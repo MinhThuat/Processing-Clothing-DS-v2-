@@ -241,6 +241,7 @@ def make_input(src, crop, dst):
 # ---------- pipeline ----------
 def run_pipe(args, logf, timeout):
     """Chạy flat_pipeline --single. Hết đăng nhập (trong log/stderr) -> AuthError; exit≠0 -> raise_for."""
+    logf.unlink(missing_ok=True)   # pipeline ghi log kiểu append -> chỉ đọc log của lần chạy này
     cmd = [sys.executable, str(PIPELINE), "--single", *map(str, args), "--log", str(logf)]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(60, timeout), cwd=str(ROOT),
@@ -276,7 +277,8 @@ def _gen_soft(fn):
 # ---------- 1 nhóm con màu ----------
 def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
     """Gen pieces 3D + art cho 1 nhóm con màu -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
-    sdir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(sdir, ignore_errors=True)    # thử lại cùng ngày: bỏ log/mảnh/pieces.json của lần trước
+    sdir.mkdir(parents=True)
     color = None if sub["matches_photo"] else sub["color"]
     colour_desc = color or "same as the reference photo"
     ctx = {"front": make_input(srcs[pick["front"] - 1], pick["crop"], sdir / "in_front.png"),
@@ -680,6 +682,20 @@ def _selfcheck():
         assert done_ids2 == {"r1"}
     finally:
         _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = orig
+    # retry cùng ngày: xoá log cũ -> không đọc nhầm error từ lần trước
+    logdir = td / "retry_check"; logdir.mkdir(exist_ok=True)
+    logfile = logdir / "retry.log"
+    # viết log cũ với error (giả sử lần chạy trước lỗi 429)
+    logfile.write_text("[gen] ✗ mảnh ao_sau lỗi: HTTP 429 usage_limit\n[gen] ✗ mảnh tay_truoc lỗi: HTTP 429 usage_limit\n")
+    assert logfile.exists() and "429" in logfile.read_text(), "test setup: log cũ phải tồn tại"
+    # run_pipe gọi: phải xoá log cũ, chạy pipeline, chỉ đọc log mới
+    # --selfcheck chạy offline, exit 0, không ghi log -> final log rỗng (hoặc chỉ có output của selfcheck)
+    run_pipe(["--selfcheck"], logfile, 60)
+    # sau khi chạy xong: log cũ đã bị xoá (bởi run_pipe), và subprocess ghi output mới vào nó
+    # selfcheck không ghi lỗi nên log mới sẽ rỗng hoặc chỉ có nội dung selfcheck
+    new_log = logfile.read_text() if logfile.exists() else ""
+    # lỗi cũ "429" không nên xuất hiện trong log sau khi chạy
+    assert "usage_limit" not in new_log, f"log phải được refresh, không còn lỗi cũ. log mới:\n{new_log}"
     print("batch selfcheck OK")
 
 
