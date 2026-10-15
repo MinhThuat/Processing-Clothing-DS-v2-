@@ -32,7 +32,7 @@ AUTH_RE = re.compile(
 # log cả trang chạy (có thể chứa HTTP 401 thoáng qua rồi tự hồi phục) -> chỉ dừng trên câu chắc chắn
 # hết đăng nhập thật sự (không khớp HTTP 401 đơn thuần).
 AUTH_HARD_RE = re.compile(
-    r"token refresh failed|refresh token expired|run `?codex login|codex chưa đăng nhập"
+    r"token refresh failed(?!: HTTP 5\d\d)|refresh token expired|run `?codex login|codex chưa đăng nhập"
     r"|need_user_authorization|not logged in|openart login", re.I)
 
 
@@ -64,6 +64,10 @@ def _selfcheck():
     assert kind_of("") == "gen"
     e = StepError("tải ảnh", "x")
     assert e.kind == "tải ảnh" and "x" in str(e)
+    # AUTH_HARD_RE: muốn lỗi chắc chắn, không HTTP 5xx (tạm thời)
+    assert AUTH_HARD_RE.search("token refresh failed: HTTP 503") is None
+    assert AUTH_HARD_RE.search("token refresh failed: HTTP 401") is not None
+    assert AUTH_HARD_RE.search("token refresh failed: HTTPError") is not None
     print("batch_errors selfcheck OK")
 
 

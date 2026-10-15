@@ -179,7 +179,10 @@ def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn):
 # ---------- log + báo Lark ----------
 def log(stage, msg=""):
     line = f"[{datetime.now():%H:%M:%S}][{stage:<6}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except OSError:
+        pass
     if _LOGF:
         _LOGF.write(line + "\n"); _LOGF.flush()
 
@@ -629,9 +632,11 @@ def main():
         summary = (f"Đợt {day}{' (dry-run)' if a.dry_run else ''}: {stats['ok']} OK · {stats['qafail']} QA FAIL"
                    f" · {stats['skip']} SKIP · {stats['loi']} LỖI · dừng vì: {reason}"
                    f" · log: {rundir / 'batch.log'}")
-        log("done", summary)
-        notify(summary)
-        release_lock()
+        try:
+            log("done", summary)
+            notify(summary)
+        finally:
+            release_lock()
 
 
 def _selfcheck():
@@ -857,6 +862,16 @@ def _selfcheck():
             pass
         a = _parse_args(["--until", "07:00", "--date", "2026-10-15", "--limit", "3"])
     assert a.until == "07:00" and a.date == "2026-10-15" and a.limit == 3
+    # log() với terminal đóng (SIGHUP): print() gây OSError(5, "EIO") nhưng đừng crash main() finally
+    class FakeBrokenStdout:
+        def write(self, s): raise OSError(5, "EIO")
+        def flush(self): raise OSError(5, "EIO")
+    old_stdout = sys.stdout
+    try:
+        sys.stdout = FakeBrokenStdout()
+        log("test", "msg")  # phải không ném lỗi
+    finally:
+        sys.stdout = old_stdout
     print("batch selfcheck OK")
 
 
