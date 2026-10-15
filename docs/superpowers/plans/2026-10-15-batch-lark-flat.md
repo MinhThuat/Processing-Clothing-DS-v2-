@@ -20,6 +20,7 @@
 - Gen lại: lần 1–2 y nguyên (`--cache pieces.json --only`), lần 3–4 Claude viết `--hint` + chọn lại ảnh/crop; sau 4 lần up bản điểm cao nhất, tên `_QAFAIL`.
 - Hạn mức: báo Lark → chờ 30' → thử lại, tối đa 3 lần; lần 4 dừng. Hết đăng nhập → dừng ngay. 5 nhóm liên tiếp lỗi cùng kiểu → dừng. 1 nhóm > 45' → `LỖI: quá thời gian`.
 - Báo Lark khi chạm hạn mức và khi dừng đợt (mọi lý do); webhook ở `studio/.env` khoá `LARK_WEBHOOK` (đã bị `.gitignore`), lỗi gửi không làm dừng đợt.
+- Chỉ làm dòng có `Create Date` (giờ Base, 10 ký tự đầu `YYYY-MM-DD`) **bằng ngày bắt đầu chạy**; cờ `--date YYYY-MM-DD` để chọn ngày khác. Dòng ngày cũ không chạy.
 - Hàng đợi sắp **mới nhất trước** theo `Create Date`; `--limit N` đếm số nhóm đã gen (nhóm SKIP không tính).
 - Kiểm thử theo kiểu repo: hàm `_selfcheck()` dùng `assert`, chạy `python <file>.py` hoặc `python batch.py --selfcheck`; không thêm pytest.
 - Code/comment tiếng Việt như code hiện có; prompt cho model bằng tiếng Anh.
@@ -845,7 +846,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Produces (Task 6 dùng):
   - Hằng `MAX_ATTEMPTS = 4`, `SAME_ERR_STOP = 5`.
   - `sku_stem(sku) -> str`, `safe_name(s, maxlen=120) -> str`, `piece_filename(sku, slug, failed=False) -> str`.
-  - `needs_work(row) -> bool`, `build_queue(rows) -> list[{"links": list[str], "rows": list[dict], "newest": str}]` (mới nhất trước).
+  - `needs_work(row) -> bool`, `build_queue(rows, day: str) -> list[{"links": list[str], "rows": list[dict], "newest": str}]` (chỉ dòng có `created[:10] == day`, mới nhất trước).
   - `group_id(g) -> str`.
   - `note_ok(day, n_pieces, regen: dict) -> str`, `note_fail(day, fails: dict) -> str`.
   - `class Stopper(until: str|None, limit: int|None, now=datetime.now)` với `.record(kind)` (kind: `None` = gen xong, `"skip"`, hoặc chuỗi lỗi) và `.reason() -> str|None`.
@@ -882,22 +883,25 @@ def _selfcheck():
     assert sku_stem("X") == "X"
     assert piece_filename("A/B-Black-Tee-M-G1", "tay_sau", failed=True) == "A_B-Black-Tee_tay_sau_QAFAIL.png"
     assert piece_filename("A-Tee-S-G1", "art") == "A-Tee_art.png"
-    # hàng đợi: lọc, gom theo bộ link, mới nhất trước
+    # hàng đợi: lọc, chỉ đúng ngày `day`, gom theo bộ link, mới nhất trước
     def row(rid, links, created, **kw):
         return {"record_id": rid, "sku": f"S-{rid}-Tee-M-G1", "color": "", "created": created,
                 "check_file": kw.get("cf", ["No File"]), "links": links,
                 "has_pieces": kw.get("hp", False), "pieces": [], "note": kw.get("note", "")}
-    rows = [row("a", ["u1"], "2026-04-01T00:00:00.000+07:00"),
-            row("b", ["u1"], "2026-04-03T00:00:00.000+07:00"),
-            row("c", ["u2"], "2026-04-02T00:00:00.000+07:00"),
-            row("d", ["u3"], "2026-04-09T00:00:00.000+07:00", hp=True),
-            row("e", ["u4"], "2026-04-09T00:00:00.000+07:00", note="SKIP: mug"),
-            row("f", ["u5"], "2026-04-09T00:00:00.000+07:00", cf=["Urgent"]),
-            row("g", [], "2026-04-09T00:00:00.000+07:00"),
-            row("h", ["u6"], "2026-04-09T00:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh")]
-    q = build_queue(rows)
+    rows = [row("a", ["u1"], "2026-04-09T01:00:00.000+07:00"),
+            row("b", ["u1"], "2026-04-09T03:00:00.000+07:00"),
+            row("c", ["u2"], "2026-04-09T02:00:00.000+07:00"),
+            row("d", ["u3"], "2026-04-09T09:00:00.000+07:00", hp=True),
+            row("e", ["u4"], "2026-04-09T09:00:00.000+07:00", note="SKIP: mug"),
+            row("f", ["u5"], "2026-04-09T09:00:00.000+07:00", cf=["Urgent"]),
+            row("g", [], "2026-04-09T09:00:00.000+07:00"),
+            row("h", ["u6"], "2026-04-09T09:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh"),
+            row("i", ["u7"], "2026-04-08T23:59:00.000+07:00"),          # ngày cũ -> không chạy
+            row("j", ["u1"], "2026-04-10T00:01:00.000+07:00")]          # ngày khác -> không chạy
+    q = build_queue(rows, "2026-04-09")
     assert [[r["record_id"] for r in g["rows"]] for g in q] == [["h"], ["a", "b"], ["c"]]
-    assert q[1]["newest"] == "2026-04-03T00:00:00.000+07:00"
+    assert q[1]["newest"] == "2026-04-09T03:00:00.000+07:00"
+    assert build_queue(rows, "2026-04-08")[0]["rows"][0]["record_id"] == "i"
     assert group_id(q[1]).startswith("S-a-Tee_") and len(group_id(q[1])) <= 80
     # ghi chú
     assert note_ok("2026-10-16", 6, {"tay_sau": 1}) == "OK 2026-10-16 · 6 mảnh + art · gen lại: tay_sau×1"
@@ -991,11 +995,11 @@ def needs_work(row):
             and not row["note"].upper().startswith("SKIP"))
 
 
-def build_queue(rows):
-    """Gom dòng cần làm theo bộ link; nhóm có dòng mới nhất lên trước."""
+def build_queue(rows, day):
+    """Gom dòng cần làm CỦA NGÀY `day` (YYYY-MM-DD theo Create Date) theo bộ link; mới nhất lên trước."""
     groups = {}
     for r in rows:
-        if needs_work(r):
+        if r["created"][:10] == day and needs_work(r):
             groups.setdefault(tuple(r["links"]), []).append(r)
     out = [{"links": list(k), "rows": v, "newest": max(x["created"] for x in v)} for k, v in groups.items()]
     out.sort(key=lambda g: g["newest"], reverse=True)
@@ -1114,7 +1118,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 1 (`QuotaError, AuthError, StepError, AUTH_RE, raise_for`), Task 2 (`lark_base.fetch_rows/get_row/upload_files/remove_files/write_notes`), Task 3 (CLI `--single/--color/--hint`, file `final_<slug>.png`, `pieces.json`, `art.png`), Task 4 (`judge.grid/contact_sheet/pick/qa/rehint`), Task 5 (mọi hàm thuần).
-- Produces: CLI `python batch.py [--until HH:MM] [--limit N] [--dry-run] [--selfcheck]`; thư mục `flat_studio_data/batch/<YYYY-MM-DD>/` gồm `batch.log` + mỗi nhóm `<group_id>/` (sheet_pick.jpg, pick.json, `c<k>/` có sheet_qa_*.jpg, qa_*.json, pipe_*.log, `out/*.png`).
+- Produces: CLI `python batch.py [--date YYYY-MM-DD] [--until HH:MM] [--limit N] [--dry-run] [--selfcheck]`; thư mục `flat_studio_data/batch/<YYYY-MM-DD>/` gồm `batch.log` + mỗi nhóm `<group_id>/` (sheet_pick.jpg, pick.json, `c<k>/` có sheet_qa_*.jpg, qa_*.json, pipe_*.log, `out/*.png`).
 
 - [ ] **Step 1: Thêm assert I/O-cục-bộ vào `_selfcheck()` (ngay trước `print("batch selfcheck OK")`)**
 
@@ -1465,6 +1469,7 @@ def main():
     ap.add_argument("--until", help="dừng sau giờ HH:MM (làm nốt nhóm đang chạy)")
     ap.add_argument("--limit", type=int, help="dừng sau N nhóm đã gen (SKIP không tính)")
     ap.add_argument("--dry-run", action="store_true", help="làm đủ trừ ghi Lark Base")
+    ap.add_argument("--date", help="chỉ làm mẫu có Create Date = ngày này (YYYY-MM-DD); mặc định hôm nay")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
@@ -1474,14 +1479,15 @@ def main():
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     acquire_lock()
-    day = date.today().isoformat()
+    day = date.today().isoformat()          # ngày ghi Note + thư mục log
+    only_day = a.date or day                 # chỉ làm mẫu tạo ngày này (mẫu ngày cũ bỏ qua)
     rundir = BATCH / day; rundir.mkdir(parents=True, exist_ok=True)
     _LOGF = open(rundir / "batch.log", "a", encoding="utf-8")
     stats, stop, reason = Counter(), Stopper(a.until, a.limit), "hết việc"
-    log("start", f"until={a.until} limit={a.limit} dry={a.dry_run}")
+    log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}")
     try:
-        queue = build_queue(lb.fetch_rows())
-        log("queue", f"{len(queue)} nhóm cần làm")
+        queue = build_queue(lb.fetch_rows(), only_day)
+        log("queue", f"{len(queue)} nhóm cần làm (mẫu ngày {only_day})")
         i, waits = 0, 0
         while i < len(queue):
             try:

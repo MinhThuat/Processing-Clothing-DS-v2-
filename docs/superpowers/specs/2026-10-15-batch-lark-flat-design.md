@@ -37,6 +37,7 @@ phải quần áo (Magnet Die Cut, Plaque, Vase, Mug…).
 python batch.py                          # chạy tới hết việc
 python batch.py --until 07:00 --limit 30 # dừng theo giờ / số nhóm
 python batch.py --dry-run --limit 3      # làm đủ trừ ghi Base
+python batch.py --date 2026-10-14       # chạy bù mẫu của 1 ngày khác
 python batch.py --selfcheck              # kiểm tra logic, không gọi mạng
 ```
 
@@ -55,7 +56,8 @@ python batch.py --selfcheck              # kiểm tra logic, không gọi mạng
 ## Luồng
 
 1. **Hàng đợi.** Lấy dòng trong view có `No File`, `Flat Pieces` trống, `Flat Note` không bắt
-   đầu bằng `SKIP`. Gom theo bộ link (Link 1…20 sau khi bóc Markdown). Sắp **mới nhất trước**
+   đầu bằng `SKIP`, và **`Create Date` = ngày bắt đầu chạy** (mẫu ngày cũ không chạy; `--date
+   YYYY-MM-DD` để chọn ngày khác). Gom theo bộ link (Link 1…20 sau khi bóc Markdown). Sắp **mới nhất trước**
    theo `Create Date` (lấy dòng mới nhất trong nhóm).
 2. **Mỗi nhóm:**
    1. Tải Link 1…N → `flat_studio_data/batch/<YYYY-MM-DD>/<nhóm>/src/`.
