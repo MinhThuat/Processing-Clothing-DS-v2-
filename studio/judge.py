@@ -91,6 +91,8 @@ def ask(prompt, images, timeout=300):
 def _box(b):
     ok = (isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)
           and all(0 <= v <= 1000 for v in b) and b[2] > b[0] and b[3] > b[1])
+    if ok:
+        ok = (b[2] - b[0]) * (b[3] - b[1]) >= 200_000   # < 20% diện tích 1000x1000 -> bbox không đáng tin -> bỏ
     return [int(v) for v in b] if ok else None
 
 
@@ -124,8 +126,9 @@ def norm_pick(js, rows, n):
             photo["record_ids"] += rest
         else:
             colors.append({"color": "photo", "matches_photo": True, "record_ids": rest})
-    return {"skip": None, "front": front, "back": back, "mode": mode,
-            "crop": _box(js.get("crop")), "colors": colors}
+    crop = None if mode == "combined" else _box(js.get("crop"))   # combined = ảnh ghép 2 mặt -> bbox
+    return {"skip": None, "front": front, "back": back, "mode": mode,    # từ contact sheet thu nhỏ, không
+            "crop": crop, "colors": colors}                              # đáng tin -> không cắt
 
 
 def norm_qa(js, names):
@@ -153,8 +156,9 @@ cap, guest book, patch, accessory...) return {{"skip": "<short reason with the p
  - "back": label of a photo of the real BACK of the SAME garment, or null.
  - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows the
    front and back side by side (then back = null); otherwise "infer".
- - "crop": [x0,y0,x1,y1] integers 0-1000 of the front photo, tight around ONE outfit when the photo
-   has several people/garments or lots of empty space; else null.
+ - "crop": [x0,y0,x1,y1] integers 0-1000 relative to THAT single photo's own width/height (NOT the
+   contact sheet); MUST be null when mode is "combined"; only crop when the photo shows several
+   different people/outfits (tight around ONE outfit), else null.
  - "colors": split the order rows by the garment colour each row asks for. Read colour words in
    SKU Design / Color; personal names, sizes and design numbers are NOT colours; a row without a colour
    uses the photo colour. Each item {{"color": "<colour words, or 'photo'>", "matches_photo": true|false,
@@ -174,6 +178,8 @@ score 1-10, errors = codes from:
  margins, border or garment outline visible), vung_den (plain areas filled black/void/glow),
  cat_loi (dress cut-out broken / missing corners), art_thieu (art misses front details or wrong
  top/bottom layout).
+If REF photo shows front and back side by side, use the front view for _truoc pieces and the back
+view for _sau pieces.
 Return ONLY: {{"pieces": {{"<name>": {{"ok": true, "score": 9, "errors": []}}, ...}}}} covering every name."""
 
 REHINT = """Generated pieces failed QA twice: {fails} (piece: error codes).
@@ -225,6 +231,14 @@ def _selfcheck():
     ids = [x for c in p["colors"] for x in c["record_ids"]]
     assert sorted(ids) == ["r1", "r2", "r3"] and len(ids) == 3             # r3 bị sót -> vào nhóm 'photo'
     assert p["colors"][1] == {"color": "pink", "matches_photo": False, "record_ids": ["r2"]}
+    # mode "combined" -> crop luôn None (dù model trả về bbox) vì bbox ước lượng từ contact sheet
+    # thu nhỏ, không đáng tin cho ảnh ghép 2 người
+    p2 = norm_pick({"skip": None, "front": 1, "back": None, "mode": "combined",
+                    "crop": [390, 50, 760, 400], "colors": []}, rows_, 5)
+    assert p2["mode"] == "combined" and p2["crop"] is None
+    # _box: vùng cắt quá nhỏ (< 20% diện tích 1000x1000) -> bỏ, tránh cắt lọt vào giữa 2 người
+    assert _box([390, 50, 760, 400]) is None                 # area 129,500 < 200,000
+    assert _box([100, 100, 700, 900]) == [100, 100, 700, 900]  # area 480,000 -> giữ
     try:
         norm_pick({"front": 9, "colors": []}, rows_, 5); raise AssertionError("front sai phải lỗi")
     except StepError as e:

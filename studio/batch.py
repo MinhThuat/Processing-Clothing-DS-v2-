@@ -324,6 +324,8 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
     color = None if sub["matches_photo"] else sub["color"]
     colour_desc = color or "same as the reference photo"
     ctx = {"front": make_input(srcs[pick["front"] - 1], pick["crop"], sdir / "in_front.png"),
+           "front_src": srcs[pick["front"] - 1],         # ảnh gốc chưa cắt, để QA luôn so với ảnh thật
+           "cropped": pick["crop"] is not None,
            "back": (make_input(srcs[pick["back"] - 1], None, sdir / "in_back.png")
                     if pick["mode"] == "two" else None),
            "hint": None}
@@ -375,7 +377,11 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
         # mảnh chưa ra file (gen lỗi) -> -1, không phải 0, để bản đã từng ra file (dù điểm 0) vẫn thắng
         res = {x: {"ok": False, "score": -1.0, "errors": ["gen_loi"]} for x in todo if x not in have}
         if have:
-            refs = [(ctx["front"], "REF front")] + ([(ctx["back"], "REF back")] if ctx["back"] else [])
+            # luôn so với ảnh gốc chưa cắt (QA phải thấy nguyên bộ/toàn ảnh, không chỉ phần đã cắt
+            # -- bbox ước lượng từ contact sheet không đáng tin); kèm bản đã cắt nếu có cắt thật
+            refs = ([(ctx["front_src"], "REF photo")]
+                    + ([(ctx["front"], "REF crop")] if ctx["cropped"] else [])
+                    + ([(ctx["back"], "REF back")] if ctx["back"] else []))
             sheet = judge.contact_sheet([refs] + judge.grid([(piece_path(x), x) for x in have], cols=4),
                                         sdir / f"sheet_qa_{n['qa']}.jpg")
             res.update(judge.qa(sheet, have, colour_desc, len(refs)))
@@ -424,7 +430,11 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
             ctx["hint"] = None
             return None
         (sdir / "rehint.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
-        ctx["front"] = make_input(srcs[(r["front"] or pick["front"]) - 1], r["crop"], sdir / "in_front_r3.png")
+        front_idx = (r["front"] or pick["front"]) - 1
+        crop = None if pick["mode"] == "combined" else r["crop"]   # combined -> bbox không đáng tin, bỏ
+        ctx["front_src"] = srcs[front_idx]
+        ctx["front"] = make_input(srcs[front_idx], crop, sdir / "in_front_r3.png")
+        ctx["cropped"] = crop is not None
         ctx["hint"] = r["hint"] or None
         log("regen", f"hint: {ctx['hint']}")
         return ctx["hint"]
