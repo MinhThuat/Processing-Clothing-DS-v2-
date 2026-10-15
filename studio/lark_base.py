@@ -21,8 +21,9 @@ FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "F
 _MD = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
 _URL = re.compile(r"https?://[^\s)\]]+")
 # lỗi đăng nhập/cấu hình -> dừng đợt; tránh bắt nhầm chữ 'file_token' trong lỗi upload
+# 'expired' đơn thuần dễ bắt nhầm (vd link ảnh/khuyến mãi "expired") -> chỉ bắt khi đi kèm 'token'
 _AUTH = re.compile(r"user_access_token|access token|refresh token|need_user_authorization"
-                   r"|auth login|unauthori|not_configured|invalid_client|expired", re.I)
+                   r"|auth login|unauthori|not_configured|invalid_client|token[^\"]{0,40}expired", re.I)
 
 
 def clean_url(v):
@@ -150,6 +151,10 @@ def _selfcheck():
     r2 = parse_row({**raw, "Flat Pieces": [{"file_token": "t1", "name": "a.png"}], "Flat Note": "SKIP: x"})
     assert r2["has_pieces"] and r2["pieces"][0]["file_token"] == "t1" and r2["note"] == "SKIP: x"
     assert len(FIELDS) == 6 + N_LINKS
+    # _AUTH: chỉ bắt 'expired' đi kèm 'token' (tránh bắt nhầm link ảnh/khuyến mãi hết hạn)
+    assert _AUTH.search("refresh token expired")
+    assert _AUTH.search("token abc123 expired")
+    assert not _AUTH.search("promotion offer expired at midnight")
     print("lark_base selfcheck OK")
 
 

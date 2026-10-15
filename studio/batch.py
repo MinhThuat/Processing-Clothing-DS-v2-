@@ -8,7 +8,7 @@ Lark Base (view 1. DS Order) -> dòng No File chưa có Flat Pieces -> tải Lin
 -> flat_pipeline (pieces 3D + art) -> Claude QA, gen lại -> up Flat Pieces + ghi Flat Note.
 Spec: docs/superpowers/specs/2026-10-15-batch-lark-flat-design.md
 """
-import argparse, hashlib, io, json, os, re, shutil, subprocess, sys, time, traceback, urllib.request
+import argparse, hashlib, io, json, os, re, shutil, signal, subprocess, sys, time, traceback, urllib.request
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,7 +17,7 @@ from PIL import Image
 
 import judge
 import lark_base as lb
-from batch_errors import AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
+from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
 from flat_pipeline import _pieces_plan
 
 ROOT = Path(__file__).resolve().parent
@@ -124,6 +124,21 @@ class Stopper:
         if self.err_run >= SAME_ERR_STOP:
             return f"{self.err_run} nhóm liên tiếp lỗi '{self.err_kind}'"
         return None
+
+
+def _quota_wait(stop, seconds, sleep=time.sleep):
+    """Chờ hạn mức `seconds' giây, chia đoạn <=60s; thoát sớm & trả lý do ngay khi stop.reason()
+    có (vd hết giờ --until trong lúc chờ), không chờ hết cả 30'. -> lý do dừng, hoặc None nếu
+    chờ hết mà không có lý do nào (đến lúc đó thì cứ thử lại như cũ)."""
+    waited = 0
+    while waited < seconds:
+        r = stop.reason()
+        if r:
+            return r
+        chunk = min(60, seconds - waited)
+        sleep(chunk)
+        waited += chunk
+    return stop.reason()
 
 
 # ---------- máy gen lại ----------
@@ -249,7 +264,7 @@ def run_pipe(args, logf, timeout):
     except subprocess.TimeoutExpired:
         raise StepError("quá thời gian", "pipeline")
     logtxt = logf.read_text(encoding="utf-8", errors="replace") if logf.exists() else ""
-    if AUTH_RE.search(logtxt + (p.stderr or "")):
+    if _log_auth_error(logtxt, p.stderr):
         raise AuthError("codex/ARK hết đăng nhập — xem " + str(logf))
     if _piece_quota(logtxt):
         raise QuotaError("hết hạn mức gen giữa chừng — xem " + str(logf))
@@ -264,6 +279,19 @@ def _piece_quota(logtxt):
     return any("✗ mảnh" in line and QUOTA_RE.search(line) for line in logtxt.splitlines())
 
 
+def _piece_auth(logtxt):
+    """Mirror _piece_quota: dòng '✗ mảnh ...' khớp AUTH_RE (đầy đủ) -> mảnh lỗi vì hết đăng nhập
+    thật sự (không phải 401 thoáng qua rồi tự hồi phục như HTTP 401 ở log vision)."""
+    return any("✗ mảnh" in line and AUTH_RE.search(line) for line in logtxt.splitlines())
+
+
+def _log_auth_error(logtxt, stderr=""):
+    """Toàn log chỉ dừng trên câu CHẮC CHẮN hết đăng nhập (AUTH_HARD_RE) — codex vision log
+    'HTTP 401' thoáng qua rồi tự refresh token không được tính; nhưng nếu chính dòng '✗ mảnh ...'
+    (mảnh thật sự lỗi) khớp AUTH_RE đầy đủ thì vẫn coi là hết đăng nhập."""
+    return bool(AUTH_HARD_RE.search(logtxt + (stderr or ""))) or _piece_auth(logtxt)
+
+
 def _gen_soft(fn):
     """Gen lỗi (StepError 'gen') -> chỉ log, để QA chấm thiếu file; lỗi khác ném tiếp."""
     try:
@@ -272,6 +300,17 @@ def _gen_soft(fn):
         if e.kind != "gen":
             raise
         log("gen", f"lỗi gen (tính 1 lần hỏng): {str(e)[:200]}")
+
+
+def _pieces_json_slugs(path):
+    """pieces.json -> tập slug mảnh (không gồm 'art') theo plan hiện tại (flat_pipeline._pieces_plan)."""
+    return {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")))}
+
+
+def _slugs_match(pieces_json_path, names):
+    """True nếu bộ mảnh trong pieces.json (bỏ 'art') khớp đúng tập `names` (cũng bỏ 'art').
+    Dùng ở lần gen lại 3: vision lại có thể đổi loại đồ/tay giống-khác -> đổi tên mảnh."""
+    return _pieces_json_slugs(pieces_json_path) == set(names)
 
 
 # ---------- 1 nhóm con màu ----------
@@ -330,7 +369,8 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
     def qa_fn(todo):
         n["qa"] += 1
         have = [x for x in todo if piece_path(x).exists()]
-        res = {x: {"ok": False, "score": 0.0, "errors": ["gen_loi"]} for x in todo if x not in have}
+        # mảnh chưa ra file (gen lỗi) -> -1, không phải 0, để bản đã từng ra file (dù điểm 0) vẫn thắng
+        res = {x: {"ok": False, "score": -1.0, "errors": ["gen_loi"]} for x in todo if x not in have}
         if have:
             refs = [(ctx["front"], "REF front")] + ([(ctx["back"], "REF back")] if ctx["back"] else [])
             sheet = judge.contact_sheet([refs] + judge.grid([(piece_path(x), x) for x in have], cols=4),
@@ -346,7 +386,27 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
             piece_path(x).unlink(missing_ok=True)
         slugs = [x for x in todo if x != "art"]
         if slugs:
-            gen_pieces(only=slugs, cache=attempt <= 2)     # lần 3-4: vision lại (+ hint, ảnh/crop mới)
+            if attempt == 3:
+                # lần 3: vision lại (crop + hint mới, từ rehint_fn) -> có thể đổi loại đồ/tay
+                # giống-khác -> tên mảnh lệch với bản gốc (USER DECISION: khi lệch thì quay về
+                # mô tả cũ, giữ crop + hint mới).
+                v0 = sdir / "pieces_v0.json"
+                shutil.copyfile(pj, v0)
+                gen_pieces(only=slugs, cache=False)
+                old = {n for n in names if n != "art"}
+                if pj.exists() and not _slugs_match(pj, old):
+                    new = _pieces_json_slugs(pj)
+                    log("regen", f"lần 3 vision ra mảnh khác ({sorted(new)} != {sorted(old)})"
+                                 " -> quay lại mô tả cũ, giữ crop+hint mới")
+                    for p in sdir.glob("final_*.png"):
+                        if p.stem[len("final_"):] not in old:
+                            p.unlink(missing_ok=True)
+                    shutil.copyfile(v0, pj)
+                    missing = [x for x in slugs if not piece_path(x).exists()]
+                    if missing:
+                        gen_pieces(only=missing, cache=True)
+            else:
+                gen_pieces(only=slugs, cache=True)     # lần 1-2: y nguyên; lần 4: dùng pieces.json hiện tại
         if "art" in todo:
             gen_art()
 
@@ -354,7 +414,12 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
         items = [(p, str(i)) for i, p in enumerate(srcs, 1)]
         items += [(piece_path(x), x) for x in fails if piece_path(x).exists()]
         sheet = judge.contact_sheet(judge.grid(items), sdir / "sheet_rehint.jpg")
-        r = judge.rehint(sheet, fails, len(srcs))
+        try:
+            r = judge.rehint(sheet, fails, len(srcs))
+        except StepError as e:               # judge lỗi -> không phá nhóm, gen lại y nguyên crop cũ
+            log("regen", f"rehint lỗi, giữ ảnh/crop cũ: {e}")
+            ctx["hint"] = None
+            return None
         (sdir / "rehint.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
         ctx["front"] = make_input(srcs[(r["front"] or pick["front"]) - 1], r["crop"], sdir / "in_front_r3.png")
         ctx["hint"] = r["hint"] or None
@@ -399,14 +464,14 @@ def upload_rows(rows, files, note, dry, done_ids):
                 log("up", f"{rid} đã có Flat Pieces -> bỏ qua"); continue
             try:
                 lb.upload_files(rid, files)
-            except Exception as e:
+            except BaseException as e:      # Ctrl+C/SIGTERM giữa chừng cũng phải dọn file dở
                 try:
                     toks = [p["file_token"] for p in lb.get_row(rid)["pieces"] if p.get("name") in names]
                     if toks:
                         lb.remove_files(rid, toks)
                 except Exception as e2:
                     log("up", f"{rid} dọn file dở lỗi: {e2}")
-                if isinstance(e, (AuthError, QuotaError)):
+                if isinstance(e, (AuthError, QuotaError, KeyboardInterrupt, SystemExit)):
                     raise
                 raise StepError("up", f"{rid}: {e}")
             done[rid] = note
@@ -480,22 +545,49 @@ def process_group(g, rundir, day, dry, stats):
         return kind
 
 
-# ---------- main ----------
-def main():
-    global _LOGF
+_UNTIL_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+
+def _parse_args(argv=None):
+    """Đọc cờ dòng lệnh + validate --date/--until TRƯỚC acquire_lock (sai thì ap.error -> SystemExit,
+    không giữ lock treo)."""
     ap = argparse.ArgumentParser(description="Flat batch: Lark Base -> mảnh rập, chạy qua đêm")
     ap.add_argument("--until", help="dừng sau giờ HH:MM (làm nốt nhóm đang chạy)")
     ap.add_argument("--limit", type=int, help="dừng sau N nhóm đã gen (SKIP không tính)")
     ap.add_argument("--dry-run", action="store_true", help="làm đủ trừ ghi Lark Base")
     ap.add_argument("--date", help="chỉ làm mẫu có Create Date = ngày này (YYYY-MM-DD); mặc định hôm nay")
     ap.add_argument("--selfcheck", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if a.date:
+        try:
+            date.fromisoformat(a.date)
+        except ValueError:
+            ap.error(f"--date không hợp lệ (cần YYYY-MM-DD): {a.date}")
+    if a.until:
+        m = _UNTIL_RE.match(a.until)
+        if not m or not (0 <= int(a.until.split(":")[0]) <= 23 and 0 <= int(a.until.split(":")[1]) <= 59):
+            ap.error(f"--until không hợp lệ (cần HH:MM): {a.until}")
+    return a
+
+
+def _raise_kbd(signum, frame):
+    raise KeyboardInterrupt
+
+
+# ---------- main ----------
+def main():
+    global _LOGF
+    a = _parse_args()
     if a.selfcheck:
         import batch_errors
         batch_errors._selfcheck(); lb._selfcheck(); judge._selfcheck(); _selfcheck()
         return
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
+    # terminal đóng (SIGHUP) / dừng tiến trình (SIGTERM) -> coi như Ctrl+C: vào finally, dọn lock + báo Lark
+    signal.signal(signal.SIGTERM, _raise_kbd)
+    if sys.platform != "win32":
+        signal.signal(signal.SIGHUP, _raise_kbd)
     acquire_lock()
     day = date.today().isoformat()          # ngày ghi Note + thư mục log
     only_day = a.date or day                 # chỉ làm mẫu tạo ngày này (mẫu ngày cũ bỏ qua)
@@ -517,7 +609,9 @@ def main():
                     reason = f"hết hạn mức sau {QUOTA_TRIES} lần chờ ({str(e)[:120]})"; break
                 notify(f"⏸ Hết hạn mức — chờ 30' rồi thử lại (lần {waits}/{QUOTA_TRIES})\n{str(e)[:200]}")
                 log("quota", f"chờ {QUOTA_WAIT // 60}' (lần {waits}/{QUOTA_TRIES}): {e}")
-                time.sleep(QUOTA_WAIT)
+                r = _quota_wait(stop, QUOTA_WAIT)     # thoát sớm nếu --until/--limit/chuỗi lỗi chạm trong lúc chờ
+                if r:
+                    reason = r; break
                 continue                       # làm lại nhóm này
             i += 1
             stop.record(kind)
@@ -592,6 +686,23 @@ def _selfcheck():
     s = Stopper("07:00", None, now=lambda: now[0])
     assert s.reason() is None
     now[0] = datetime(2026, 10, 16, 7, 0); assert s.reason() == "hết giờ 07:00"
+    # _quota_wait: deadline đã qua -> thoát ngay, không sleep lần nào
+    calls_sleep = []
+    assert _quota_wait(s, 1800, sleep=lambda sec: calls_sleep.append(sec)) == "hết giờ 07:00"
+    assert calls_sleep == []
+    # không có lý do dừng -> chờ hết, chia đoạn <=60s
+    s2 = Stopper(None, None)
+    calls_sleep2 = []
+    assert _quota_wait(s2, 150, sleep=lambda sec: calls_sleep2.append(sec)) is None
+    assert calls_sleep2 == [60, 60, 30]
+    # lý do dừng xuất hiện GIỮA lúc chờ -> thoát sớm (không chờ hết 150s)
+    s3 = Stopper(None, 1)
+    calls_sleep3 = []
+    def sleep3(sec):
+        calls_sleep3.append(sec)
+        s3.record(None)              # giả lập: đủ --limit ngay trong lúc chờ
+    assert _quota_wait(s3, 150, sleep=sleep3) == "đủ --limit 1"
+    assert calls_sleep3 == [60]
     # máy gen lại: A đạt ngay; B đạt ở lần 3 (sau hint); C lỗi cả 5 bản -> chọn bản điểm cao nhất
     script = {"A": [(True, 9)], "B": [(False, 3), (False, 4), (False, 2), (True, 8)],
               "C": [(False, 2), (False, 6), (False, 3), (False, 5), (False, 4)]}
@@ -641,6 +752,23 @@ def _selfcheck():
     assert _piece_quota("[gen] ✗ mảnh ao_sau lỗi: HTTP 429 usage_limit") is True
     assert _piece_quota("[vision] lỗi codex: HTTP 429") is False
     assert _piece_quota("[gen] ✗ mảnh x lỗi: openart không tạo file") is False
+    # #1 401 giả (codex vision tự hồi phục) không được dừng run; chỉ câu CHẮC CHẮN mới dừng
+    assert _log_auth_error("[vision   ] lỗi codex: HTTP 401 Unauthorized") is False
+    assert _log_auth_error("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
+    assert _log_auth_error("bình thường", stderr="codex chưa đăng nhập") is True   # AUTH_HARD_RE toàn log
+    assert _piece_auth("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
+    assert _piece_auth("[vision] lỗi codex: HTTP 401") is False       # không phải dòng "✗ mảnh"
+    # #2 _slugs_match: lần 3 vision lại đổi tay giống<->khác -> tên mảnh lệch
+    tb = dict(type="top_bottom", top_front="a", top_back="b", pants_front="c", pants_back="d",
+              sl_front="e", sl_back="f", sr_front="g", sr_back="h")
+    same_names = {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau", "tay_truoc", "tay_sau"}
+    diff_names = {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau",
+                  "tay_trai_truoc", "tay_trai_sau", "tay_phai_truoc", "tay_phai_sau"}
+    p_same = td / "pieces_same.json"; p_same.write_text(json.dumps({**tb, "sleeves_same": True}))
+    p_diff = td / "pieces_diff.json"; p_diff.write_text(json.dumps({**tb, "sleeves_same": False}))
+    assert _slugs_match(p_same, same_names) is True
+    assert _slugs_match(p_diff, same_names) is False
+    assert _slugs_match(p_diff, diff_names) is True
     # upload_rows: lỗi giữa chừng không mất note dòng đã up, không ghi LỖI nhầm dòng đã up
     import lark_base as _lb
     orig = (_lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes)
@@ -680,6 +808,22 @@ def _selfcheck():
         except StepError as e:
             assert e.kind == "up" and "r2" in str(e) and "boom" in str(e)
         assert done_ids2 == {"r1"}
+        # #3 Ctrl+C/terminal đóng giữa lúc up: vẫn dọn file dở (remove_files), rồi ném tiếp
+        # KeyboardInterrupt; note của dòng đã up trước đó (r1) vẫn phải được ghi.
+        def fake_upload3(rid, fs):
+            if rid == "r2":
+                raise KeyboardInterrupt
+        _lb.upload_files = fake_upload3
+        calls["remove"] = []; calls["notes"] = None
+        done_ids3 = set()
+        try:
+            upload_rows(rows, files, "note3", False, done_ids3)
+            raise AssertionError("KeyboardInterrupt phải ném tiếp")
+        except KeyboardInterrupt:
+            pass
+        assert calls["remove"] == [("r2", ["tok_r2"])]     # cleanup vẫn chạy
+        assert calls["notes"] == {"r1": "note3"}            # note của r1 (đã up trước) vẫn được ghi
+        assert done_ids3 == {"r1"}
     finally:
         _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = orig
     # retry cùng ngày: xoá log cũ -> không đọc nhầm error từ lần trước
@@ -696,6 +840,23 @@ def _selfcheck():
     new_log = logfile.read_text() if logfile.exists() else ""
     # lỗi cũ "429" không nên xuất hiện trong log sau khi chạy
     assert "usage_limit" not in new_log, f"log phải được refresh, không còn lỗi cũ. log mới:\n{new_log}"
+    # #5 _parse_args: validate --date/--until TRƯỚC acquire_lock; sai -> SystemExit (ap.error)
+    import contextlib
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            _parse_args(["--date", "2026-13-40"]); raise AssertionError("--date sai phải lỗi")
+        except SystemExit:
+            pass
+        try:
+            _parse_args(["--until", "25:99"]); raise AssertionError("--until giờ sai phải lỗi")
+        except SystemExit:
+            pass
+        try:
+            _parse_args(["--until", "7:5"]); raise AssertionError("--until thiếu số 0 phải lỗi")
+        except SystemExit:
+            pass
+        a = _parse_args(["--until", "07:00", "--date", "2026-10-15", "--limit", "3"])
+    assert a.until == "07:00" and a.date == "2026-10-15" and a.limit == 3
     print("batch selfcheck OK")
 
 

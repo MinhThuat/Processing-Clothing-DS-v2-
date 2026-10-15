@@ -29,6 +29,11 @@ AUTH_RE = re.compile(
     r"token refresh failed|access token expired|refresh token expired|HTTP 401|\bunauthori[sz]ed"
     r"|run `?codex login|codex chưa đăng nhập|need_user_authorization|not logged in"
     r"|invalid api key|openart login", re.I)
+# log cả trang chạy (có thể chứa HTTP 401 thoáng qua rồi tự hồi phục) -> chỉ dừng trên câu chắc chắn
+# hết đăng nhập thật sự (không khớp HTTP 401 đơn thuần).
+AUTH_HARD_RE = re.compile(
+    r"token refresh failed|refresh token expired|run `?codex login|codex chưa đăng nhập"
+    r"|need_user_authorization|not logged in|openart login", re.I)
 
 
 def raise_for(text, kind):
