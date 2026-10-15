@@ -17,7 +17,8 @@ from PIL import Image
 
 import judge
 import lark_base as lb
-from batch_errors import AUTH_RE, AuthError, QuotaError, StepError, raise_for
+from batch_errors import AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
+from flat_pipeline import _pieces_plan
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expanduser()
@@ -249,9 +250,17 @@ def run_pipe(args, logf, timeout):
     logtxt = logf.read_text(encoding="utf-8", errors="replace") if logf.exists() else ""
     if AUTH_RE.search(logtxt + (p.stderr or "")):
         raise AuthError("codex/ARK hết đăng nhập — xem " + str(logf))
+    if _piece_quota(logtxt):
+        raise QuotaError("hết hạn mức gen giữa chừng — xem " + str(logf))
     if p.returncode != 0:
         raise_for((p.stderr or "")[-2000:], "gen")
     return logtxt
+
+
+def _piece_quota(logtxt):
+    """True nếu có dòng gen mảnh lỗi ('✗ mảnh ...') khớp QUOTA_RE -> hạn mức hỏng giữa chừng.
+    Chỉ tính dòng mảnh thật sự lỗi (không tính 429 mà OpenArt/codex tự hồi phục)."""
+    return any("✗ mảnh" in line and QUOTA_RE.search(line) for line in logtxt.splitlines())
 
 
 def _gen_soft(fn):
@@ -265,7 +274,7 @@ def _gen_soft(fn):
 
 
 # ---------- 1 nhóm con màu ----------
-def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline):
+def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
     """Gen pieces 3D + art cho 1 nhóm con màu -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
     sdir.mkdir(parents=True, exist_ok=True)
     color = None if sub["matches_photo"] else sub["color"]
@@ -306,7 +315,12 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline):
     # lần 0
     gen_pieces()
     gen_art()
-    names = sorted(p.stem[len("final_"):] for p in sdir.glob("final_*.png"))
+    pj = sdir / "pieces.json"
+    if not pj.exists():
+        raise StepError("gen", "vision không ra pieces.json")
+    want = {p["slug"] for p in _pieces_plan(json.loads(pj.read_text(encoding="utf-8")))}
+    have = {p.stem[len("final_"):] for p in sdir.glob("final_*.png")}
+    names = sorted(want | have)              # mảnh lỗi lần 0 (thiếu file) vẫn vào danh sách -> QA chấm 0 -> gen lại
     if not names:
         raise StepError("gen", "không ra mảnh nào")
     names.append("art")                     # art lỗi lần 0 -> QA chấm 0 -> được gen lại
@@ -363,34 +377,45 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline):
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
     note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen)
-    upload_rows(rows, files, note, dry)
+    upload_rows(rows, files, note, dry, done_ids)
     return bool(fails)
 
 
-def upload_rows(rows, files, note, dry):
-    """Up cùng bộ file cho từng dòng; dòng đã có Flat Pieces -> bỏ qua. Ghi Note sau khi up xong."""
+def upload_rows(rows, files, note, dry, done_ids):
+    """Up cùng bộ file cho từng dòng; dòng đã có Flat Pieces -> bỏ qua.
+    `done_ids` (set dùng chung của cả nhóm) được cập nhật ngay khi 1 dòng up xong, để lỗi giữa chừng
+    (quota/lỗi lạ ở dòng sau) không mất note của các dòng đã up trước đó, và không bị ghi LỖI nhầm."""
     if dry:
         log("dry", f"[không ghi Base] {len(rows)} dòng · {len(files)} file · note: {note}")
         return
     names = {f.name for f in files}
     done = {}
-    for r in rows:
-        rid = r["record_id"]
-        if lb.get_row(rid)["has_pieces"]:
-            log("up", f"{rid} đã có Flat Pieces -> bỏ qua"); continue
-        try:
-            lb.upload_files(rid, files)
-        except StepError as e:
-            toks = [p["file_token"] for p in lb.get_row(rid)["pieces"] if p.get("name") in names]
-            if toks:
-                lb.remove_files(rid, toks)
-            if done:
+    try:
+        for r in rows:
+            rid = r["record_id"]
+            if lb.get_row(rid)["has_pieces"]:
+                log("up", f"{rid} đã có Flat Pieces -> bỏ qua"); continue
+            try:
+                lb.upload_files(rid, files)
+            except Exception as e:
+                try:
+                    toks = [p["file_token"] for p in lb.get_row(rid)["pieces"] if p.get("name") in names]
+                    if toks:
+                        lb.remove_files(rid, toks)
+                except Exception as e2:
+                    log("up", f"{rid} dọn file dở lỗi: {e2}")
+                if isinstance(e, (AuthError, QuotaError)):
+                    raise
+                raise StepError("up", f"{rid}: {e}")
+            done[rid] = note
+            done_ids.add(rid)
+            log("up", f"{rid} ✓ {len(files)} file")
+    finally:
+        if done:
+            try:
                 lb.write_notes(done)
-            raise StepError("up", f"{rid}: {e}")
-        done[rid] = note
-        log("up", f"{rid} ✓ {len(files)} file")
-    if done:
-        lb.write_notes(done)
+            except Exception as e:
+                log("up", f"ghi note up thất bại: {e}")
 
 
 # ---------- 1 nhóm ----------
@@ -433,8 +458,7 @@ def process_group(g, rundir, day, dry, stats):
         any_fail = False
         for k, sub in enumerate(pick["colors"], 1):
             sub_rows = [r for r in rows if r["record_id"] in sub["record_ids"]]
-            any_fail |= process_subgroup(sub, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline)
-            done_ids |= {r["record_id"] for r in sub_rows}
+            any_fail |= process_subgroup(sub, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline, done_ids)
         stats["qafail" if any_fail else "ok"] += 1
         if not dry:
             cleanup(gdir)
@@ -604,6 +628,58 @@ def _selfcheck():
     except SystemExit:
         pass
     release_lock(lk); assert not lk.exists()
+    if sys.platform != "win32":              # PID khác nhưng còn sống (PID cha) -> cũng phải chặn
+        lk2 = td / "y.lock"; lk2.write_text(str(os.getppid()))
+        try:
+            acquire_lock(lk2); raise AssertionError("lock PID sống khác phải chặn")
+        except SystemExit:
+            pass
+        lk2.unlink()
+    # _piece_quota: chỉ tính dòng "✗ mảnh ..." khớp QUOTA_RE
+    assert _piece_quota("[gen] ✗ mảnh ao_sau lỗi: HTTP 429 usage_limit") is True
+    assert _piece_quota("[vision] lỗi codex: HTTP 429") is False
+    assert _piece_quota("[gen] ✗ mảnh x lỗi: openart không tạo file") is False
+    # upload_rows: lỗi giữa chừng không mất note dòng đã up, không ghi LỖI nhầm dòng đã up
+    import lark_base as _lb
+    orig = (_lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes)
+    try:
+        rows = [{"record_id": "r1"}, {"record_id": "r2"}, {"record_id": "r3"}]
+        files = [td / "final_a.png"]; files[0].write_text("x")
+        calls = {"remove": [], "notes": None}
+        def fake_get_row(rid):
+            return {"has_pieces": False, "pieces": [{"name": "final_a.png", "file_token": f"tok_{rid}"}]}
+        def fake_upload(rid, fs):
+            if rid == "r2":
+                raise QuotaError("hết hạn mức")
+        def fake_remove(rid, toks):
+            calls["remove"].append((rid, toks))
+        def fake_write_notes(notes):
+            calls["notes"] = dict(notes)
+        _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = \
+            fake_get_row, fake_upload, fake_remove, fake_write_notes
+        done_ids = set()
+        try:
+            upload_rows(rows, files, "note1", False, done_ids)
+            raise AssertionError("QuotaError phải ném tiếp")
+        except QuotaError:
+            pass
+        assert done_ids == {"r1"}
+        assert calls["notes"] == {"r1": "note1"}
+        assert calls["remove"] == [("r2", ["tok_r2"])]
+        # lỗi lạ (không phải StepError) -> StepError kind "up"
+        def fake_upload2(rid, fs):
+            if rid == "r2":
+                raise RuntimeError("boom")
+        _lb.upload_files = fake_upload2
+        done_ids2 = set()
+        try:
+            upload_rows(rows, files, "note2", False, done_ids2)
+            raise AssertionError("phải ném StepError")
+        except StepError as e:
+            assert e.kind == "up" and "r2" in str(e) and "boom" in str(e)
+        assert done_ids2 == {"r1"}
+    finally:
+        _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = orig
     print("batch selfcheck OK")
 
 
