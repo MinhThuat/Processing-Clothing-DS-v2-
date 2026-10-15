@@ -180,6 +180,8 @@ async def regen(request):
     if not rundir.is_dir() or slug not in KNOWN_SLUGS:
         return web.json_response({"error": "run/slug không hợp lệ"}, status=400)
     pdir = rundir / f"person_{person}"
+    if not (pdir / "pieces.json").is_file():   # run 2 ảnh / combined: pieces.json nằm thẳng trong run
+        pdir = rundir
     cache = pdir / "pieces.json"; front = pdir / "crop_front.png"
     if not cache.is_file() or not front.is_file():
         return web.json_response({"error": "thiếu pieces.json/crop để gen lẻ"}, status=400)

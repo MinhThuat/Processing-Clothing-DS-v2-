@@ -41,6 +41,18 @@ def log(stage, msg=""):
         _LOGF.write(line + "\n"); _LOGF.flush()
 
 EMIT = None   # nếu set: crop/panel ghi thẳng vào thư mục này (cho UI web poll)
+COLOR = None  # --color: ép màu nền vải (batch: nhóm con màu khác ảnh gốc)
+HINT = None   # --hint: ghi chú sửa lỗi QA ghép cuối prompt (batch: gen lại lần 3-4)
+
+def _prompt_extra():
+    """Phần ghép thêm vào MỌI prompt gen theo --color/--hint (rỗng nếu không truyền)."""
+    s = ""
+    if COLOR:
+        s += (f" RECOLOUR: the garment's BASE fabric colour must be {COLOR}; keep every graphic, "
+              "motif and its position exactly — only the base fabric colour changes.")
+    if HINT:
+        s += " FIX: " + HINT
+    return s
 
 def _workdir(prefix, sub=""):
     """Thư mục làm việc: dùng EMIT (được serve) nếu có, không thì temp."""
@@ -382,7 +394,7 @@ def _make_piece(spec, refs, work, out, flat=False):
         cutout(tmp).save(dst)                               # cắt theo silhouette, nền trong suốt
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
-        gen_panel(tpl.format(label=spec["label"], base=_base_colour(spec["desc"]), desc=spec["desc"]),
+        gen_panel(tpl.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]), desc=spec["desc"]),
                   [ref], dst)
         _flatten_white(dst)                                 # full-bleed: đục, nền vải trắng
     return dst
@@ -480,6 +492,7 @@ def _openart_gen(prompt, refs, out, timeout=300):
 
 def gen_panel(prompt, refs, out):
     """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt Seedream 4.5."""
+    prompt = prompt + _prompt_extra()
     try:
         log("gen", "  → thử chatgpt-imagegen (codex) ...")
         r = _chatgpt_gen(prompt, refs, out)
@@ -541,11 +554,17 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
     if only:
         want = set(only if isinstance(only, (list, tuple, set)) else str(only).split(","))
         plan = [s for s in plan if _slug_wanted(s["slug"], want)]
-    outs = []
+    outs, errs = [], []
     for spec in plan:
         log("gen", f"gen mảnh {spec['slug']} ({'phẳng' if flat else '3D'}) ...")
-        outs.append(_make_piece(spec, refs, work, out, flat=flat))
+        try:
+            outs.append(_make_piece(spec, refs, work, out, flat=flat))
+        except Exception as e:                  # 1 mảnh lỗi -> làm tiếp mảnh khác (batch gen lại sau)
+            log("gen", f"  ✗ mảnh {spec['slug']} lỗi: {str(e)[:300]}")
+            errs.append(e)
     log("done", f"{len(outs)} mảnh: " + ", ".join(o.name for o in outs))
+    if errs and not outs:
+        raise errs[-1]
     return outs[0] if outs else out
 
 def run_art_one(client, img, out, emit_sub="", **_):
@@ -597,19 +616,23 @@ def _run_perperson(img, out, worker, label, wprefix, **wkw):
     log("done", f"{label} {len(outs)}/{len(boxes)}: " + ", ".join(o.name for o in outs))
     return outs
 
-def run_pieces(front, out, back=None, combined=False, only=None, cache=None, flat=False):
-    """Tách mảnh. 1 ảnh (tự suy sau) -> tách từng người. --back/--combined -> 1 trang phục, lưng thật.
+def run_pieces(front, out, back=None, combined=False, only=None, cache=None, flat=False, single=False):
+    """Tách mảnh. 1 ảnh (tự suy sau) -> tách từng người. --back/--combined/--single -> 1 trang phục.
     only = chỉ gen slug đã chọn; cache = gen lẻ dùng lại mô tả cũ; flat = vẽ phẳng vector thay vì 3D."""
-    if back or combined or cache:
+    if back or combined or cache or single:
         client = _ark_client()
-        tag = "gen lẻ (cache)" if cache else ("+sau thật (2 ảnh)" if back else "2-view (1 ảnh)")
+        tag = "gen lẻ (cache)" if cache else ("+sau thật (2 ảnh)" if back else
+                                             ("2-view (1 ảnh)" if combined else "1 bộ (--single)"))
         log("start", f"PIECES tách mảnh | {Path(front).name} | {tag} | {'phẳng' if flat else '3D'}")
         run_pieces_one(client, front, Path(out), back=back, combined=combined, only=only, cache=cache, flat=flat)
         return [Path(out)]
     return _run_perperson(front, Path(out), run_pieces_one, "PIECES tách mảnh", "piecesset_", only=only, flat=flat)
 
-def run_art(front, out):
-    """Art phẳng: 1 bản vẽ nguyên bộ mặt trước. Tách từng người."""
+def run_art(front, out, single=False):
+    """Art phẳng: 1 bản vẽ nguyên bộ mặt trước. Tách từng người (--single: không tách)."""
+    if single:
+        log("start", f"ART phẳng nguyên bộ | {Path(front).name} | 1 bộ (--single)")
+        return [run_art_one(_ark_client(), front, Path(out))]
     return _run_perperson(front, Path(out), run_art_one, "ART phẳng nguyên bộ", "artset_")
 
 
@@ -656,6 +679,13 @@ def _selfcheck():
     assert _base_colour("base white; yoke yellow") == "white"
     assert _base_colour("base mustard yellow #E6A817; x") == "mustard yellow #E6A817"
     assert _base_colour("no base word") == "the panel's own solid fabric colour"
+    # --color / --hint: ghép vào cuối prompt; mặc định rỗng
+    globals()["COLOR"], globals()["HINT"] = None, None
+    assert _prompt_extra() == ""
+    globals()["COLOR"], globals()["HINT"] = "heliconia pink", "NO chest graphic on back"
+    ex = _prompt_extra()
+    assert "heliconia pink" in ex and "FIX: NO chest graphic on back" in ex
+    globals()["COLOR"], globals()["HINT"] = None, None
     print("selfcheck OK")
 
 
@@ -676,6 +706,10 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--out", default="flat_out.png")
     ap.add_argument("--log", help="file ghi log (mặc định: <out>.log cạnh output)")
     ap.add_argument("--emit", help="ghi crop/mảnh vào thư mục này (cho UI web poll)")
+    ap.add_argument("--single", action="store_true",
+                    help="coi --front là 1 bộ đồ, bỏ bước tách người (batch đã tự crop)")
+    ap.add_argument("--color", help="ép màu nền vải (vd 'heliconia pink'), giữ họa tiết")
+    ap.add_argument("--hint", help="ghi chú sửa lỗi ghép cuối mọi prompt gen")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
@@ -683,12 +717,14 @@ if __name__ == "__main__":
     elif a.front:
         if a.emit:
             globals()["EMIT"] = a.emit
+        globals()["COLOR"], globals()["HINT"] = a.color, a.hint
         out = Path(a.out)
         logpath = _open_log(a.log or out.with_suffix(".log"))
         log("start", f"log -> {logpath}")
         if a.art:
-            run_art(a.front, out)
+            run_art(a.front, out, single=a.single)
         else:                                   # mặc định: pieces
-            run_pieces(a.front, out, back=a.back, combined=a.combined, only=a.only, cache=a.cache, flat=a.flat)
+            run_pieces(a.front, out, back=a.back, combined=a.combined, only=a.only, cache=a.cache,
+                       flat=a.flat, single=a.single)
     else:
         ap.error("cần --front (+ --pieces hoặc --art), hoặc --selfcheck")
