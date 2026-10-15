@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flat Studio · ảnh váy → rập phẳng</title>
+<style>
+  :root{
+    --mat:#16302b; --mat2:#1b3a33; --grid:#294c43; --ink:#0e1917; --paper:#efe9dc;
+    --chalk:#e4ece8; --muted:#93a8a0; --thread:#e0483b; --pin:#e0a83f; --line:#33534b;
+    --r:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--ink); color:var(--chalk);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  .disp{font-family:"Arial Narrow","Archivo Narrow",Archivo,system-ui,sans-serif;
+    text-transform:uppercase; letter-spacing:.14em; font-weight:700}
+  .mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace}
+
+  /* ---- header ---- */
+  header{display:flex;align-items:center;gap:14px;padding:10px 18px;
+    background:linear-gradient(var(--ink),#0c1614);border-bottom:1px solid var(--line)}
+  .logo{width:26px;height:26px;flex:0 0 26px;border:2px solid var(--thread);border-radius:50%;
+    position:relative}
+  .logo::after{content:"";position:absolute;inset:5px;border-radius:50%;background:var(--pin)}
+  header h1{font-size:17px;margin:0}
+  header h1 .sub{color:var(--muted);font-weight:400;letter-spacing:.24em;font-size:11px;margin-left:8px}
+  .sp{flex:1}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;padding:5px 11px;border-radius:99px;
+    border:1px solid var(--line);color:var(--muted);background:#0c1614}
+  .chip .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .chip.ok .dot{background:#54c98a} .chip.ok{color:#bfe8d1;border-color:#2c5c45}
+  .chip.bad .dot{background:var(--thread)} .chip.bad{color:#f2b3ad;border-color:#7a2b26}
+  .ghost{background:transparent;border:1px solid var(--line);color:var(--chalk);
+    padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px}
+  .ghost:hover{border-color:var(--pin);color:var(--pin)}
+  .ghost[hidden]{display:none}
+  .ghost.hot{border-color:var(--thread);color:#f2b3ad;background:#2a1614}
+  .ghost:disabled{opacity:.6;cursor:default}
+
+  /* ---- cutting mat (canvas) ---- */
+  #mat{flex:1;overflow:auto;padding:20px 22px;
+    background:
+      repeating-linear-gradient(0deg,transparent 0 39px,var(--grid) 39px 40px),
+      repeating-linear-gradient(90deg,transparent 0 39px,var(--grid) 39px 40px),
+      var(--mat);
+    background-size:40px 40px;}
+  .lane{margin-bottom:18px}
+  .lane > .lbl{font-size:11px;color:var(--chalk);opacity:.75;margin:0 0 10px}
+  .lane > .lbl b{color:var(--pin)}
+  .pieces{display:flex;flex-wrap:wrap;gap:14px}
+  .piece{position:relative;background:var(--paper);border-radius:6px;padding:8px;
+    box-shadow:0 6px 18px rgba(0,0,0,.35);
+    outline:2px dashed #b9ad93;outline-offset:-6px;}
+  .piece.big{padding:10px}
+  .piece img{display:block;border-radius:3px;background:#fff;cursor:pointer}
+  .piece img:hover{outline:2px solid var(--pin);outline-offset:2px}
+  .piece .cap{font-size:10.5px;color:#5c5647;text-align:center;margin-top:6px;
+    text-transform:uppercase;letter-spacing:.08em}
+  .piece .pin{position:absolute;top:-6px;left:50%;transform:translateX(-50%);
+    width:11px;height:11px;border-radius:50%;background:var(--pin);
+    box-shadow:0 1px 3px rgba(0,0,0,.5)}
+  /* mảnh nhỏ (crop/panel) vs thành phẩm */
+  .lane.crop img{height:120px;width:auto}
+  .lane.panel img{height:180px;width:auto}
+  .lane.final img{height:240px;width:auto;max-width:100%}   /* đủ nhìn, file gốc vẫn full-size */
+  .piece .regen{position:absolute;top:-8px;right:-8px;z-index:2;width:24px;height:24px;
+    border-radius:50%;border:0;cursor:pointer;background:var(--thread);color:#fff;
+    font-size:14px;line-height:24px;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+  .piece .regen:hover{background:var(--pin);color:#241a06}
+  .piece .regen:disabled{opacity:.6;cursor:default}
+  .empty{color:var(--muted);font-size:13px;border:1px dashed var(--line);
+    border-radius:8px;padding:26px;text-align:center}
+
+  /* thanh chạy đang gen: tailor tacks marching */
+  @keyframes march{to{outline-offset:-9px}}
+  .working .piece.pending{outline-color:var(--thread);animation:march .9s linear infinite alternate}
+
+  /* ---- codex badge ---- */
+  #badge{display:none;background:linear-gradient(90deg,#7a2b26,#a5352d);
+    border-top:2px solid var(--thread);border-bottom:2px solid var(--thread);
+    padding:14px 20px}
+  #badge.show{display:block}
+  #badge .row{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  #badge .big{font-size:15px}
+  #badge .hint{font-size:12.5px;color:#ffd9d4;margin:8px 0 0;line-height:1.5}
+  #badge .hint code{background:#00000038;padding:1px 6px;border-radius:4px}
+  #clog{margin-top:8px;max-height:120px;overflow:auto;background:#00000040;
+    border-radius:6px;padding:8px 10px;font-size:12px;white-space:pre-wrap;display:none}
+  .btn{background:var(--thread);color:#fff;border:0;padding:9px 16px;border-radius:8px;
+    cursor:pointer;font-weight:700;font-size:13px}
+  .btn:hover{filter:brightness(1.08)} .btn:disabled{opacity:.5;cursor:default}
+  .btn.pin{background:var(--pin);color:#241a06}
+
+  /* ---- control deck ---- */
+  #deck{background:linear-gradient(#12201d,#0e1917);border-top:1px solid var(--line);
+    padding:14px 18px 16px;display:grid;grid-template-columns:1fr 1fr 320px;gap:16px;align-items:start}
+  .field > .lbl{font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:8px}
+  /* mode segmented */
+  .seg{display:flex;gap:6px;flex-wrap:wrap}
+  .seg button{flex:1;min-width:120px;background:#0c1614;border:1px solid var(--line);color:var(--chalk);
+    padding:9px 10px;border-radius:8px;cursor:pointer;font-size:12.5px;text-align:left;line-height:1.3}
+  .seg button small{display:block;color:var(--muted);font-size:10.5px;margin-top:2px}
+  .seg button.on{border-color:var(--thread);background:#1b1310;color:#fff}
+  .seg button.on small{color:#f0b3ad}
+  /* dropzones */
+  .drops{display:flex;gap:12px}
+  .dz{position:relative;flex:1;border:1.5px dashed var(--line);border-radius:10px;min-height:104px;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+    cursor:pointer;text-align:center;padding:10px;background:#0c1614;transition:.15s}
+  .dz:hover,.dz.drag{border-color:var(--pin);background:#12201d}
+  .dz .k{font-size:12px;color:var(--chalk)} .dz .h{font-size:10.5px;color:var(--muted)}
+  .dz .pv{display:flex;flex-direction:column;align-items:center;gap:5px;width:100%}
+  .dz .pv img{max-height:82px;max-width:100%;border-radius:5px}
+  .dz .clr{position:absolute;top:6px;right:6px;width:23px;height:23px;border-radius:50%;
+    background:var(--thread);color:#fff;border:0;cursor:pointer;font-size:15px;line-height:1;
+    display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,.45)}
+  .dz .clr:hover{filter:brightness(1.12)}
+  .dz.off{display:none}
+  .go{background:var(--thread);color:#fff;border:0;width:100%;padding:13px;border-radius:10px;
+    font-weight:700;font-size:15px;cursor:pointer;margin-top:12px}
+  .go:hover{filter:brightness(1.08)} .go:disabled{opacity:.5;cursor:default}
+  .sel{background:#0c1614;border:1px solid var(--line);color:var(--chalk);border-radius:8px;
+    padding:7px 10px;font-size:12px;cursor:pointer}
+  .sel:focus{outline:2px solid var(--pin);outline-offset:1px}
+  /* stitch log */
+  #log{background:#0a1210;border:1px solid var(--line);border-radius:10px;height:190px;
+    overflow:auto;padding:10px 12px;font-size:11.5px;line-height:1.5;color:#bfe8d1;white-space:pre-wrap}
+  #log .stg{color:var(--pin)} #log .err{color:var(--thread)}
+  .deck-lbl{font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:8px}
+
+  @media (max-width:900px){#deck{grid-template-columns:1fr}}
+  @media (prefers-reduced-motion:reduce){.working .piece.pending{animation:none}}
+  /* ---- guided tour ---- */
+  #tour{position:fixed;inset:0;z-index:60;display:none} #tour.on{display:block}
+  #tourHole{position:fixed;border-radius:8px;border:2px solid var(--pin);pointer-events:none;
+    box-shadow:0 0 0 9999px rgba(4,10,8,.74);transition:top .2s,left .2s,width .2s,height .2s}
+  #tourTip{position:fixed;max-width:300px;background:#12211d;border:1px solid var(--pin);
+    border-radius:10px;padding:14px;box-shadow:0 10px 34px rgba(0,0,0,.55)}
+  #tourTip h4{margin:0 0 6px;font-size:14px;color:var(--pin)}
+  #tourTip p{margin:0 0 12px;font-size:12.5px;color:var(--chalk);line-height:1.55}
+  #tourTip b{color:#fff}
+  #tourTip .nav{display:flex;gap:8px;align-items:center}
+  #tourTip .nav .step{flex:1;color:var(--muted);font-size:11px}
+  #tourClose{position:absolute;top:8px;right:10px;border:0;background:transparent;color:var(--muted);
+    font-size:16px;padding:0;cursor:pointer;line-height:1}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <h1 class="disp">Flat Studio<span class="sub">ảnh váy → rập phẳng</span></h1>
+  <div class="sp"></div>
+  <button id="btnTour" class="ghost">▶ Hướng dẫn</button>
+  <span id="cxchip" class="chip"><span class="dot"></span><span id="cxtxt">đang kiểm tra codex…</span></span>
+  <button id="restart" class="ghost">↻ Restart</button>
+</header>
+<div id="tour">
+  <div id="tourHole"></div>
+  <div id="tourTip">
+    <button id="tourClose" title="đóng">✕</button>
+    <h4 id="tourH"></h4><p id="tourP"></p>
+    <div class="nav"><span class="step" id="tourStep"></span>
+      <button id="tourPrev" class="ghost">← Trước</button>
+      <button id="tourNext" class="ghost">Tiếp →</button></div>
+  </div>
+</div>
+
+<!-- CANVAS: cutting mat -->
+<div id="mat">
+  <div class="lane crop"><p class="lbl"><b>Mảnh cắt</b> · dola-seed tách từ ảnh gốc</p>
+    <div class="pieces" id="gcrop"><div class="empty">Nạp ảnh ở dưới rồi bấm “Tạo rập”. Các mảnh sẽ được ghim lên bàn cắt.</div></div></div>
+  <div class="lane panel"><p class="lbl"><b>Panel gen</b> · ép phẳng flat-vector</p>
+    <div class="pieces" id="gpanel"></div></div>
+  <div class="lane final"><p class="lbl"><b>Thành phẩm</b> · layout ghép</p>
+    <div class="pieces" id="gfinal"></div></div>
+</div>
+
+<!-- CODEX EXPIRY BADGE -->
+<div id="badge">
+  <div class="row">
+    <b class="big disp">⚠ Codex hết hạn — cần đăng nhập lại</b>
+    <button id="cxlogin" class="btn">Đăng nhập lại</button>
+    <span style="flex:1"></span>
+    <button id="cxclose" class="ghost">Ẩn</button>
+  </div>
+  <p class="hint">Bấm <b>Đăng nhập lại</b> để chạy <code>codex login</code>, rồi mở URL/mã hiện bên dưới trong trình duyệt và xác nhận.
+     Hoặc mở terminal gõ <code>codex login</code> thủ công.</p>
+  <div id="clog" class="mono"></div>
+</div>
+
+<!-- CONTROL DECK -->
+<div id="deck">
+  <div class="field">
+    <div class="lbl disp">Chế độ</div>
+    <div class="seg" id="seg">
+      <button data-m="pieces" class="on">Tách mảnh<small>auto váy/áo-quần · full-bleed · mỗi mảnh 1 ảnh</small></button>
+      <button data-m="art">Art phẳng<small>1 bản vẽ nguyên bộ, mặt trước</small></button>
+    </div>
+    <label id="cbwrap" style="display:flex;gap:8px;align-items:center;margin-top:12px;cursor:pointer;font-size:13px;color:var(--chalk)">
+      <input type="checkbox" id="cbcombined"> Ảnh mặt trước gồm CẢ 2 mặt (trước + sau trong 1 ảnh)
+    </label>
+    <label id="flatwrap" style="display:flex;gap:8px;align-items:center;margin-top:8px;cursor:pointer;font-size:13px;color:var(--chalk)">
+      <input type="checkbox" id="cbflat"> Vẽ PHẲNG vector (bỏ hiệu ứng nổi/3D — mặc định giữ 3D)
+    </label>
+    <details id="onlywrap" style="margin-top:10px;font-size:12.5px;color:var(--chalk)">
+      <summary style="cursor:pointer;color:var(--muted)">Chỉ gen mảnh chọn (bỏ trống = tất cả)</summary>
+      <div id="onlyboxes" style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px">
+        <b style="width:100%;color:var(--muted);font-weight:600">Áo + quần</b>
+        <label><input type="checkbox" data-slug="ao_truoc"> Áo trước</label>
+        <label><input type="checkbox" data-slug="ao_sau"> Áo sau</label>
+        <label><input type="checkbox" data-slug="tay_truoc"> Tay trước</label>
+        <label><input type="checkbox" data-slug="tay_sau"> Tay sau</label>
+        <label><input type="checkbox" data-slug="quan_truoc"> Quần trước</label>
+        <label><input type="checkbox" data-slug="quan_sau"> Quần sau</label>
+        <b style="width:100%;color:var(--muted);font-weight:600;margin-top:4px">Váy</b>
+        <label><input type="checkbox" data-slug="than_truoc"> Thân trước</label>
+        <label><input type="checkbox" data-slug="than_sau"> Thân sau</label>
+        <label><input type="checkbox" data-slug="ta_truoc"> Tà trước</label>
+        <label><input type="checkbox" data-slug="ta_sau"> Tà sau</label>
+      </div>
+    </details>
+    <div class="drops" style="margin-top:14px">
+      <div class="dz" id="dzf" data-k="front">
+        <div class="ph"><div class="k">Ảnh chính (mặt trước)</div><div class="h">kéo-thả · dán Ctrl+V · bấm chọn — từ web hoặc máy</div></div>
+        <div class="pv" hidden></div>
+        <input type="file" id="ff" accept="image/*" hidden></div>
+      <div class="dz" id="dzb" data-k="back">
+        <div class="ph"><div class="k">Ảnh mặt sau (tùy chọn)</div><div class="h">có → dùng lưng thật · kéo-thả / dán / chọn</div></div>
+        <div class="pv" hidden></div>
+        <input type="file" id="fb" accept="image/*" hidden></div>
+    </div>
+  </div>
+
+  <div class="field">
+    <div class="lbl disp">Chạy</div>
+    <div class="mono" style="font-size:12px;color:var(--muted);line-height:1.6">
+      Pipeline: <b style="color:var(--chalk)">dola-seed</b> phân loại + tả mảnh →
+      <b style="color:var(--chalk)">chatgpt-imagegen</b> (lỗi → OpenArt) → xuất từng mảnh.
+    </div>
+    <button class="go" id="go">✂ Tạo rập</button>
+    <div id="stat" class="mono" style="font-size:11.5px;color:var(--muted);margin-top:8px"></div>
+  </div>
+
+  <div class="field">
+    <div class="deck-lbl disp">Nhật ký</div>
+    <div id="log" class="mono">—</div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s), api=(u,o)=>fetch(u,o).then(r=>r.json());
+// fetch có timeout: quá hạn -> hủy, ném lỗi (tránh kẹt "đang tải…")
+async function apiT(u,o={},ms=45000){
+  const c=new AbortController(), t=setTimeout(()=>c.abort(),ms);
+  try{ const r=await fetch(u,{...o,signal:c.signal}); return await r.json(); }
+  catch(e){ throw new Error(e.name==="AbortError"?"quá thời gian, thử lại":e.message); }
+  finally{ clearTimeout(t); }
+}
+let mode="pieces", run=null, poll=null;
+const picks={front:null, back:null};
+
+// ---- mode segmented ----
+function syncMode(){
+  const pieces=mode==="pieces", combined=$("#cbcombined").checked;
+  $("#cbwrap").style.display=pieces?"flex":"none";        // checkbox chỉ cho pieces
+  $("#flatwrap").style.display=pieces?"flex":"none";      // kiểu vẽ chỉ cho pieces
+  $("#onlywrap").style.display=pieces?"block":"none";     // chọn mảnh chỉ cho pieces
+  $("#dzb").classList.toggle("off", !pieces || combined); // art / combined -> ẩn ảnh sau
+}
+$("#seg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b)return;
+  [...$("#seg").children].forEach(x=>x.classList.toggle("on",x===b));
+  mode=b.dataset.m; syncMode();
+});
+$("#cbcombined").addEventListener("change",syncMode);
+syncMode();
+
+// ---- dropzones: file / kéo-thả (web+local) / dán Ctrl+V / xóa ----
+let active={dz:$("#dzf"),key:"front"};   // vùng nhận khi dán (paste)
+function setActive(dz,key){active={dz,key};}
+function ph(dz){return dz.querySelector(".ph");}
+function pv(dz){return dz.querySelector(".pv");}
+function setK(dz,t){const k=dz.querySelector(".ph .k"); if(k)k.textContent=t;}
+function extractImgUrl(html){const m=html&&html.match(/<img[^>]+src=["']([^"']+)["']/i);return m?m[1]:"";}
+
+function showThumb(dz,key,src,name){
+  pv(dz).innerHTML=`<button class="clr" title="Xóa ảnh này">×</button>`+
+    `<img src="${src}"><div class="h">${(name||"").slice(0,42)}</div>`;
+  pv(dz).hidden=false; ph(dz).hidden=true;
+  pv(dz).querySelector(".clr").onclick=ev=>{ev.stopPropagation();clearPick(dz,key);};
+}
+function clearPick(dz,key){
+  picks[key]=null; pv(dz).innerHTML=""; pv(dz).hidden=true; ph(dz).hidden=false;
+  setK(dz,dz.dataset.k0||"Ảnh");   // khôi phục nhãn gốc (không để kẹt "đang tải…")
+  toastStat("đã xóa ảnh "+(key==="front"?"mặt trước":"mặt sau"));
+}
+
+function wireDrop(dz,input,key){
+  dz.dataset.k0=dz.querySelector(".ph .k").textContent;
+  dz.addEventListener("click",e=>{if(e.target.closest(".clr"))return;setActive(dz,key);input.click();});
+  dz.addEventListener("mouseenter",()=>setActive(dz,key));
+  input.addEventListener("change",()=>input.files[0]&&upload(input.files[0],dz,key));
+  dz.addEventListener("dragover",e=>{e.preventDefault();dz.classList.add("drag");});
+  dz.addEventListener("dragleave",()=>dz.classList.remove("drag"));
+  dz.addEventListener("drop",e=>{e.preventDefault();dz.classList.remove("drag");
+    const dt=e.dataTransfer;
+    if(dt.files&&dt.files.length){upload(dt.files[0],dz,key);return;}
+    const url=(dt.getData("text/uri-list")||dt.getData("text/plain")||extractImgUrl(dt.getData("text/html"))||"").trim();
+    if(url)fromUrl(url,dz,key); else toastStat("⚠ không nhận được ảnh từ thao tác kéo");
+  });
+}
+async function upload(file,dz,key){
+  setK(dz,"đang tải…");
+  try{
+    const fd=new FormData(); fd.append("f",file,file.name||"paste.png");
+    const r=await apiT("/upload",{method:"POST",body:fd});
+    if(r.error||!r.paths||!r.paths.length) throw new Error(r.error||"tải ảnh thất bại");
+    picks[key]=r.paths[0]; showThumb(dz,key,URL.createObjectURL(file),file.name||"ảnh dán");
+  }catch(err){ setK(dz,dz.dataset.k0); toastStat("⚠ "+err.message); }
+}
+async function fromUrl(url,dz,key){
+  setK(dz,"đang tải từ web…");
+  try{
+    const r=await apiT("/fetch_url",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
+    if(r.error||!r.path) throw new Error(r.error||"tải ảnh thất bại");
+    picks[key]=r.path; showThumb(dz,key,"/media?p="+encodeURIComponent(r.path),url.split("/").pop());
+  }catch(err){ setK(dz,dz.dataset.k0); toastStat("⚠ "+err.message); }
+}
+wireDrop($("#dzf"),$("#ff"),"front");
+wireDrop($("#dzb"),$("#fb"),"back");
+
+// dán ảnh (Ctrl+V) bất kỳ đâu -> vào vùng đang chọn
+document.addEventListener("paste",e=>{
+  const cd=e.clipboardData; if(!cd)return;
+  for(const it of cd.items||[]){
+    if(it.type&&it.type.startsWith("image/")){const f=it.getAsFile();
+      if(f){upload(f,active.dz,active.key);e.preventDefault();return;}}
+  }
+  const txt=(cd.getData("text")||"").trim();
+  const url=/^https?:\/\//.test(txt)?txt:extractImgUrl(cd.getData("text/html"));
+  if(url){fromUrl(url,active.dz,active.key);e.preventDefault();}
+});
+
+// ---- run ----
+$("#go").addEventListener("click",async()=>{
+  if(!picks.front){toastStat("⚠ chưa có ảnh mặt trước");return;}
+  const combined=mode==="pieces"&&$("#cbcombined").checked;
+  const back=(mode==="pieces"&&!combined)?picks.back:null;
+  const only=mode==="pieces"?[...document.querySelectorAll("#onlyboxes input:checked")].map(c=>c.dataset.slug):[];
+  const flat=mode==="pieces"&&$("#cbflat").checked;
+  $("#go").disabled=true; $("#go").textContent="⏳ đang chạy…";
+  ["#gcrop","#gpanel","#gfinal"].forEach(g=>$(g).innerHTML="");
+  const r=await api("/run",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({mode,front:picks.front,back,combined,only,flat})});
+  if(r.error){toastStat("⚠ "+r.error);resetGo();return;}
+  run=r.run; startPoll();
+});
+function resetGo(){$("#go").disabled=false;$("#go").textContent="✂ Tạo rập";}
+function toastStat(m){$("#stat").textContent=m}
+
+function startPoll(){ clearInterval(poll); poll=setInterval(tick,1500); tick(); }
+async function tick(){
+  const s=await api("/state?run="+run); if(s.error)return;
+  renderLog(s.log); renderImgs(s.images);
+  setUpdate(s.src_changed);
+  if(s.codex_bad) showBadge();
+  $("#mat").classList.toggle("working",s.running);
+  toastStat(s.running?"⏳ đang xử lý…":"✓ xong");
+  if(!s.running){clearInterval(poll);resetGo();}
+}
+function renderLog(t){
+  const el=$("#log");
+  el.innerHTML=(t||"—").split("\n").map(l=>{
+    l=l.replace(/</g,"&lt;");
+    if(/lỗi|error|✗/i.test(l))return `<span class="err">${l}</span>`;
+    return l.replace(/(\[[a-z ]+\])/i,'<span class="stg">$1</span>');
+  }).join("\n");
+  el.scrollTop=el.scrollHeight;
+}
+const SLUG_LABEL={ao_truoc:"Áo trước",ao_sau:"Áo sau",quan_truoc:"Quần trước",quan_sau:"Quần sau",
+  tay_truoc:"Tay trước",tay_sau:"Tay sau",tay_trai_truoc:"Tay trái trước",tay_trai_sau:"Tay trái sau",
+  tay_phai_truoc:"Tay phải trước",tay_phai_sau:"Tay phải sau",than_truoc:"Thân váy trước",
+  than_sau:"Thân váy sau",ta_truoc:"Tà váy trước",ta_sau:"Tà váy sau"};
+function piece(im,pending,big){
+  const regen = im.slug ? `<button class="regen" title="Gen lại mảnh này (dùng mô tả cũ)" `+
+    `data-run="${run||''}" data-person="${im.person||1}" data-slug="${im.slug}">⟳</button>` : '';
+  const lbl = (im.slug && SLUG_LABEL[im.slug])
+    ? SLUG_LABEL[im.slug] + ((im.person>1)?(" · người "+im.person):"") : im.name;
+  return `<div class="piece ${big?'big':''} ${pending?'pending':''}"><span class="pin"></span>`+regen+
+    `<img src="${im.src}" loading="lazy" data-p="${im.path||''}" title="Bấm để mở thư mục chứa ảnh">`+
+    `<div class="cap">${lbl}</div></div>`;
+}
+// gen lại 1 mảnh (nút ⟳) -> /regen dùng lại mô tả cũ, không vision lại
+$("#gfinal").addEventListener("click",async e=>{
+  const b=e.target.closest(".regen"); if(!b)return;
+  e.stopPropagation(); b.disabled=true; b.textContent="…";
+  const r=await api("/regen",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({run:b.dataset.run,person:+b.dataset.person,slug:b.dataset.slug,flat:$("#cbflat").checked})});
+  if(r&&r.error){toastStat("⚠ "+r.error);b.disabled=false;b.textContent="⟳";return;}
+  toastStat("⟳ đang gen lại "+b.dataset.slug+"…"); startPoll();
+});
+function renderImgs(g){
+  $("#gcrop").innerHTML = g.crop.length? g.crop.map(x=>piece(x)).join("")
+     : '<div class="empty">chờ dola-seed tách mảnh…</div>';
+  $("#gpanel").innerHTML= g.panel.map(x=>piece(x)).join("");
+  $("#gfinal").innerHTML= g.final.map(x=>piece(x,false,true)).join("");
+}
+// bấm ảnh bất kỳ trên bàn cắt -> mở thư mục chứa ảnh
+$("#mat").addEventListener("click",e=>{
+  const img=e.target.closest(".piece img"); if(!img||!img.dataset.p)return;
+  api("/reveal?p="+encodeURIComponent(img.dataset.p))
+    .then(r=>toastStat(r&&r.error?("⚠ "+r.error):"đã mở thư mục chứa ảnh"))
+    .catch(()=>toastStat("⚠ không mở được thư mục"));
+});
+
+// ---- codex badge ----
+let badgeDismissed=false;
+function showBadge(){ if(!badgeDismissed) $("#badge").classList.add("show"); }
+$("#cxclose").onclick=()=>{badgeDismissed=true; $("#badge").classList.remove("show");};
+// đổi nhãn nút Restart khi có code mới (nút luôn hiện để restart thủ công bất cứ lúc nào)
+function setUpdate(changed){
+  const b=$("#restart"); if(b._busy)return;
+  b.textContent = changed ? "↻ Có code mới — Restart" : "↻ Restart";
+  b.classList.toggle("hot", !!changed);
+}
+$("#cxlogin").onclick=async()=>{
+  $("#cxlogin").disabled=true; $("#clog").style.display="block"; $("#clog").textContent="…";
+  await api("/codex/login",{method:"POST"});
+  const t=setInterval(async()=>{
+    const r=await api("/codex/login/log");
+    $("#clog").textContent=r.log||"…";
+    if(r.ok){clearInterval(t);setCodex(true);$("#badge").classList.remove("show");$("#cxlogin").disabled=false;}
+  },1500);
+};
+function setCodex(ok){
+  const c=$("#cxchip"); c.className="chip "+(ok?"ok":"bad");
+  $("#cxtxt").textContent=ok?"codex OK":"codex chưa đăng nhập";
+  if(ok){badgeDismissed=false; $("#badge").classList.remove("show");}
+  else showBadge();
+}
+// heartbeat: chạy cả lúc rảnh -> luôn biết codex hết hạn / có code mới
+async function heartbeat(){
+  try{ const r=await api("/codex/status"); setCodex(r.ok); setUpdate(r.src_changed); }catch(e){}
+}
+setInterval(heartbeat,8000); heartbeat();
+$("#restart").onclick=async()=>{
+  const b=$("#restart"); b._busy=true; b.disabled=true;
+  b.textContent="đang khởi động lại — chờ vài giây rồi tải lại trang…";
+  try{ await api("/restart",{method:"POST"}); }catch(e){}
+  setTimeout(()=>location.reload(), 4000);   // start.bat tự bật lại server
+};
+
+// ---------- Hướng dẫn có badge chỉ vào từng chỗ (guided tour) ----------
+const TOUR=[
+  {sel:"#seg", h:"1. Chọn chế độ", p:"Chọn kiểu rập: <b>Tách mảnh</b> (từng mảnh rời), <b>Art phẳng</b> (1 bản vẽ nguyên bộ)… tùy loại trang phục."},
+  {sel:"#cbwrap", h:"2. Tùy chọn", p:"Tick <b>2 mặt trong 1 ảnh</b>, <b>vẽ phẳng vector</b>, hoặc mở <b>Chỉ gen mảnh chọn</b> để giới hạn mảnh cần."},
+  {sel:"#dzf", h:"3. Thả ảnh", p:"<b>Kéo-thả</b>, <b>dán Ctrl+V</b>, hoặc bấm chọn ảnh mặt trước. Có ảnh <b>mặt sau</b> thì thả thêm ô bên cạnh để dùng lưng thật."},
+  {sel:"#go", h:"4. Tạo rập", p:"Bấm <b>✂ Tạo rập</b> để chạy pipeline: dola-seed tách → gen phẳng → ghép."},
+  {sel:"#mat", h:"5. Xem bàn cắt", p:"Theo dõi real-time: <b>mảnh cắt</b> → <b>panel gen</b> → <b>thành phẩm</b>. Bấm ảnh bất kỳ để mở thư mục chứa nó."},
+  {sel:"#log", h:"6. Nhật ký", p:"Xem tiến trình & lỗi từng bước ở đây. Xong là ảnh nằm trong <b>flat_studio_data/runs/</b>."},
+];
+let TI=0;
+const vis=el=>el&&el.getClientRects().length>0;
+function tgt(s){ const e=document.querySelector(s.sel); return vis(e)?e:null; }
+function showTour(i){
+  TI=(i+TOUR.length)%TOUR.length; const s=TOUR[TI], el=tgt(s), last=TI===TOUR.length-1;
+  const hole=$("#tourHole"), tip=$("#tourTip");
+  $("#tour").classList.add("on");
+  $("#tourH").innerHTML=s.h; $("#tourP").innerHTML=s.p;
+  $("#tourStep").textContent=`Bước ${TI+1}/${TOUR.length}`;
+  $("#tourNext").textContent=last?"Xong ✓":"Tiếp →";
+  $("#tourPrev").style.visibility=TI?"visible":"hidden";
+  if(el){ el.scrollIntoView({block:"center",behavior:"smooth"}); setTimeout(()=>placeTour(el,hole,tip),280); }
+  else{ hole.style.width="0"; hole.style.height="0"; tip.style.transform="translate(-50%,-50%)"; tip.style.left="50%"; tip.style.top="42%"; }
+}
+function placeTour(el,hole,tip){
+  const r=el.getBoundingClientRect(), pad=6;
+  hole.style.left=(r.left-pad)+"px"; hole.style.top=(r.top-pad)+"px";
+  hole.style.width=(r.width+pad*2)+"px"; hole.style.height=(r.height+pad*2)+"px";
+  tip.style.transform="none";
+  const tw=tip.offsetWidth, th=tip.offsetHeight, gap=14;
+  let top=r.bottom+gap; if(top+th>innerHeight-8) top=Math.max(8,r.top-gap-th);
+  const left=Math.min(Math.max(8,r.left), innerWidth-tw-8);
+  tip.style.left=left+"px"; tip.style.top=top+"px";
+}
+function reposTour(){ if($("#tour").classList.contains("on")){ const el=tgt(TOUR[TI]); if(el) placeTour(el,$("#tourHole"),$("#tourTip")); } }
+function endTour(){ $("#tour").classList.remove("on"); try{localStorage.setItem("flat_tour","1")}catch(e){} }
+$("#btnTour").onclick=()=>showTour(0);
+$("#tourNext").onclick=()=>TI===TOUR.length-1?endTour():showTour(TI+1);
+$("#tourPrev").onclick=()=>showTour(TI-1);
+$("#tourClose").onclick=endTour;
+$("#tour").addEventListener("click",e=>{ if(e.target.id==="tour") endTour(); });
+window.addEventListener("resize",reposTour);
+window.addEventListener("scroll",reposTour,true);
+try{ if(!localStorage.getItem("flat_tour")) setTimeout(()=>showTour(0),700); }catch(e){}
+</script>
+</body>
+</html>

@@ -1,0 +1,2258 @@
+#!/usr/bin/env python3
+"""chatgpt-imagegen — generate images using your ChatGPT subscription, no API key.
+
+Two backends produce the same kind of bitmap, but bill different buckets:
+
+  * web (default): drives your already-logged-in ChatGPT browser via
+    `chrome-use`, generating on the ChatGPT *conversation* surface. The real
+    browser produces the Cloudflare Turnstile token a headless client can't
+    forge — that, not Cloudflare's edge or the sentinel proof-of-work (both
+    passable bare), is the actual wall. This does NOT consume the metered
+    Codex-usage limit —
+    it's the same surface as typing in the app. Needs a logged-in browser open.
+    Conversations are grouped into a ChatGPT Project (default "imagegen",
+    created on first use) so they don't litter the chat history.
+
+  * codex: a headless POST to `chatgpt.com/backend-api/codex/responses` with the
+    `image_generation` tool, reusing the OAuth token from `~/.codex/auth.json`
+    (`codex login`). Fast and dependency-free, but every call bills the metered
+    Codex-usage bucket.
+
+Usage:
+    chatgpt-imagegen "a watercolor cat"                       # web backend (default)
+    chatgpt-imagegen "logo" -o brand/logo.png --size 1024x1024
+    chatgpt-imagegen "hero banner" -o web/hero.png --backend codex
+
+Setup (one-time):
+    web backend:   install chrome-use (formerly agent-browser-stealth) and
+                   connect its extension to your logged-in Chrome; be signed
+                   in to chatgpt.com in that browser.
+    codex backend: `npm i -g @openai/codex` and run `codex login`.
+
+Project: https://github.com/leeguooooo/chatgpt-imagegen
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+try:
+    import fcntl
+except ImportError:  # Windows
+    import msvcrt
+
+    class fcntl:  # type: ignore[no-redef]
+        LOCK_EX = 0x1
+        LOCK_NB = 0x4
+        LOCK_UN = 0x8
+
+        @staticmethod
+        def flock(f, operation):
+            if operation & fcntl.LOCK_UN:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+                return
+            mode = msvcrt.LK_NBLCK if (operation & fcntl.LOCK_NB) else msvcrt.LK_LOCK
+            f.seek(0)
+            try:
+                msvcrt.locking(f.fileno(), mode, 1)
+            except OSError:
+                raise OSError("lock unavailable")
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+__version__ = "0.11.0"
+
+CODEX_BACKEND = "https://chatgpt.com/backend-api/codex/responses"
+
+# Reference-image (image-to-image / --ref) support. Re-encode a reference under
+# this base64 budget to avoid oversized request bodies; downsizing uses macOS
+# `sips` so the no-pip-deps property is preserved.
+REF_B64_BUDGET = 5 * 1024 * 1024
+REF_MAX_EDGE = 2048
+# Hard cap on how many bytes we pull from a `--ref` URL, so a hostile or
+# mistaken link can't OOM us by streaming gigabytes into memory.
+REF_DOWNLOAD_MAX = 25 * 1024 * 1024
+# Default idle gap (seconds) tolerated between SSE chunks before the stream is
+# treated as stalled. The connect timeout urllib applies to urlopen() also
+# governs every subsequent read, so without loosening it a >connect-timeout
+# pause mid-stream (common while a detailed image renders) kills a live stream.
+# Overridable via --stall-timeout; always clamped to the total --timeout.
+# Measured: a real "generating" phase can stay silent ~66s before the first
+# partial image, so 120s leaves margin against false stalls on the slowest
+# images while still catching a genuine hang well inside the total budget.
+DEFAULT_STALL_TIMEOUT = 120.0
+DEFAULT_TOTAL_TIMEOUT = 300  # large images occasionally take 2-3 minutes
+OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's published client id
+FALLBACK_VERSION = "0.154.0"
+FALLBACK_UA = f"codex_cli_rs/{FALLBACK_VERSION} (Mac OS 26.0.1; arm64) chatgpt-imagegen"
+AUTH_PATH = Path.home() / ".codex" / "auth.json"
+VERSION_PATH = Path.home() / ".codex" / "version.json"
+
+# Web backend: drive the real, logged-in ChatGPT browser via chrome-use
+# (formerly agent-browser-stealth) so image generation runs on the ChatGPT
+# *conversation* surface (the cheap bucket) rather than the codex/responses
+# surface (the metered Codex-usage bucket). The real-Chrome connect produces
+# the Cloudflare Turnstile token a plain/headless client can't forge (the CF
+# edge IP check and the sentinel proof-of-work are both passable bare —
+# Turnstile is the wall). See README "Backends".
+# Newer installs ship a single `chrome-use` binary; older installs exposed the
+# same binary as agent-browser / agent-browser-stealth / abs — accept whichever
+# is on PATH, newest name first.
+AB_BIN_CANDIDATES = ("chrome-use", "agent-browser", "agent-browser-stealth", "abs")
+# Minimum chrome-use the web backend was verified against: img2img needs the
+# `upload` subcommand and the model switch needs coordinate clicks (`click X Y`).
+# Older binaries fail those with an opaque "exit N", so we soft-warn (never block
+# — a working older build shouldn't be locked out, and bumping it shouldn't gate
+# on a perfect version string). Stable session reuse below avoids daemon pile-up.
+AB_MIN_VERSION = "1.5.0"
+# A *regular* new chat — NOT a temporary chat. Temporary Chat disables the
+# image_generation tool ("I can't generate images in this temporary chat"),
+# so we must use a normal conversation. Trade-off: each run leaves a chat in
+# history — mitigated by grouping runs into a ChatGPT Project (--project).
+WEB_NEW_CHAT_URL = "https://chatgpt.com/"
+# A chat started from a Project's page lands inside that Project.
+WEB_PROJECT_URL = "https://chatgpt.com/g/{gizmo_id}/project"
+# Default ChatGPT Project that web-backend conversations are filed under.
+DEFAULT_PROJECT = "imagegen"
+# Image assets render as <img> whose src points at one of these backend paths.
+WEB_IMG_SRC_RE = r"estuary/content|files/download|oaiusercontent"
+# Composer model the web backend forces before generating. The "Pro" reasoning
+# tier has NO built-in image generator — it answers an image request by running
+# Code Interpreter (Python/PIL, a downloadable file) or flat-out refusing ("image
+# generation isn't available in this chat, switch to GPT-5"), so the page never
+# yields a native image asset and detection times out. "Instant" generates
+# natively. The picker is sticky per browser, so a Chrome left on Pro poisons
+# every web run until we switch it. Override via CHATGPT_IMAGEGEN_WEB_MODEL.
+# Comma-separated CANDIDATES tried in order — the first that exists in the picker
+# wins — because plans label the image-capable tier differently (Plus/Pro:
+# "Instant"; others may only have "Auto").
+WEB_MODEL_DEFAULT = "Instant,Auto"
+
+JsonDict = dict[str, Any]
+
+
+class GatewayError(RuntimeError):
+    """Raised when the upstream HTTP call fails. Carries the status code."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class WebUnavailable(GatewayError):
+    """The web backend can't run at all (chrome-use missing, browser not
+    reachable, or chatgpt.com not logged in) — as opposed to a failure that
+    happens *after* a prompt was successfully submitted.
+
+    Auto-routing treats this as "fall back to codex"; a failure after submit is
+    a plain GatewayError and must NOT silently fall back (that would burn the
+    Codex-usage bucket the web backend exists to spare)."""
+
+
+class WebRateLimited(WebUnavailable):
+    """chatgpt.com showed its "Too many requests" dialog before we submitted
+    anything — the page surface has temporarily rate-limited this account.
+
+    Subclasses WebUnavailable on purpose: nothing was submitted/billed yet, so
+    auto mode may safely fall back to codex (a different limiter). Retrying
+    other Chrome profiles is pointless when they hold the same account, and
+    each costs ~45s — so this aborts the candidate loop instead."""
+
+
+# ---------- auth ----------
+
+def _load_auth() -> JsonDict:
+    if not AUTH_PATH.exists():
+        sys.exit(
+            f"~/.codex/auth.json not found.\n"
+            f"Install Codex CLI (`npm i -g @openai/codex`) and run `codex login` first."
+        )
+    try:
+        return json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.exit(f"failed to parse {AUTH_PATH}: {e}")
+
+
+def _extract_access_token(auth: JsonDict) -> tuple[str | None, str | None, str | None]:
+    """Return (access_token, account_id, refresh_token).
+
+    Only honours the OAuth `tokens` block written by `codex login`. An older
+    `OPENAI_API_KEY` field is intentionally NOT used as a fallback — that field
+    is an API key, not a ChatGPT OAuth bearer, and the backend rejects it.
+    """
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        return None, None, None
+    access = tokens.get("access_token") if isinstance(tokens.get("access_token"), str) else None
+    account_id = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else None
+    refresh = tokens.get("refresh_token") if isinstance(tokens.get("refresh_token"), str) else None
+    return access, account_id, refresh
+
+
+def _refresh_access_token(refresh_token: str, timeout: int = 30) -> JsonDict:
+    data = urllib.parse.urlencode(
+        {
+            "client_id": OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=data,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": FALLBACK_UA,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        # Try to surface the OAuth `error` field without leaking the full body.
+        oauth_err = ""
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                oauth_err = parsed["error"]
+        except Exception:
+            pass
+        if oauth_err == "invalid_grant":
+            raise GatewayError(
+                "refresh_token is no longer valid — run `codex login` again to re-authenticate.",
+                status=e.code,
+            ) from None
+        # Avoid leaking the full response body. Surface only HTTP status and error code.
+        msg = f"token refresh failed: HTTP {e.code}"
+        if oauth_err:
+            msg += f" ({oauth_err})"
+        raise GatewayError(msg, status=e.code) from None
+
+
+def _persist_refreshed_auth(original: JsonDict, refreshed: JsonDict) -> None:
+    """Atomically rewrite ~/.codex/auth.json with the refreshed tokens.
+
+    Writes a temp file in the same directory with mode 0600, fsyncs it, then
+    os.replace()s it over the original. Survives crashes / disk-full midwrite.
+    """
+    tokens = original.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+        original["tokens"] = tokens
+    if isinstance(refreshed.get("access_token"), str):
+        tokens["access_token"] = refreshed["access_token"]
+    if isinstance(refreshed.get("refresh_token"), str):
+        tokens["refresh_token"] = refreshed["refresh_token"]
+    if isinstance(refreshed.get("id_token"), str):
+        tokens["id_token"] = refreshed["id_token"]
+    original["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    serialized = json.dumps(original, indent=2).encode("utf-8")
+    AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".auth.", suffix=".tmp", dir=str(AUTH_PATH.parent))
+    tmp_file = Path(tmp_path)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(serialized)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, AUTH_PATH)
+    except Exception:
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _detect_codex_version() -> str:
+    """Best codex version string to send in the `version` header.
+
+    Reads `~/.codex/version.json`, but returns the *newer* of that value and
+    FALLBACK_VERSION. A stale `latest_version` (seen in the wild as low as
+    0.99.0 while the installed CLI was 0.130.0) makes the backend reject newer
+    models with "requires a newer version of Codex" — so never send a version
+    older than our known-good floor.
+    """
+    def parse(v: str) -> tuple[int, int, int] | None:
+        return tuple(int(p) for p in v.split(".")) if re.fullmatch(r"\d+\.\d+\.\d+", v) else None  # type: ignore[return-value]
+
+    floor = FALLBACK_VERSION
+    try:
+        if VERSION_PATH.exists():
+            data = json.loads(VERSION_PATH.read_text(encoding="utf-8"))
+            v = data.get("latest_version")
+            if isinstance(v, str):
+                pv, pf = parse(v), parse(floor)
+                if pv and pf:
+                    return v if pv >= pf else floor
+                if pv:
+                    return v
+    except Exception:
+        pass
+    return floor
+
+
+def _loosen_read_timeout(resp: Any, timeout: float) -> None:
+    """Raise the per-read socket timeout on an already-connected response.
+
+    urlopen()'s ``timeout`` is a *connect* budget, but urllib leaves it on the
+    socket so it silently becomes the per-read timeout too. Left at the short
+    connect value, a single quiet gap in the SSE stream aborts a generation
+    that is still alive. Best-effort: if the socket isn't reachable through the
+    documented attribute chain, the connect timeout stays in place.
+    """
+    try:
+        resp.fp.raw._sock.settimeout(timeout)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _build_headers(token: str, account_id: str | None, version: str) -> dict[str, str]:
+    sid = str(uuid.uuid4())
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+        "Connection": "Keep-Alive",
+        "version": version,
+        "session_id": sid,
+        "x-client-request-id": sid,
+        "User-Agent": f"codex_cli_rs/{version} (Mac OS 26.0.1; arm64) chatgpt-imagegen",
+        "originator": "codex_cli_rs",
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    return headers
+
+
+# ---------- reference-image (img2img) helpers ----------
+
+def _is_url(ref: str) -> bool:
+    return ref.startswith("http://") or ref.startswith("https://")
+
+
+def _sniff_mime(data: bytes) -> str | None:
+    """Best-effort MIME sniff for the image types the backend accepts."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _download_ref_url(ref: str) -> bytes:
+    """Download a `--ref` URL into memory, capped at REF_DOWNLOAD_MAX bytes.
+
+    Reads incrementally and aborts past the cap so a hostile/huge link can't
+    OOM us (`urlopen().read()` with no size is unbounded). Exits cleanly on any
+    network failure or an over-cap body.
+    """
+    try:
+        req = urllib.request.Request(ref, headers={"User-Agent": FALLBACK_UA})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read(REF_DOWNLOAD_MAX + 1)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"could not download reference {ref!r}: {e}")
+    if len(raw) > REF_DOWNLOAD_MAX:
+        sys.exit(
+            f"reference {ref!r} is larger than the {REF_DOWNLOAD_MAX // (1024 * 1024)} MB "
+            f"download cap — save it locally and downsize first, then pass the file."
+        )
+    return raw
+
+
+def _load_reference(ref: str) -> tuple[str, str]:
+    """Return (base64, mime) for a local path or http(s) URL.
+
+    Downloads URLs, then sniffs the MIME. If the base64 would exceed
+    REF_B64_BUDGET, downsizes to a <=REF_MAX_EDGE JPEG via macOS `sips`
+    (keeps the no-pip-deps property). Exits cleanly on any failure.
+    """
+    src_path: str
+    cleanup: str | None = None
+    try:
+        if _is_url(ref):
+            raw = _download_ref_url(ref)
+            fd, tmp = tempfile.mkstemp(suffix=".img")
+            os.close(fd)
+            Path(tmp).write_bytes(raw)
+            src_path, cleanup = tmp, tmp
+        else:
+            p = Path(ref).expanduser()
+            if not p.is_file():
+                sys.exit(f"reference image not found: {ref}")
+            src_path = str(p)
+            raw = p.read_bytes()
+
+        mime = _sniff_mime(raw)
+        if mime is None:
+            sys.exit(f"unsupported reference image type for {ref!r} (need PNG, JPEG, or WEBP)")
+
+        b64 = base64.b64encode(raw).decode("ascii")
+        if len(b64) > REF_B64_BUDGET:
+            shrunk = _downsize_reference(src_path)
+            if shrunk is not None:
+                mime = "image/jpeg"
+                b64 = base64.b64encode(shrunk).decode("ascii")
+        return b64, mime
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+
+
+def _downsize_reference(src_path: str) -> bytes | None:
+    """Re-encode a too-large reference to a <=REF_MAX_EDGE JPEG via `sips`.
+
+    Returns the JPEG bytes, or None if `sips` is unavailable/failed (caller
+    then sends the original and lets the backend decide).
+    """
+    if shutil.which("sips") is None:
+        return None
+    fd, tmp = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", str(REF_MAX_EDGE),
+             src_path, "--out", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return None
+        return Path(tmp).read_bytes()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# ---------- request ----------
+
+def _build_web_text(prompt: str, size: str, is_edit: bool = False) -> str:
+    """Natural-language image request for the ChatGPT *page* (web backend).
+
+    Deliberately NOT the codex wording: the page has no API `image_generation`
+    tool and no output-format knob — those are codex-only concepts. Naming a
+    "tool" or demanding an "Output format: png … produce only the image" pushes
+    the page model toward Code Interpreter, which answers an image request by
+    writing Python/PIL and returning a downloadable file — never a native image
+    asset. So we ask plainly for a picture and let the native generator fire.
+    When `is_edit`, anchor on the attached reference so it edits rather than
+    inventing a fresh subject.
+    """
+    if is_edit:
+        text = (
+            f"Edit the attached image directly with your built-in image "
+            f"generator: {prompt}. Keep the reference as the canonical subject — "
+            f"reproduce its pattern, colours, and texture faithfully."
+        )
+    else:
+        text = f"Create an image with your built-in image generator: {prompt}."
+    if size and size != "auto":
+        text += f" Aspect ratio / size: {size}."
+    return text
+
+
+def _build_user_text(
+    prompt: str, size: str, output_format: str, is_edit: bool = False
+) -> str:
+    """Natural-language instruction for the **codex** backend.
+
+    The codex request wires a real `image_generation` tool, so naming it and the
+    output format is correct here (unlike the web page — see _build_web_text).
+    The codex endpoint has no size/format knobs in the message body, so we fold
+    those hints into the prompt; the model reads them and picks the aspect ratio.
+    When `is_edit`, the instruction anchors on the attached reference image so
+    the model edits it faithfully rather than inventing a fresh subject.
+    """
+    if is_edit:
+        user_text = (
+            "Use the image_generation tool to edit the attached reference "
+            "image(s). Treat the reference as the canonical subject — reproduce "
+            "its exact pattern, colours, and texture faithfully; do not redesign "
+            f"or stylise the subject itself. Request: {prompt}. "
+            f"Output format: {output_format}."
+        )
+    else:
+        user_text = (
+            "Use the image_generation tool to render the following. "
+            f"Request: {prompt}. "
+            f"Output format: {output_format}."
+        )
+    if size and size != "auto":
+        user_text += f" Size: {size}."
+    user_text += " Do not include explanatory text — produce only the image."
+    return user_text
+
+
+def _build_payload(
+    prompt: str, size: str, output_format: str, model: str,
+    refs: list[tuple[str, str]] | None = None,
+) -> JsonDict:
+    """Build the codex/responses body. When `refs` (list of (b64, mime)) is
+    given, attach each as an `input_image` content part ahead of the text and
+    force the image tool to fire (`tool_choice: required`) — the img2img path.
+    """
+    is_edit = bool(refs)
+    user_text = _build_user_text(prompt, size, output_format, is_edit=is_edit)
+
+    image_tool: JsonDict = {"type": "image_generation", "output_format": output_format}
+    if size and size != "auto":
+        image_tool["size"] = size
+    # ponytail: env override, avoids argparse plumbing. low|medium|high|auto
+    _q = os.environ.get("CHATGPT_IMAGEGEN_QUALITY")
+    if _q:
+        image_tool["quality"] = _q
+
+    if refs:
+        content: list[JsonDict] = [
+            {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"}
+            for (b64, mime) in refs
+        ]
+        content.append({"type": "input_text", "text": user_text})
+        tool_choice = "required"
+    else:
+        content = [{"type": "input_text", "text": user_text}]
+        tool_choice = "auto"
+
+    # The Codex backend requires `instructions` to match an allowlisted prompt.
+    # We use a tiny system-style instruction known to be accepted on gpt-5.5.
+    return {
+        "model": model,
+        "stream": True,
+        "instructions": "You are an image generation assistant.",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": content,
+            }
+        ],
+        "tools": [image_tool],
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": False,
+        "store": False,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "include": ["reasoning.encrypted_content"],
+        "text": {"verbosity": "low"},
+    }
+
+
+def _stream(
+    url: str,
+    headers: dict[str, str],
+    body: JsonDict,
+    deadline: float,
+    stall_timeout: float,
+) -> Iterator[JsonDict]:
+    """Yield parsed JSON event dicts from the SSE stream.
+
+    Standards-compliant enough for OpenAI's variant:
+      * `:` lines are comments (ignored).
+      * `event:` lines are tracked but unused here.
+      * `data:` lines accumulate into a single payload per event; blank line
+        terminates the event and we yield the parsed JSON.
+      * A `data: [DONE]` payload terminates the stream cleanly.
+      * Total wall-clock budget is enforced via `deadline` (monotonic time).
+    """
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    # Initial connect timeout: shorter of remaining budget or 30s.
+    initial = max(1.0, min(30.0, deadline - time.monotonic()))
+    resp = urllib.request.urlopen(req, timeout=initial)
+    # Loosen the per-read timeout: a quiet gap between SSE chunks routinely
+    # exceeds the 30s connect timeout, and the overall wall-clock cap is already
+    # enforced by the `deadline` check below — so bound the per-read idle window
+    # by stall_timeout (and never beyond the remaining budget). A read that
+    # blocks longer than this raises TimeoutError, which the caller turns into a
+    # clean "stalled" message.
+    _loosen_read_timeout(resp, min(stall_timeout, max(1.0, deadline - time.monotonic())))
+    try:
+        data_buf: list[str] = []
+        for raw in resp:
+            if time.monotonic() >= deadline:
+                raise GatewayError(
+                    f"stream exceeded total timeout budget; aborting",
+                    status=None,
+                )
+            line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+            if line == "":
+                # End of event.
+                if not data_buf:
+                    continue
+                payload = "\n".join(data_buf)
+                data_buf = []
+                if payload == "[DONE]":
+                    return
+                try:
+                    yield json.loads(payload)
+                except Exception:
+                    # Malformed event; keep going but make it visible in verbose mode.
+                    print(
+                        f"   .. warning: skipped malformed SSE payload "
+                        f"({len(payload)} bytes)",
+                        file=sys.stderr,
+                    )
+                continue
+            if line.startswith(":"):
+                continue  # comment / keepalive
+            if line.startswith("event:"):
+                continue  # event type — we infer from payload's "type" field
+            if line.startswith("data:"):
+                # Strip the "data:" prefix and exactly one optional leading space.
+                chunk = line[len("data:") :]
+                if chunk.startswith(" "):
+                    chunk = chunk[1:]
+                data_buf.append(chunk)
+                continue
+            # Other field types (id:, retry:, etc.) — ignore silently.
+    finally:
+        resp.close()
+
+
+def _post_for_image(
+    payload: JsonDict,
+    headers: dict[str, str],
+    deadline: float,
+    start: float,
+    stall_timeout: float,
+    progress: bool,
+) -> tuple[bytes, JsonDict]:
+    """Returns (image_bytes, item_meta). Raises GatewayError on failure.
+
+    When `progress` is set, a human-readable timeline is streamed to stderr —
+    one line per phase, each stamped with elapsed seconds — so a slow run is
+    legible and a stall is obvious. stdout is never touched here.
+    """
+    saw_event_types: dict[str, int] = {}
+    image_b64: str | None = None
+    item_meta: JsonDict = {}
+    last_revised_prompt: str = ""
+    last_phase = "connecting"
+    failure_detail: str | None = None
+
+    def emit(msg: str) -> None:
+        if progress:
+            print(f"[{time.monotonic() - start:6.1f}s] {msg}", file=sys.stderr)
+
+    try:
+        for evt in _stream(CODEX_BACKEND, headers, payload, deadline, stall_timeout):
+            t = evt.get("type", "?")
+            saw_event_types[t] = saw_event_types.get(t, 0) + 1
+            first = saw_event_types[t] == 1
+            if t == "response.image_generation_call.in_progress" and first:
+                last_phase = "queued"
+                emit("queued")
+            elif t == "response.image_generation_call.generating" and first:
+                last_phase = "generating"
+                emit("generating")
+            elif t == "response.image_generation_call.partial_image":
+                last_phase = "receiving image"
+                emit(f"receiving image (partial {saw_event_types[t]})")
+            if t in ("error", "response.failed"):
+                # Capture the backend's own failure reason so a mid-stream
+                # failure surfaces *why* (quota / moderation / transient) rather
+                # than a generic "no image returned".
+                detail = None
+                if isinstance(evt.get("response"), dict):
+                    err = evt["response"].get("error")
+                    if isinstance(err, dict):
+                        detail = err.get("message") or err.get("code")
+                if detail is None:
+                    detail = evt.get("message") or evt.get("code") or (
+                        evt.get("error") if isinstance(evt.get("error"), str) else None
+                    )
+                if isinstance(evt.get("error"), dict):
+                    detail = evt["error"].get("message") or detail
+                if detail:
+                    failure_detail = str(detail)
+            if t == "response.output_item.done":
+                item = evt.get("item")
+                if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    if isinstance(item.get("result"), str):
+                        image_b64 = item["result"]
+                        item_meta = {k: v for k, v in item.items() if k != "result"}
+                        if isinstance(item.get("revised_prompt"), str):
+                            last_revised_prompt = item["revised_prompt"]
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="ignore")
+        raise GatewayError(f"HTTP {e.code}: {body_text[:600]}", status=e.code) from None
+    except (TimeoutError, ConnectionError):
+        # Socket read timed out or the connection dropped mid-stream. Surface a
+        # clean, actionable message — naming the phase we stalled in and how long
+        # we waited — instead of a raw Python traceback.
+        elapsed = time.monotonic() - start
+        if time.monotonic() >= deadline:
+            total = int(round(deadline - start))
+            raise GatewayError(
+                f"timed out: no image within the {total}s total budget "
+                f"(last phase: {last_phase}, {elapsed:.0f}s elapsed). "
+                f"Raise --timeout for very large images."
+            ) from None
+        raise GatewayError(
+            f"stalled: the image backend sent no data for ~{int(stall_timeout)}s "
+            f"(last phase: {last_phase}, {elapsed:.0f}s elapsed). It may be "
+            f"overloaded — retry, or raise --stall-timeout / --timeout."
+        ) from None
+    except urllib.error.URLError as e:
+        raise GatewayError(f"network error contacting the image backend: {e.reason}") from None
+
+    if not image_b64:
+        types_seen = ", ".join(sorted(saw_event_types)) or "(none)"
+        if failure_detail:
+            raise GatewayError(
+                f"backend failed mid-generation: {failure_detail} "
+                f"(events seen: {types_seen})"
+            )
+        raise GatewayError(f"no image returned. events seen: {types_seen}")
+
+    if last_revised_prompt:
+        emit(f"revised prompt: {last_revised_prompt[:120]}")
+
+    try:
+        image_bytes = base64.b64decode(image_b64, validate=True)
+    except Exception:
+        raise GatewayError("backend returned invalid base64 in image_generation_call.result") from None
+    return image_bytes, item_meta
+
+
+# ---------- web backend (drive the real ChatGPT browser) ----------
+
+_AB_INSTALL_HINT = (
+    "install it (no npm, no token):\n"
+    "  curl -fsSL https://raw.githubusercontent.com/leeguooooo/"
+    "chrome-use/main/install.sh | sh\n"
+    "then connect it to your logged-in Chrome (see the chrome-use skill)"
+)
+
+
+def _find_agent_browser() -> str | None:
+    """Return the chrome-use binary path, or None if it isn't installed."""
+    for name in AB_BIN_CANDIDATES:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse a dotted version like '1.5.23' into (1, 5, 23); junk → (0,)."""
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(n) for n in nums[:3]) or (0,)
+
+
+def _warn_if_chrome_use_old(ab: str, emit) -> None:
+    """Soft-warn (never block) if chrome-use is below AB_MIN_VERSION.
+
+    The web backend's img2img (`upload`) and model switch (coordinate `click`)
+    need a recent chrome-use; an old binary fails them with an opaque exit code.
+    Best-effort: if `--version` can't be read or parsed, stay quiet.
+    """
+    try:
+        out = subprocess.run([ab, "--version"], capture_output=True, text=True,
+                             timeout=10)
+    except Exception:  # noqa: BLE001
+        return
+    text = (out.stdout or out.stderr or "").strip()
+    m = re.search(r"\d+\.\d+\.\d+", text)
+    if not m:
+        return
+    if _version_tuple(m.group(0)) < _version_tuple(AB_MIN_VERSION):
+        emit(
+            f"warning: chrome-use {m.group(0)} is older than {AB_MIN_VERSION}; "
+            f"image-to-image / model-switch may fail. Update with the installer "
+            f"at github.com/leeguooooo/chrome-use."
+        )
+
+
+def _codex_token_present() -> bool:
+    """True if ~/.codex/auth.json carries a usable ChatGPT OAuth access_token."""
+    try:
+        auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    access, _account, _refresh = _extract_access_token(auth)
+    return bool(access)
+
+
+def _chrome_user_data_dirs() -> list[Path]:
+    home = Path.home()
+    dirs = [
+        home / "Library" / "Application Support" / "Google" / "Chrome",  # macOS
+        home / ".config" / "google-chrome",                              # Linux
+        home / ".config" / "chromium",
+    ]
+    # Windows
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        dirs.insert(0, Path(local_app_data) / "Google" / "Chrome" / "User Data")
+    return dirs
+
+
+def _detect_logged_in_profiles() -> list[str]:
+    """Chrome profile names with a live chatgpt.com session, freshest first.
+
+    Read-only and offline: each profile's `Cookies` SQLite is copied and queried
+    only for the `__Secure-next-auth.session-token` cookie's host/expiry — the
+    encrypted value is never read or decrypted. Detects *whether* a profile is
+    logged in, not which account; that's all the web backend needs to pick one.
+    """
+    import sqlite3
+
+    # Chrome stores expiry as microseconds since 1601-01-01; convert "now".
+    chrome_now_us = (time.time() + 11644473600) * 1_000_000
+    found: list[tuple[str, int]] = []
+    for base in _chrome_user_data_dirs():
+        if not base.is_dir():
+            continue
+        for prof in base.iterdir():
+            if not prof.is_dir() or not (prof / "Preferences").exists():
+                continue
+            db = next((c for c in (prof / "Network" / "Cookies", prof / "Cookies")
+                       if c.exists()), None)
+            if not db:
+                continue
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".db")
+                os.close(fd)
+                shutil.copy2(db, tmp)
+                con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+                row = con.execute(
+                    "SELECT MAX(expires_utc) FROM cookies "
+                    "WHERE host_key LIKE '%chatgpt.com%' "
+                    "AND name LIKE '__Secure-next-auth.session-token%'"
+                ).fetchone()
+                con.close()
+                exp = row[0] if row else None
+                if exp and exp > chrome_now_us:
+                    found.append((prof.name, exp))
+            except Exception:
+                pass
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+    found.sort(key=lambda r: r[1], reverse=True)
+    return [name for name, _exp in found]
+
+
+def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | None = None) -> str:
+    """Run one chrome-use subcommand, return stdout. Raises GatewayError on failure.
+
+    ``profile`` (a Chrome profile name/path) is passed as chrome-use's global
+    ``--profile`` flag, which must precede the subcommand. Only the launching
+    ``open`` call needs it; later calls reuse the session's browser.
+    """
+    cmd = [ab]
+    if profile:
+        cmd += ["--profile", profile]
+    cmd += [*ab_args, "--session", session]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=max(5.0, timeout)
+        )
+    except subprocess.TimeoutExpired:
+        raise GatewayError(f"chrome-use timed out: {' '.join(ab_args[:2])}") from None
+    except FileNotFoundError:
+        raise GatewayError("chrome-use binary vanished mid-run") from None
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise GatewayError(
+            f"chrome-use {ab_args[0] if ab_args else ''} failed "
+            f"(exit {proc.returncode}): {' / '.join(tail)[:300]}"
+        )
+    return proc.stdout
+
+
+def _ab_eval(ab: str, js: str, session: str, timeout: float) -> Any:
+    """Run JS in the page and decode the value it returns.
+
+    Convention: the JS always `return JSON.stringify(value)`. chrome-use
+    prints that string JSON-encoded, so we decode twice — once to recover the
+    JSON text the page returned, once to parse it into a Python object.
+    """
+    out = _ab(ab, "eval", js, session=session, timeout=timeout)
+    # Scan from the last non-empty line for the first that decodes to a string.
+    for line in reversed([l for l in out.splitlines() if l.strip()]):
+        try:
+            inner = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(inner, str):
+            try:
+                return json.loads(inner)
+            except Exception:
+                return inner
+        return inner
+    raise GatewayError(f"could not parse chrome-use eval output: {out[:200]!r}")
+
+
+# JS: snapshot the generation state — whether a stop/streaming control is still
+# present, and the newest image asset src that was NOT already on the page when
+# we started (baseline list passed in). Returned as a JSON string.
+# Both the baseline and the freshness scan are scoped to `main img` — this
+# tab's conversation thread — never document-wide. ChatGPT pushes an "Image
+# created" toast (with a thumbnail whose src matches the asset regex) into ANY
+# open chatgpt.com tab when some OTHER conversation finishes an image; the
+# toast lives in a portal outside <main>, so a document-wide scan grabs that
+# sibling's image (the cross-contaminated/duplicate outputs of issue #7) while
+# a main-scoped scan can't. NOTE the generated <img> is NOT inside the
+# [data-message-author-role="assistant"] element (verified in the live DOM:
+# main#main > #thread > section[data-testid=conversation-turn-N] > … > img),
+# so don't be tempted to scope tighter than <main>.
+_JS_STATE = r"""(() => {
+  const seen = new Set(%s);
+  const stop = !!document.querySelector(
+    'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
+  );
+  const re = new RegExp(%s);
+  // The generated image renders in <main> but OUTSIDE any message bubble (it's
+  // an image-generation card, not an assistant text turn — so we can't scope to
+  // the assistant role). An img2img reference, however, is echoed INSIDE the
+  // user bubble with a fresh estuary/content src not in the pre-submit baseline.
+  // So detect fresh main images but exclude any that belong to a user message.
+  const userSrcs = new Set();
+  document.querySelectorAll('[data-message-author-role="user"] img')
+    .forEach(i => { const s = i.currentSrc || i.src; if (s) userSrcs.add(s); });
+  const fresh = [...document.querySelectorAll('main img')]
+    .map(i => i.currentSrc || i.src)
+    .filter(s => re.test(s) && !seen.has(s) && !userSrcs.has(s));
+  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const lastA = a[a.length - 1];
+  const dlg = [...document.querySelectorAll('[role="dialog"]')]
+    .map(d => d.textContent || '').join(' ');
+  return JSON.stringify({stop, last: fresh[fresh.length - 1] || null,
+                         assistant: a.length > 0,
+                         limited: /too many requests|requests too quickly/i.test(dlg),
+                         atext: lastA ? lastA.textContent.trim().slice(0, 240) : ""});
+})()"""
+
+_JS_BASELINE = r"""(() => {
+  const re = new RegExp(%s);
+  const srcs = [...document.querySelectorAll('main img')]
+    .map(i => i.currentSrc || i.src).filter(s => re.test(s));
+  return JSON.stringify(srcs);
+})()"""
+
+# JS: fetch the asset bytes from inside the authenticated page and hand them
+# back base64-encoded along with the content type. credentials:'include' reuses
+# the browser's session cookies, so the signed/asset URL resolves.
+_JS_FETCH = r"""(async () => {
+  try {
+    const r = await fetch(%s, {credentials: 'include'});
+    if (!r.ok) return JSON.stringify({ok: false, status: r.status});
+    const buf = new Uint8Array(await (await r.blob()).arrayBuffer());
+    let bin = '';
+    const CH = 0x8000;
+    for (let i = 0; i < buf.length; i += CH)
+      bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
+    return JSON.stringify({ok: true, type: r.headers.get('content-type'),
+                           bytes: buf.length, b64: btoa(bin)});
+  } catch (e) { return JSON.stringify({ok: false, error: String(e)}); }
+})()"""
+
+# JS: resolve a ChatGPT Project (a "snorlax" gizmo, id g-p-…) by exact display
+# name, creating it if absent. Runs inside the authenticated page so the
+# session cookies + accessToken are free. Endpoints (probed live, undocumented):
+#   GET  /backend-api/gizmos/snorlax/sidebar   → list projects
+#   POST /backend-api/projects {name, instructions} → create one
+_JS_ENSURE_PROJECT = r"""(async () => {
+  try {
+    const name = %s;
+    const sess = await fetch('/api/auth/session', {credentials: 'include'})
+      .then(r => r.json()).catch(() => null);
+    if (!sess || !sess.accessToken)
+      return JSON.stringify({ok: false, error: 'no accessToken in /api/auth/session'});
+    const h = {Authorization: 'Bearer ' + sess.accessToken,
+               'Content-Type': 'application/json'};
+    const find = async () => {
+      const r = await fetch(
+        '/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0',
+        {credentials: 'include', headers: h});
+      if (!r.ok) throw new Error('project list HTTP ' + r.status);
+      for (const it of (await r.json()).items || []) {
+        const g = it.gizmo && it.gizmo.gizmo;
+        if (g && g.display && g.display.name === name) return g.id;
+      }
+      return null;
+    };
+    let id = await find();
+    if (id) return JSON.stringify({ok: true, id, created: false});
+    const mk = await fetch('/backend-api/projects', {
+      method: 'POST', credentials: 'include', headers: h,
+      body: JSON.stringify({name: name, instructions: ''})});
+    if (!mk.ok) return JSON.stringify({ok: false, error: 'project create HTTP ' + mk.status});
+    const j = await mk.json().catch(() => null);
+    id = j && ((j.gizmo && (j.gizmo.id || (j.gizmo.gizmo && j.gizmo.gizmo.id))) || j.id);
+    if (!id) id = await find();  // response shape unknown-proof: re-list by name
+    if (!id) return JSON.stringify({ok: false, error: 'created but could not resolve id'});
+    return JSON.stringify({ok: true, id, created: true});
+  } catch (e) { return JSON.stringify({ok: false, error: String(e)}); }
+})()"""
+
+
+# JS: is the composer up — and is chatgpt.com showing its rate-limit dialog?
+# ("Too many requests — You're making requests too quickly. We've temporarily
+# limited access to your conversations…"). The dialog means every further page
+# action is pointless for a few minutes, so surface it instead of timing out.
+_JS_COMPOSER = r"""(() => {
+  const dlg = [...document.querySelectorAll('[role="dialog"]')]
+    .map(d => d.textContent || '').join(' ');
+  return JSON.stringify({
+    composer: !!document.querySelector('#prompt-textarea'),
+    limited: /too many requests|requests too quickly/i.test(dlg),
+  });
+})()"""
+
+_RATE_LIMIT_MSG = (
+    "chatgpt.com rate-limited this account ('Too many requests') — the page "
+    "surface needs a few minutes of quiet before it will serve again."
+)
+
+
+def _wait_composer(ab: str, session: str, remaining, tries: int = 15) -> bool:
+    """Poll until the chat composer (#prompt-textarea) is on the page.
+
+    Raises WebRateLimited if the page shows the "Too many requests" dialog —
+    waiting out the poll budget (and then other profile candidates) would just
+    burn ~45s each on an account-level block."""
+    for _ in range(tries):
+        try:
+            st = _ab_eval(ab, _JS_COMPOSER, session=session,
+                          timeout=min(20.0, remaining()))
+            if isinstance(st, dict):
+                if st.get("limited"):
+                    raise WebRateLimited(_RATE_LIMIT_MSG)
+                if st.get("composer"):
+                    return True
+        except WebRateLimited:
+            raise
+        except GatewayError:
+            pass
+        time.sleep(1.0)
+    return False
+
+
+def _enter_project(ab: str, session: str, name: str, remaining, emit) -> None:
+    """Navigate the open session into the named ChatGPT Project, creating the
+    project on first use — so each run's conversation files under the project
+    instead of littering the top-level chat history.
+
+    Best-effort: organization is a nicety, the generation is the point. On any
+    failure this warns and restores a plain new chat, never aborts the run.
+    """
+    navigated = False
+    try:
+        res = _ab_eval(ab, _JS_ENSURE_PROJECT % json.dumps(name),
+                       session=session, timeout=min(30.0, remaining()))
+        if not isinstance(res, dict) or not res.get("ok") or not res.get("id"):
+            detail = res.get("error") if isinstance(res, dict) else res
+            raise GatewayError(f"could not resolve project: {detail}")
+        emit(f"using project {name!r}" + (" (created)" if res.get("created") else ""))
+        navigated = True
+        _ab(ab, "open", WEB_PROJECT_URL.format(gizmo_id=res["id"]),
+            session=session, timeout=min(30.0, remaining()))
+        if not _wait_composer(ab, session, remaining):
+            raise GatewayError("project page composer never appeared")
+    except WebRateLimited:
+        raise  # account-level block; a plain chat would be just as dead
+    except GatewayError as e:
+        emit(f"warning: project {name!r} unavailable ({e}); using a plain chat")
+        if navigated:
+            # We may have left the plain-chat page; restore it so the normal
+            # submit flow still has a composer to type into.
+            try:
+                _ab(ab, "open", WEB_NEW_CHAT_URL, session=session,
+                    timeout=min(30.0, remaining()))
+                _wait_composer(ab, session, remaining)
+            except GatewayError:
+                pass
+
+
+# JS: delete (hide) the conversation currently open in the tab. ChatGPT's own
+# "delete" is a PATCH with `is_visible:false` — it drops the chat from history,
+# search, and the sidebar. Conversation id comes from the `/c/<id>` URL segment
+# (works for both plain `/c/…` and project `/g/g-p-…/c/…` URLs). accessToken is
+# read from the in-page session, same as _JS_ENSURE_PROJECT.
+_JS_DELETE_CONV = r"""(async () => {
+  try {
+    const m = location.pathname.match(/\/c\/([0-9a-f-]{16,})/i);
+    if (!m) return JSON.stringify({ok: false, error: 'no conversation id in URL'});
+    const id = m[1];
+    const sess = await fetch('/api/auth/session', {credentials: 'include'})
+      .then(r => r.json()).catch(() => null);
+    if (!sess || !sess.accessToken)
+      return JSON.stringify({ok: false, error: 'no accessToken in /api/auth/session'});
+    const r = await fetch('/backend-api/conversation/' + id, {
+      method: 'PATCH', credentials: 'include',
+      headers: {Authorization: 'Bearer ' + sess.accessToken,
+                'Content-Type': 'application/json'},
+      body: JSON.stringify({is_visible: false})});
+    if (!r.ok) return JSON.stringify({ok: false, error: 'delete HTTP ' + r.status});
+    return JSON.stringify({ok: true, id});
+  } catch (e) { return JSON.stringify({ok: false, error: String(e)}); }
+})()"""
+
+
+def _delete_conversation(ab, session, remaining, emit) -> None:
+    """Delete the conversation just used so the run leaves no history.
+
+    Best-effort: the image is already saved by the time we get here, so a delete
+    failure only warns — it never fails the run or loses the image.
+    """
+    try:
+        res = _ab_eval(ab, _JS_DELETE_CONV, session=session,
+                       timeout=min(20.0, remaining()))
+    except GatewayError as e:
+        emit(f"warning: could not delete conversation ({e}); it stays in history")
+        return
+    if isinstance(res, dict) and res.get("ok"):
+        emit("conversation deleted (no history kept)")
+    else:
+        detail = res.get("error") if isinstance(res, dict) else res
+        emit(f"warning: could not delete conversation ({detail}); it stays in history")
+
+
+# JS: locate the composer model-picker button and return its label + viewport
+# center {text, x, y}, or null. The picker has no stable selector, so match the
+# one menu-opening button whose short label names a model/effort.
+_JS_MODEL_BTN = r"""(() => {
+  const b = [...document.querySelectorAll('button')].find(b =>
+    b.getAttribute('aria-haspopup') === 'menu' &&
+    (b.innerText || '').trim().length > 0 &&
+    (b.innerText || '').trim().length < 25 &&
+    /\b(Auto|Pro|Instant|Medium|High|Thinking|Fast|GPT)\b/.test(b.innerText || ''));
+  if (!b) return JSON.stringify(null);
+  const r = b.getBoundingClientRect();
+  return JSON.stringify({text: b.innerText.replace(/\s+/g, ' ').trim(),
+                         x: Math.round(r.x + r.width / 2),
+                         y: Math.round(r.y + r.height / 2)});
+})()"""
+
+# JS: find an open-menu radio/item by exact label, return its center {x, y}.
+_JS_MENU_ITEM = r"""(() => {
+  const name = %s;
+  const m = [...document.querySelectorAll('[role="menuitemradio"],[role="menuitem"]')]
+    .find(e => (e.innerText || '').replace(/\s+/g, ' ').trim() === name);
+  if (!m) return JSON.stringify(null);
+  const r = m.getBoundingClientRect();
+  return JSON.stringify({x: Math.round(r.x + r.width / 2),
+                         y: Math.round(r.y + r.height / 2)});
+})()"""
+
+
+def _ensure_web_model(ab, session, model_label, remaining, emit) -> None:
+    """Switch the composer to the first available of ``model_label`` (a
+    comma-separated candidate list, e.g. "Instant,Auto").
+
+    Needed because "Pro" has no native image generator (see WEB_MODEL_DEFAULT).
+    Different plans label the image-capable tier differently (Plus/Pro expose
+    Instant/Medium/…; other plans an "Auto"), so we try a list and take the first
+    that exists in the picker — more robust than one hardcoded label. The menu
+    renders in a React portal that ignores synthetic ``.click()`` and re-renders
+    away injected ids, so we drive it by real coordinate clicks read fresh from
+    getBoundingClientRect each step.
+
+    Best-effort: on any failure this warns and proceeds with the current model,
+    exactly like _enter_project — selection is a nicety, not worth aborting over.
+    """
+    candidates = [c.strip() for c in (model_label or "").split(",") if c.strip()]
+    if not candidates:
+        return
+    wants = [c.lower() for c in candidates]
+    try:
+        btn = _ab_eval(ab, _JS_MODEL_BTN, session=session,
+                       timeout=min(15.0, remaining()))
+        if not isinstance(btn, dict):
+            emit("warning: model picker not found; leaving model as-is")
+            return
+        cur_text = btn.get("text", "").strip().lower()
+        if any(cur_text.startswith(w) for w in wants):
+            return  # already on an acceptable model (picker is sticky)
+        emit(f"switching model {btn.get('text')!r} → first of {candidates}")
+        _ab(ab, "click", str(btn["x"]), str(btn["y"]),
+            session=session, timeout=min(15.0, remaining()))
+        time.sleep(0.6)
+        chosen = None
+        item = None
+        for cand in candidates:  # first candidate present in the open menu wins
+            it = _ab_eval(ab, _JS_MENU_ITEM % json.dumps(cand),
+                          session=session, timeout=min(15.0, remaining()))
+            if isinstance(it, dict):
+                chosen, item = cand, it
+                break
+        if item is None:
+            emit(f"warning: none of {candidates} in the picker; leaving as-is")
+            try:  # close the menu so it can't swallow the prompt
+                _ab(ab, "press", "Escape", session=session,
+                    timeout=min(10.0, remaining()))
+            except GatewayError:
+                pass
+            return
+        _ab(ab, "click", str(item["x"]), str(item["y"]),
+            session=session, timeout=min(15.0, remaining()))
+        time.sleep(0.4)
+        now = _ab_eval(ab, _JS_MODEL_BTN, session=session,
+                       timeout=min(15.0, remaining()))
+        cur = now.get("text") if isinstance(now, dict) else None
+        if isinstance(cur, str) and cur.strip().lower().startswith(chosen.lower()):
+            emit(f"model set to {chosen!r}")
+        else:
+            emit(f"warning: model may not have switched (now {cur!r})")
+    except WebRateLimited:
+        raise
+    except GatewayError as e:
+        emit(f"warning: could not switch model ({e}); using the current one")
+
+
+def _env_bool(name: str) -> bool:
+    """True if env var ``name`` is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _backend_limit(kind: str, default: int) -> int:
+    """Concurrency cap for a backend, via CHATGPT_IMAGEGEN_<KIND>_CONCURRENCY.
+
+    0 or a negative value means unlimited. Unset / unparsable → the default.
+    """
+    raw = os.environ.get(f"CHATGPT_IMAGEGEN_{kind.upper()}_CONCURRENCY", "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+# Per-backend defaults. They differ because the backends hit different limits:
+#   web   — drives the ONE shared logged-in Chrome AND the chatgpt.com page
+#           surface, which rate-limits aggressively ("Too many requests …
+#           temporarily limited access to your conversations"). Keep it at 1.
+#   codex — independent HTTP POSTs; measured fine at 4 concurrent on a Plus
+#           account (no 429s, no serialization). Cap it anyway so an agent
+#           fanning out a big batch can't trip the per-account limiter.
+WEB_CONCURRENCY_DEFAULT = 1
+CODEX_CONCURRENCY_DEFAULT = 4
+
+
+@contextmanager
+def _concurrency_slot(kind: str, limit: int, progress: bool, start: float) -> "Iterator[None]":
+    """Cross-process counting semaphore: at most ``limit`` concurrent runs.
+
+    Implemented as ``limit`` flock slot files in the temp dir — a run holds
+    exactly one slot for its whole generation. Excess runs queue (0.5s poll)
+    instead of failing or corrupting each other (issue #7: parallel web runs
+    cross-contaminated images; the page surface also rate-limits hard). The
+    kernel releases a slot when its holder dies, so a crash can't wedge the
+    queue. ``limit <= 0`` disables the gate entirely.
+    """
+    if limit <= 0:
+        yield
+        return
+    base = tempfile.gettempdir()
+    slot = None
+    announced = False
+    try:
+        while slot is None:
+            for i in range(limit):
+                f = open(os.path.join(base, f"chatgpt-imagegen-{kind}-{i}.lock"), "w")
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    slot = f
+                    break
+                except OSError:
+                    f.close()
+            else:
+                if progress and not announced:
+                    announced = True
+                    print(
+                        f"[{time.monotonic() - start:6.1f}s] waiting for a free "
+                        f"{kind} slot (max {limit} concurrent {kind} generation"
+                        f"{'s' if limit != 1 else ''})",
+                        file=sys.stderr,
+                    )
+                time.sleep(0.5)
+        yield
+    finally:
+        if slot is not None:
+            try:
+                fcntl.flock(slot, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            slot.close()
+
+
+def run_web(
+    args: argparse.Namespace, progress: bool, start: float,
+    refs: list[str] | None = None,
+) -> tuple[bytes, JsonDict]:
+    """Generate an image by driving the user's logged-in ChatGPT browser.
+
+    When ``refs`` (reference image paths/URLs) are supplied, runs image-to-image:
+    each reference is attached to the composer via `chrome-use upload` before the
+    edit prompt is submitted — no Codex-usage, same surface as text-to-image.
+
+    Returns (image_bytes, meta). Raises GatewayError / exits on failure.
+    """
+    ab = _find_agent_browser()
+    if ab is None:
+        raise WebUnavailable(f"`chrome-use` is not installed — {_AB_INSTALL_HINT}")
+    # Default to a STABLE session name so we reuse one chrome-use daemon instead
+    # of leaking a fresh `imagegen-<pid>` daemon every run (chrome-use has no
+    # clean daemon-reap command yet — see leeguooooo/chrome-use#48). Safe because
+    # web runs are serialized to 1 by the concurrency gate; only if the user
+    # lifts that cap do we fall back to a per-pid session so parallel runs don't
+    # share — and cross-contaminate (issue #7) — the same tab.
+    if args.session:
+        session = args.session
+    elif _backend_limit("web", WEB_CONCURRENCY_DEFAULT) == 1:
+        session = "imagegen"
+    else:
+        session = f"imagegen-{os.getpid()}"
+    # Budget the generation from NOW, not from process start: web runs may have
+    # blocked on the serialize lock (issue #7) before reaching here, and that
+    # queue wait must not eat into the --timeout image budget.
+    deadline = time.monotonic() + args.timeout
+    user_text = _build_web_text(args.gen_prompt, args.size, is_edit=bool(refs))
+
+    def emit(msg: str) -> None:
+        if progress:
+            print(f"[{time.monotonic() - start:6.1f}s] {msg}", file=sys.stderr)
+
+    def remaining() -> float:
+        return max(2.0, deadline - time.monotonic())
+
+    _warn_if_chrome_use_old(ab, emit)
+
+    # Decide which browser(s) to try, in order.
+    #   relay/off  → only the currently-open Chrome (extension relay).
+    #   auto       → relay FIRST (your open Chrome usually works and is best for
+    #                anti-detection), then any offline-detected profile that's
+    #                logged in to chatgpt.com — so we only switch profiles when
+    #                the open browser isn't logged in.
+    #   <name>     → only that profile.
+    # `None` in the list means "relay" (no --profile flag).
+    pl = (args.profile or "auto").strip().lower()
+    if pl in ("relay", "off", "current"):
+        candidates: list[str | None] = [None]
+    elif pl == "auto":
+        candidates = [None] + _detect_logged_in_profiles()
+    else:
+        candidates = [args.profile.strip()]
+
+    def _try_open(prof: str | None) -> bool:
+        """Open a fresh chat and wait for the composer. True if it appears."""
+        try:
+            _ab(ab, "open", WEB_NEW_CHAT_URL, session=session,
+                timeout=min(30.0, remaining()), profile=prof)
+        except GatewayError:
+            return False
+        return _wait_composer(ab, session, remaining)
+
+    def _close() -> None:
+        """Close the session's browser/tab. Best-effort; never raises."""
+        try:
+            _ab(ab, "close", session=session, timeout=15.0)
+        except Exception:
+            pass  # leftover tab is harmless; never fail the run over cleanup
+
+    chosen: str | None = None
+    opened = False
+    for prof in candidates:
+        label = "current Chrome (relay)" if prof is None else f"profile {prof!r}"
+        emit(f"opening ChatGPT via {label}")
+        try:
+            if _try_open(prof):
+                chosen, opened = prof, True
+                emit(f"using {label}")
+                break
+        except WebRateLimited:
+            _close()  # account-level block: stop burning 45s per candidate
+            raise
+        _close()  # always tear down a failed attempt, including the last
+    if not opened:
+        raise WebUnavailable(
+            "no logged-in ChatGPT browser available (tried the open Chrome"
+            + (" and detected profiles" if len(candidates) > 1 else "")
+            + "). Sign in to chatgpt.com, or use --backend codex."
+        )
+
+    # Everything past here drives the now-open browser. Wrap it so the tab is
+    # ALWAYS closed on the way out — success, failure (quota/refusal/timeout), or
+    # exception — instead of leaking a window on every non-happy path.
+    try:
+        project = (args.project or "").strip()
+        if project:
+            _enter_project(ab, session, project, remaining, emit)
+        _ensure_web_model(
+            ab, session,
+            getattr(args, "web_model", WEB_MODEL_DEFAULT) or WEB_MODEL_DEFAULT,
+            remaining, emit)
+        result = _generate_in_browser(
+            ab, session, user_text, args, deadline, remaining, emit, refs=refs)
+        # Image is saved by now. Delete the conversation so no history is left —
+        # the default. `--keep-conversation` opts out; `--keep-tab` (debugging)
+        # implies keeping it, since an open tab on a deleted chat is useless.
+        if not getattr(args, "keep_conversation", False) and not args.keep_tab:
+            _delete_conversation(ab, session, remaining, emit)
+        return result
+    finally:
+        if not args.keep_tab:
+            _close()
+
+
+def _resolve_ref_path(ref: str) -> tuple[str, str | None]:
+    """Return (local_path, cleanup_path|None) for a local path or http(s) URL.
+
+    Web img2img hands a real file to `chrome-use upload`, so — unlike the codex
+    helper `_load_reference` — we keep the file on disk rather than base64ing it.
+    URLs download to a temp file the caller deletes via the returned cleanup
+    path. Exits cleanly on a missing file / unsupported type / download failure.
+    """
+    if _is_url(ref):
+        raw = _download_ref_url(ref)
+        mime = _sniff_mime(raw)
+        if mime is None:
+            sys.exit(f"unsupported reference image type for {ref!r} (need PNG, JPEG, or WEBP)")
+        ext = {"image/png": ".png", "image/jpeg": ".jpg",
+               "image/webp": ".webp"}.get(mime, ".img")
+        fd, tmp = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        Path(tmp).write_bytes(raw)
+        return tmp, tmp
+    p = Path(ref).expanduser()
+    if not p.is_file():
+        sys.exit(f"reference image not found: {ref}")
+    with p.open("rb") as fh:
+        if _sniff_mime(fh.read(16)) is None:
+            sys.exit(f"unsupported reference image type for {ref!r} (need PNG, JPEG, or WEBP)")
+    return str(p), None
+
+
+# JS: count reference attachments sitting in the composer (uploaded, not yet
+# sent). Used to confirm an upload landed before we submit the edit prompt.
+_JS_PENDING_UPLOADS = r"""(() => {
+  const form = document.querySelector('form') || document.body;
+  const imgs = [...form.querySelectorAll('img')]
+    .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || ''));
+  return JSON.stringify(imgs.length);
+})()"""
+
+
+def _upload_references(ab, session, ref_paths, remaining, emit) -> None:
+    """Attach reference image files to the composer via `chrome-use upload`.
+
+    ChatGPT's composer exposes a standard <input accept="image/*">, so the
+    generic upload command drives it with NO ChatGPT-specific support needed.
+    Waits for the thumbnail(s) to render so the caller's baseline capture counts
+    them as pre-existing — never mistaking a reference for the generated result.
+    """
+    emit(f"attaching {len(ref_paths)} reference image(s)")
+    _ab(ab, "upload", 'input[accept="image/*"]', *ref_paths,
+        session=session, timeout=min(90.0, remaining()))
+    for _ in range(15):  # best-effort confirmation; proceed regardless
+        try:
+            n = _ab_eval(ab, _JS_PENDING_UPLOADS, session=session,
+                         timeout=min(10.0, remaining()))
+        except GatewayError:
+            n = 0
+        if isinstance(n, int) and n >= 1:
+            emit("reference attached")
+            time.sleep(2.0)  # let the upload finalise server-side before we send
+            return
+        time.sleep(1.0)
+    emit("warning: reference attachment not confirmed; submitting anyway")
+
+
+def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit,
+                         refs=None):
+    # Image-to-image: attach the reference(s) to the composer FIRST, then delete
+    # any temp downloads — the browser has uploaded the bytes to ChatGPT by the
+    # time the thumbnail renders, so the local copy is no longer needed.
+    if refs:
+        ref_paths: list[str] = []
+        cleanups: list[str] = []
+        for r in refs:
+            path, cleanup = _resolve_ref_path(r)
+            ref_paths.append(path)
+            if cleanup:
+                cleanups.append(cleanup)
+        _upload_references(ab, session, ref_paths, remaining, emit)
+        for c in cleanups:
+            try:
+                os.unlink(c)
+            except OSError:
+                pass
+
+    # Capture the baseline set of image srcs already on the page so we never
+    # mistake a prior image — INCLUDING a just-uploaded reference, whose src is
+    # also an estuary/content URL — for the new one.
+    baseline = _ab_eval(ab, _JS_BASELINE % json.dumps(WEB_IMG_SRC_RE),
+                        session=session, timeout=min(20.0, remaining()))
+    if not isinstance(baseline, list):
+        baseline = []
+
+    emit("submitting prompt")
+    # The composer is a ProseMirror/React contenteditable. `fill` mutates the
+    # DOM without firing the input events React listens for, so the send button
+    # stays bound to empty state and nothing submits. Real keystrokes via
+    # `keyboard type` go through ProseMirror's input path and update React, so
+    # both Enter and the send button then work.
+    _ab(ab, "click", "#prompt-textarea", session=session, timeout=min(20.0, remaining()))
+    _ab(ab, "keyboard", "type", user_text, session=session, timeout=min(60.0, remaining()))
+
+    def _composer_empty() -> bool:
+        # A sent message clears the composer; an empty composer is our proof the
+        # submit actually left the page (vs. a swallowed Enter leaving it stuck).
+        try:
+            return bool(_ab_eval(
+                ab,
+                "(() => { const t=(document.querySelector('#prompt-textarea')||{})"
+                ".textContent||''; return JSON.stringify(t.trim().length===0); })()",
+                session=session, timeout=min(15.0, remaining())))
+        except GatewayError:
+            return False
+
+    # Retry until the composer empties. With an attached reference the send button
+    # is briefly disabled while the upload finalises server-side, so the first
+    # Enter (or send click) can be swallowed — a single attempt would leave the
+    # prompt stuck in the box and the poll below would hang until timeout.
+    sent = False
+    for _ in range(6):
+        _ab(ab, "press", "Enter", session=session, timeout=min(20.0, remaining()))
+        time.sleep(1.0)
+        if _composer_empty():
+            sent = True
+            break
+        try:
+            _ab(ab, "click", 'button[data-testid="send-button"]',
+                session=session, timeout=min(15.0, remaining()))
+        except GatewayError:
+            pass
+        time.sleep(1.5)
+        if _composer_empty():
+            sent = True
+            break
+    if not sent:
+        emit("warning: composer did not clear — the prompt may not have sent")
+
+    # Poll until the stream stops AND a brand-new image asset is present and
+    # stable across two reads (guards against grabbing a mid-render partial).
+    state_js = _JS_STATE % (json.dumps(baseline), json.dumps(WEB_IMG_SRC_RE))
+    last_phase = ""
+    final_src: str | None = None
+    stable_src: str | None = None
+    # Idle = an assistant turn exists, nothing is streaming, and still no image.
+    # After ~16s of that we conclude the reply finished without an image (refusal,
+    # text-only, or an empty turn) instead of hanging until the total timeout.
+    idle_polls = 0
+    IDLE_LIMIT = 8
+    last_atext = ""
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        try:
+            st = _ab_eval(ab, state_js, session=session, timeout=min(20.0, remaining()))
+        except GatewayError:
+            continue
+        if not isinstance(st, dict):
+            continue
+        if st.get("limited"):
+            # Post-submit rate limit: a plain GatewayError on purpose — the
+            # prompt already went in, so auto mode must NOT double-spend by
+            # silently retrying on codex.
+            raise GatewayError(
+                _RATE_LIMIT_MSG + " The prompt was already submitted; check "
+                "the conversation later or retry in a few minutes."
+            )
+        if st.get("stop"):
+            if last_phase != "generating":
+                last_phase = "generating"
+                emit("generating")
+            stable_src = None
+            idle_polls = 0
+            continue
+        cur = st.get("last")
+        if cur:
+            if last_phase not in ("receiving image", "done"):
+                last_phase = "receiving image"
+                emit("receiving image")
+            idle_polls = 0
+            # Require the same fresh src twice in a row before trusting it.
+            if cur == stable_src:
+                final_src = cur
+                break
+            stable_src = cur
+        elif st.get("assistant"):
+            # Assistant turn present, not streaming, no new image yet.
+            if isinstance(st.get("atext"), str) and st["atext"]:
+                last_atext = st["atext"]
+            idle_polls += 1
+            if idle_polls >= IDLE_LIMIT:
+                reason = f' ChatGPT said: "{last_atext}"' if last_atext else ""
+                raise GatewayError(
+                    "ChatGPT finished without producing an image (text reply, "
+                    "refusal, or image quota reached)." + reason +
+                    " Try rephrasing, a different --profile, or --backend codex."
+                )
+
+    if not final_src:
+        raise GatewayError(
+            f"timed out after {args.timeout}s waiting for the image "
+            f"(last phase: {last_phase or 'connecting'})."
+        )
+
+    emit("downloading image bytes")
+    res = _ab_eval(ab, _JS_FETCH % json.dumps(final_src),
+                  session=session, timeout=min(60.0, remaining()))
+    if not isinstance(res, dict) or not res.get("ok"):
+        detail = res.get("status") or res.get("error") if isinstance(res, dict) else res
+        raise GatewayError(f"failed to download the generated image: {detail}")
+    try:
+        image_bytes = base64.b64decode(res["b64"], validate=True)
+    except Exception:
+        raise GatewayError("generated image came back as invalid base64") from None
+
+    meta: JsonDict = {"content_type": res.get("type"), "source": "web"}
+    # Cleanup (closing the tab) is handled by run_web's finally, so it runs on
+    # every exit path — not just this success one.
+    return image_bytes, meta
+
+
+# ---------- save ----------
+
+def _default_out_path(prompt: str, fmt: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:60] or "image"
+    base = Path("assets/generated")
+    base.mkdir(parents=True, exist_ok=True)
+    i = 1
+    while True:
+        candidate = base / (f"{slug}.{fmt}" if i == 1 else f"{slug}-{i}.{fmt}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _maybe_warn_extension_mismatch(out_path: Path, fmt: str) -> None:
+    ext = out_path.suffix.lower().lstrip(".")
+    # Map jpg <-> jpeg as equivalent.
+    canon = "jpeg" if ext == "jpg" else ext
+    if canon and canon != fmt:
+        print(
+            f"   .. warning: --format={fmt} but {out_path.name} has .{ext} extension; "
+            f"writing {fmt} bytes anyway",
+            file=sys.stderr,
+        )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        v = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {value!r}")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {value!r}")
+    return v
+
+
+# ---------- codex backend (headless responses API) ----------
+
+def run_codex(
+    args: argparse.Namespace, progress: bool, stall_timeout: float, start: float,
+    refs: list[str] | None = None,
+) -> tuple[bytes, JsonDict]:
+    """Generate an image via the headless codex/responses endpoint.
+
+    Fast and dependency-free, but every call bills the metered Codex-usage
+    bucket. Returns (image_bytes, meta); exits on unrecoverable failure.
+
+    When `refs` (reference image paths/URLs) are supplied, runs image-to-image:
+    each reference is attached as an `input_image` content part and the image
+    tool is forced (`tool_choice: required`).
+
+    Concurrency is gated at CODEX_CONCURRENCY_DEFAULT (4) parallel runs by a
+    cross-process semaphore — wide enough for real fan-out, tight enough that a
+    big agent batch can't trip the per-account limiter. Tune (or disable with
+    0) via CHATGPT_IMAGEGEN_CODEX_CONCURRENCY.
+    """
+    auth = _load_auth()
+    access, account_id, refresh = _extract_access_token(auth)
+    if not access:
+        sys.exit(
+            "no ChatGPT OAuth access_token in ~/.codex/auth.json. "
+            "Run `codex login` to sign into your ChatGPT subscription. "
+            "(An OPENAI_API_KEY in this file is not a substitute — the backend "
+            "requires a subscription OAuth token.)"
+        )
+
+    loaded_refs: list[tuple[str, str]] | None = None
+    if refs:
+        loaded_refs = [_load_reference(r) for r in refs]
+        if progress:
+            approx = sum(len(b64) for b64, _ in loaded_refs)
+            print(
+                f"[{time.monotonic() - start:6.1f}s] image-to-image: "
+                f"{len(loaded_refs)} reference(s), ~{approx // 1024} KB base64",
+                file=sys.stderr,
+            )
+
+    version = _detect_codex_version()
+    payload = _build_payload(args.gen_prompt, args.size, args.format, args.model,
+                             refs=loaded_refs)
+
+    with _concurrency_slot("codex", _backend_limit("codex", CODEX_CONCURRENCY_DEFAULT),
+                           progress, start):
+        return _run_codex_locked(
+            args, progress, stall_timeout, start, payload, account_id, access,
+            refresh, version, auth)
+
+
+def _run_codex_locked(
+    args, progress, stall_timeout, start, payload, account_id, access,
+    refresh, version, auth,
+) -> tuple[bytes, JsonDict]:
+    # Budget from NOW, not process start: the run may have queued on the codex
+    # concurrency slot, and that wait must not eat the --timeout image budget.
+    deadline = time.monotonic() + args.timeout
+
+    def _attempt(token: str) -> tuple[bytes, JsonDict]:
+        headers = _build_headers(token, account_id, version)
+        return _post_for_image(payload, headers, deadline, start, stall_timeout, progress)
+
+    try:
+        return _attempt(access)
+    except GatewayError as e:
+        # Auto-refresh on 401/403 once, then retry. Any other error → fail clean.
+        if e.status in (401, 403) and refresh:
+            if progress:
+                print(f"[{time.monotonic() - start:6.1f}s] access token expired; refreshing",
+                      file=sys.stderr)
+            try:
+                refreshed = _refresh_access_token(refresh)
+            except GatewayError as re_err:
+                sys.exit(str(re_err))
+            except Exception as re_err:
+                # Never include the refresh response body / token material in the message.
+                sys.exit(f"token refresh failed: {type(re_err).__name__}")
+            new_access = refreshed.get("access_token")
+            if not isinstance(new_access, str) or not new_access:
+                # Avoid leaking the dict (may contain id_token / refresh_token).
+                present = sorted(k for k in refreshed if isinstance(refreshed.get(k), str))
+                sys.exit(
+                    f"refresh response missing access_token "
+                    f"(present string fields: {present})"
+                )
+            try:
+                _persist_refreshed_auth(auth, refreshed)
+            except Exception as p_err:
+                # Always warn on persistence failure, even in quiet mode — stale
+                # tokens on next run will look like a mysterious failure otherwise.
+                print(
+                    f"warning: could not persist refreshed token to {AUTH_PATH}: "
+                    f"{type(p_err).__name__}: {p_err}",
+                    file=sys.stderr,
+                )
+            try:
+                return _attempt(new_access)
+            except GatewayError as retry_err:
+                sys.exit(str(retry_err))
+        else:
+            sys.exit(str(e))
+
+
+# ---------- backend routing ----------
+
+def _dispatch(
+    args: argparse.Namespace, progress: bool, stall_timeout: float, start: float
+) -> tuple[bytes, JsonDict]:
+    """Pick a backend and run it.
+
+    auto  : prefer web (spares Codex-usage); fall back to codex only when the
+            web backend is *unavailable* (no chrome-use / browser not
+            reachable / not logged in). A web failure that happens after the
+            prompt was submitted is NOT silently retried on codex — that would
+            spend the very bucket auto-mode is trying to protect.
+    web   : force web; any failure is fatal (with guidance).
+    codex : force codex.
+    """
+    def note(msg: str) -> None:
+        if progress:
+            print(f"[{time.monotonic() - start:6.1f}s] {msg}", file=sys.stderr)
+
+    refs = getattr(args, "ref", None)
+    # Image-to-image (refs) is now supported on BOTH backends: web attaches the
+    # reference to the composer via `chrome-use upload`, codex sends it as an
+    # input_image part. So refs ride the normal backend selection below — auto
+    # still prefers web (spares Codex-usage), exactly like text-to-image.
+
+    if args.backend == "codex":
+        return run_codex(args, progress, stall_timeout, start, refs=refs)
+
+    web_limit = _backend_limit("web", WEB_CONCURRENCY_DEFAULT)
+
+    if args.backend == "web":
+        try:
+            with _concurrency_slot("web", web_limit, progress, start):
+                return run_web(args, progress, start, refs=refs)
+        except GatewayError as e:
+            sys.exit(str(e))
+
+    # auto
+    try:
+        with _concurrency_slot("web", web_limit, progress, start):
+            return run_web(args, progress, start, refs=refs)
+    except WebUnavailable as e:
+        if _codex_token_present():
+            if _find_agent_browser() is None:
+                # chrome-use isn't installed. Keep this to a *gentle* one-line
+                # tip — never dump install commands here, and never install on
+                # the user's behalf. Full setup guidance lives in the README /
+                # skill and is for when the user explicitly opts in.
+                note("chrome-use not installed; falling back to codex "
+                     "(bills the metered Codex-usage bucket).")
+                note("tip: with chrome-use installed, generation runs through "
+                     "your logged-in browser and costs no Codex usage.")
+            else:
+                note(f"web backend unavailable ({e}); falling back to codex "
+                     f"(this consumes Codex-usage).")
+            return run_codex(args, progress, stall_timeout, start, refs=refs)
+        sys.exit(
+            "cannot generate an image — neither backend is ready:\n"
+            f"  • web:   {e}\n"
+            "  • codex: no ChatGPT OAuth token in ~/.codex/auth.json "
+            "(run `npm i -g @openai/codex && codex login`).\n"
+            "Set up either the logged-in browser (preferred — spares Codex-usage) "
+            "or codex login."
+        )
+    except GatewayError as e:
+        # Web was available but failed mid-generation. Don't silently burn the
+        # Codex bucket; surface it and let the user decide (--backend codex).
+        sys.exit(
+            f"{e}\n(web backend was reachable, so auto-mode did not fall back to "
+            f"codex — rerun with --backend codex to use the Codex-usage path.)"
+        )
+
+
+# ── Style presets ──────────────────────────────────────────────────────────
+# Named, reusable prompt snippets appended (as a comma-joined suffix) to the
+# user's prompt. Stored in ~/.config/chatgpt-imagegen/styles.json; seeded once
+# from the built-ins below and never auto-overwritten (use `style reset`).
+_BUILTIN_STYLES = {
+    "doodle": (
+        "drawn as a deliberately crude doodle using the biggest possible blocks "
+        "of color, leaning hard into a scribbly, pathetically bad look. White "
+        "background, as if drawn with a mouse in an old-school computer paint "
+        "program. It should be faintly recognizable yet not quite right — like "
+        "it almost matches but everything is subtly off, awkward and confusing. "
+        "Low-res, smeared together pixel by pixel, showing off just how absurdly "
+        "bad it is. Honestly, draw it however you want — but the content must "
+        "still be readable."
+    ),
+}
+
+_STYLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _valid_style_name(name: str) -> bool:
+    """A style name is a lowercase slug: alnum/-/_ , starting alphanumeric."""
+    return bool(_STYLE_NAME_RE.match(name or ""))
+
+
+def _compose_prompt(user_prompt: str, snippet: str | None) -> str:
+    """Append a style snippet to the prompt as a comma-joined suffix.
+
+    Blank/None snippet → prompt unchanged. A single trailing ','/'.' on the
+    prompt is dropped so the join reads cleanly. Pure; no I/O.
+    """
+    if not snippet or not snippet.strip():
+        return user_prompt
+    base = user_prompt.rstrip()
+    if base and base[-1] in ",.":
+        base = base[:-1].rstrip()
+    snippet = snippet.strip()
+    return f"{base}, {snippet}" if base else snippet
+
+
+def _styles_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".config"
+    return root / "chatgpt-imagegen" / "styles.json"
+
+
+def _builtin_styles() -> dict:
+    return dict(_BUILTIN_STYLES)
+
+
+def _default_styles_doc() -> dict:
+    return {"version": 1, "default": "", "styles": _builtin_styles()}
+
+
+def _save_styles(doc: dict) -> None:
+    """Atomically write the styles doc (temp file + os.replace)."""
+    path = _styles_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_styles() -> dict:
+    """Read the styles doc, seeding built-ins on first use. Raises SystemExit
+    (clear message) on a corrupt/unreadable file rather than clobbering it."""
+    path = _styles_path()
+    if not path.exists():
+        doc = _default_styles_doc()
+        _save_styles(doc)
+        return doc
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        raise SystemExit(f"error: cannot read styles file {path}: {e}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("styles"), dict):
+        raise SystemExit(
+            f"error: malformed styles file {path} "
+            f"(expected an object with a 'styles' map). "
+            f"Fix it by hand or run `chatgpt-imagegen style reset`.")
+    doc.setdefault("version", 1)
+    doc.setdefault("default", "")
+    return doc
+
+
+def _die_unknown_style(name: str, styles: dict) -> None:
+    avail = ", ".join(sorted(styles)) or "(none)"
+    raise SystemExit(f"error: unknown style {name!r}. available: {avail}")
+
+
+def _resolve_style_name(doc: dict, *, style_arg: str | None,
+                        no_style: bool) -> str | None:
+    """Pick the style NAME to apply (or None). Order:
+    1. --no-style       → None
+    2. --style NAME     → NAME (error if unknown)
+    3. active default   → it
+    4. otherwise        → None
+    """
+    if no_style:
+        return None
+    styles = doc.get("styles", {})
+    name = style_arg or (doc.get("default") or "")
+    if not name:
+        return None
+    if name not in styles:
+        _die_unknown_style(name, styles)
+    return name
+
+
+def _style_command(argv: list[str]) -> int:
+    """`chatgpt-imagegen style <verb> ...` — manage style presets."""
+    p = argparse.ArgumentParser(
+        prog="chatgpt-imagegen style",
+        description="Manage reusable prompt-style presets "
+                    f"(stored in {_styles_path()}).")
+    sub = p.add_subparsers(dest="verb")
+    sub.add_parser("list", help="list all styles (the active default is marked *)")
+    sp = sub.add_parser("show", help="print one style's snippet in full")
+    sp.add_argument("name")
+    sp = sub.add_parser("add", help="create or overwrite a style")
+    sp.add_argument("name")
+    sp.add_argument("snippet")
+    sp = sub.add_parser("rm", help="delete a style")
+    sp.add_argument("name")
+    sp = sub.add_parser("use", help="set the active default style")
+    sp.add_argument("name")
+    sub.add_parser("clear", help="unset the active default style")
+    rp = sub.add_parser("reset", help="re-seed the built-in styles (discards edits)")
+    rp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    a = p.parse_args(argv)
+
+    if not a.verb:
+        p.print_help()
+        return 2
+
+    doc = _load_styles()
+    styles = doc["styles"]
+
+    if a.verb == "list":
+        if not styles:
+            print("(no styles)")
+            return 0
+        default = doc.get("default") or ""
+        for name in sorted(styles):
+            preview = " ".join(styles[name].split())
+            if len(preview) > 60:
+                preview = preview[:59] + "…"
+            print(f"{'*' if name == default else ' '} {name}: {preview}")
+        if default:
+            print(f"\n* = active default ({default})")
+        else:
+            print("\n(no active default — pass --style NAME to apply one)")
+        return 0
+
+    if a.verb == "show":
+        if a.name not in styles:
+            _die_unknown_style(a.name, styles)
+        print(styles[a.name])
+        return 0
+
+    if a.verb == "add":
+        if not _valid_style_name(a.name):
+            raise SystemExit(
+                f"error: invalid style name {a.name!r}; use lowercase letters, "
+                f"digits, '-' or '_', starting with a letter or digit.")
+        existed = a.name in styles
+        styles[a.name] = a.snippet
+        _save_styles(doc)
+        print(f"{'updated' if existed else 'added'} style {a.name!r}", file=sys.stderr)
+        return 0
+
+    if a.verb == "rm":
+        if a.name not in styles:
+            _die_unknown_style(a.name, styles)
+        del styles[a.name]
+        cleared = doc.get("default") == a.name
+        if cleared:
+            doc["default"] = ""
+        _save_styles(doc)
+        tail = " (was the active default; default cleared)" if cleared else ""
+        print(f"removed style {a.name!r}{tail}", file=sys.stderr)
+        return 0
+
+    if a.verb == "use":
+        if a.name not in styles:
+            _die_unknown_style(a.name, styles)
+        doc["default"] = a.name
+        _save_styles(doc)
+        print(f"active default style set to {a.name!r}", file=sys.stderr)
+        return 0
+
+    if a.verb == "clear":
+        doc["default"] = ""
+        _save_styles(doc)
+        print("active default style cleared", file=sys.stderr)
+        return 0
+
+    if a.verb == "reset":
+        if not a.yes:
+            sys.stderr.write(
+                "This discards all style edits and restores built-ins. "
+                "Continue? [y/N] ")
+            sys.stderr.flush()
+            if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+                print("aborted", file=sys.stderr)
+                return 1
+        _save_styles(_default_styles_doc())
+        print("styles reset to built-ins", file=sys.stderr)
+        return 0
+
+    return 0
+
+
+# ---------- main ----------
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "style":
+        return _style_command(sys.argv[2:])
+    parser = argparse.ArgumentParser(
+        description="Generate an image with your ChatGPT subscription (no API key)."
+    )
+    parser.add_argument(
+        "-V", "--version", action="version",
+        version=f"chatgpt-imagegen {__version__}",
+    )
+    parser.add_argument("prompt", help="Description of the image to generate")
+    style_grp = parser.add_mutually_exclusive_group()
+    style_grp.add_argument(
+        "--style", default=None, metavar="NAME",
+        help="Apply a saved style preset's text to this prompt "
+             "(see `chatgpt-imagegen style list`). Overrides the active "
+             "default for this run.",
+    )
+    style_grp.add_argument(
+        "--no-style", action="store_true",
+        help="Skip styles for this run even if an active default is set.",
+    )
+    parser.add_argument("-o", "--out", help="Output file path (default: assets/generated/<slug>.<ext>)")
+    parser.add_argument(
+        "--size",
+        default="auto",
+        help="auto | WIDTHxHEIGHT (e.g. 1024x1024, 1536x1024, 1024x1536). "
+             "Forwarded as-is; the backend decides what it accepts.",
+    )
+    parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"])
+    parser.add_argument("--model", default=os.environ.get("CHATGPT_IMAGEGEN_MODEL", "gpt-5.6-sol"))
+    parser.add_argument(
+        "-i", "--ref",
+        action="append",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="Reference image for image-to-image (repeatable). A local path or "
+             "http(s) URL. When given, generation edits the reference(s) instead "
+             "of rendering from text. Works on both backends: web attaches it to "
+             "the composer (no Codex-usage), codex sends it as an input_image.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "web", "codex"],
+        default=os.environ.get("CHATGPT_IMAGEGEN_BACKEND", "auto"),
+        help="auto (default): prefer web (spares Codex-usage limits); fall back "
+             "to codex only if the browser isn't available/logged in. "
+             "web: force the logged-in-browser path (chrome-use). "
+             "codex: force the headless codex/responses path (bills Codex-usage). "
+             "Also settable via CHATGPT_IMAGEGEN_BACKEND.",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="(web backend) chrome-use session name to reuse a Chrome tab "
+             "group across runs (default: imagegen-<pid>).",
+    )
+    parser.add_argument(
+        "--project",
+        default=os.environ.get("CHATGPT_IMAGEGEN_PROJECT", DEFAULT_PROJECT),
+        help="(web backend) ChatGPT Project to file the conversation under — "
+             f"found by exact name, created if absent (default: {DEFAULT_PROJECT!r}; "
+             "also settable via CHATGPT_IMAGEGEN_PROJECT). Pass an empty string "
+             "to use a plain top-level chat instead.",
+    )
+    parser.add_argument(
+        "--web-model",
+        default=os.environ.get("CHATGPT_IMAGEGEN_WEB_MODEL", WEB_MODEL_DEFAULT),
+        help="(web backend) composer model/effort to select before generating — "
+             "a comma-separated candidate list, first one present in the picker "
+             f"wins (default: {WEB_MODEL_DEFAULT!r}; also settable via "
+             "CHATGPT_IMAGEGEN_WEB_MODEL). Labels must match the picker exactly. "
+             "The 'Pro' tier has no native image generator, so leaving it on Pro "
+             "makes the page write Python instead of an image — hence the switch. "
+             "Pass an empty string to keep whatever model is already selected.",
+    )
+    parser.add_argument(
+        "--profile",
+        default="auto",
+        help="(web backend) which Chrome profile to drive. auto (default): "
+             "offline-detect a profile that's logged in to chatgpt.com and use "
+             "the freshest; relay: use your currently-open Chrome via the "
+             "extension; or a profile name like \"Profile 3\".",
+    )
+    parser.add_argument(
+        "--keep-tab",
+        action="store_true",
+        help="(web backend) leave the ChatGPT tab open after generating instead "
+             "of closing it. Implies --keep-conversation (an open tab on a "
+             "deleted chat is useless).",
+    )
+    parser.add_argument(
+        "--keep-conversation",
+        action="store_true",
+        default=_env_bool("CHATGPT_IMAGEGEN_KEEP_CONVERSATION"),
+        help="(web backend) keep the ChatGPT conversation after generating. "
+             "Default: the conversation is DELETED so the run leaves no history "
+             "(it's filed under the project only transiently). Also settable via "
+             "CHATGPT_IMAGEGEN_KEEP_CONVERSATION=1.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=DEFAULT_TOTAL_TIMEOUT,
+        help=f"Total wall-clock budget for the request, in seconds "
+             f"(default: {DEFAULT_TOTAL_TIMEOUT}). Large images can take 2-3 min.",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=_positive_int,
+        default=int(DEFAULT_STALL_TIMEOUT),
+        help=f"Max seconds of silence (no SSE data) before the request is "
+             f"declared stalled (default: {int(DEFAULT_STALL_TIMEOUT)}). "
+             f"Clamped to --timeout.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print only the saved path on stdout (stderr progress is unaffected; "
+             "use --no-progress to silence it).",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Suppress the stderr progress timeline (errors are still shown).",
+    )
+    args = parser.parse_args()
+    _styles_doc = _load_styles()
+    _style_name = _resolve_style_name(
+        _styles_doc, style_arg=args.style, no_style=args.no_style)
+    _snippet = _styles_doc["styles"][_style_name] if _style_name else None
+    args.gen_prompt = _compose_prompt(args.prompt, _snippet)
+    progress = not args.no_progress
+    stall_timeout = float(min(args.stall_timeout, args.timeout))
+    start = time.monotonic()
+
+    if progress:
+        prompt_preview = f"{args.prompt[:60]}{'…' if len(args.prompt) > 60 else ''}"
+        print(
+            f"[   0.0s] requesting image  (backend={args.backend} size={args.size} "
+            f"format={args.format} timeout={args.timeout}s)",
+            file=sys.stderr,
+        )
+        print(f"           prompt: {prompt_preview}", file=sys.stderr)
+        if _style_name:
+            print(f"           style: {_style_name}", file=sys.stderr)
+
+    image_bytes, meta = _dispatch(args, progress, stall_timeout, start)
+
+    out_path = Path(args.out) if args.out else _default_out_path(args.prompt, args.format)
+    if args.out and progress:
+        _maybe_warn_extension_mismatch(out_path, args.format)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(image_bytes)
+
+    if progress:
+        size_info = f"  size={meta.get('size')}" if meta.get("size") else ""
+        quality_info = f"  quality={meta.get('quality')}" if meta.get("quality") else ""
+        print(
+            f"[{time.monotonic() - start:6.1f}s] saved → {out_path}  "
+            f"({len(image_bytes):,} bytes){size_info}{quality_info}",
+            file=sys.stderr,
+        )
+    # stdout is always exactly the saved path, one line — safe for `$(...)` capture.
+    print(out_path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,10 @@
+# Thư viện Python cho Flat Studio.
+# Cài: pip install -r requirements.txt
+aiohttp>=3.9
+pillow
+numpy
+opencv-python-headless
+scipy
+openai>=1.0
+python-dotenv
+certifi
