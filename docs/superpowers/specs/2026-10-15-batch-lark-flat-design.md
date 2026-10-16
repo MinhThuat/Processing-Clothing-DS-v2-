@@ -18,7 +18,7 @@ Không thay giao diện web hiện có (giữ nguyên, không xoá).
 | Base | `NQMeb69ZRak4kfs40oQlMfySgXA` (sg.larksuite.com) |
 | Bảng | `ORD_01` = `tblZhM8uIGIzQ4fx` |
 | View | `No File` = `vewRdGQSXj` (hôm nay; team định nghĩa: No File, chưa DS Check-Done, DS/SS Status không hủy/tạm ngưng/chờ xác nhận, Create Date = Today). Chạy bù ngày cũ: `1. DS Order` = `vew0cgQ2cZ` + chép lại 5 điều kiện đó |
-| Lọc "cần làm" | `Check File` (multi-select) chứa `No File` |
+| Lọc "cần làm" | Trong view No File: dòng gắn tag `GEN` (cột `Gen`) và `Flat Pieces` trống; đã có ảnh thì bỏ qua |
 | Cột ảnh đầu vào | `Link 1` … `Link 20` (text kiểu URL, giá trị dạng Markdown `[url](url)`) |
 | Cột kết quả | `Flat Pieces` = `fldVzvTA9Q` (attachment) — có file = "đã có ảnh" |
 | Cột ghi chú | `Flat Note` = `fldGVXw4ph` (text) |

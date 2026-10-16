@@ -62,7 +62,8 @@ def piece_filename(sku, slug, failed=False):
 
 # ---------- hàng đợi ----------
 def needs_work(row):
-    return ("No File" in row["check_file"] and not row["has_pieces"] and bool(row["links"])
+    """Dòng (đã qua view No File) có gắn tag GEN, chưa có ảnh Flat Pieces, có link, chưa bị SKIP."""
+    return (row.get("gen", False) and not row["has_pieces"] and bool(row["links"])
             and not row["note"].upper().startswith("SKIP"))
 
 
@@ -73,7 +74,7 @@ def build_queue(rows, day):
         if r["created"][:10] == day and needs_work(r):
             groups.setdefault(tuple(r["links"]), []).append(r)
     out = [{"links": list(k), "rows": v, "newest": max(x["created"] for x in v)} for k, v in groups.items()]
-    out.sort(key=lambda g: (any(r.get("gen") for r in g["rows"]), g["newest"]), reverse=True)   # tag GEN trước
+    out.sort(key=lambda g: g["newest"], reverse=True)
     return out
 
 
@@ -795,13 +796,14 @@ def _selfcheck():
     def row(rid, links, created, **kw):
         return {"record_id": rid, "sku": f"S-{rid}-Tee-M-G1", "color": "", "created": created,
                 "check_file": kw.get("cf", ["No File"]), "links": links,
-                "has_pieces": kw.get("hp", False), "pieces": [], "note": kw.get("note", "")}
+                "has_pieces": kw.get("hp", False), "pieces": [], "note": kw.get("note", ""),
+                "gen": kw.get("gen", True)}
     rows = [row("a", ["u1"], "2026-04-09T01:00:00.000+07:00"),
             row("b", ["u1"], "2026-04-09T03:00:00.000+07:00"),
             row("c", ["u2"], "2026-04-09T02:00:00.000+07:00"),
             row("d", ["u3"], "2026-04-09T09:00:00.000+07:00", hp=True),
             row("e", ["u4"], "2026-04-09T09:00:00.000+07:00", note="SKIP: mug"),
-            row("f", ["u5"], "2026-04-09T09:00:00.000+07:00", cf=["Urgent"]),
+            row("f", ["u5"], "2026-04-09T09:00:00.000+07:00", gen=False),   # không gắn GEN -> bỏ
             row("g", [], "2026-04-09T09:00:00.000+07:00"),
             row("h", ["u6"], "2026-04-09T09:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh"),
             row("i", ["u7"], "2026-04-08T23:59:00.000+07:00"),          # ngày cũ -> không chạy
@@ -810,10 +812,10 @@ def _selfcheck():
     assert [[r["record_id"] for r in g["rows"]] for g in q] == [["h"], ["a", "b"], ["c"]]
     assert q[1]["newest"] == "2026-04-09T03:00:00.000+07:00"
     assert build_queue(rows, "2026-04-08")[0]["rows"][0]["record_id"] == "i"
-    # dòng gắn tag GEN lên đầu hàng đợi (dù cũ hơn), sau đó vẫn mới nhất trước
+    # chỉ làm dòng gắn tag GEN (trong view No File); dòng không GEN bị bỏ dù chưa có ảnh
     rows_g = [dict(row("p", ["v1"], "2026-04-09T01:00:00.000+07:00"), gen=True),
               dict(row("q", ["v2"], "2026-04-09T09:00:00.000+07:00"), gen=False)]
-    assert [g["rows"][0]["record_id"] for g in build_queue(rows_g, "2026-04-09")] == ["p", "q"]
+    assert [g["rows"][0]["record_id"] for g in build_queue(rows_g, "2026-04-09")] == ["p"]
     assert group_id(q[1]).startswith("S-a-Tee_") and len(group_id(q[1])) <= 80
     # ghi chú
     assert note_ok("2026-10-16", 6, {"tay_sau": 1}) == "OK 2026-10-16 · 6 mảnh + art · gen lại: tay_sau×1"
