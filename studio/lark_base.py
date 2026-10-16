@@ -13,6 +13,7 @@ PROFILE = "tool_ds"
 BASE = "NQMeb69ZRak4kfs40oQlMfySgXA"
 TABLE = "tblZhM8uIGIzQ4fx"      # ORD_01
 VIEW = "vew0cgQ2cZ"             # 1. DS Order
+VIEW_NOFILE = "vewRdGQSXj"      # No File (team định nghĩa: No File, chưa DS Check-Done, đơn không hủy/tạm ngưng, tạo hôm nay)
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
 F_NOTE = "fldGVXw4ph"           # Flat Note (text)
 N_LINKS = 20
@@ -83,13 +84,29 @@ def _read_ndjson(args):
     return js, [json.loads(l) for l in lines if l.strip()]
 
 
-def fetch_rows():
-    """Mọi dòng có Check File chứa 'No File' trong view 1. DS Order (phân trang 2000/lần)."""
-    filt = json.dumps({"logic": "and", "conditions": [["Check File", "intersects", ["No File"]]]})
+def _query(day, today):
+    """(view, filter|None) để lấy dòng cần làm của ngày `day`.
+    Hôm nay -> view "No File" do team định nghĩa (tự lọc; gửi --filter-json sẽ THAY filter của view).
+    Ngày cũ -> view 1. DS Order + chép lại 5 điều kiện của view "No File", 'Today' -> ngày đó."""
+    if day == today:
+        return VIEW_NOFILE, None
+    return VIEW, {"logic": "and", "conditions": [
+        ["Check File", "intersects", ["No File"]],
+        ["DS Check-Done", "==", False],
+        ["DS Status", "disjoint", ["Đang xác nhận", "Tạm ngưng", "Hủy bỏ"]],
+        ["SS Status", "disjoint", ["Chờ xác nhận", "Hủy đơn"]],
+        ["Create Date", "==", f"ExactDate({day})"]]}
+
+
+def fetch_rows(day, today):
+    """Dòng cần làm của ngày `day` (YYYY-MM-DD) theo điều kiện view "No File" (phân trang 2000/lần)."""
+    view, filt = _query(day, today)
     rows, off = [], 0
     while True:
-        args = ["base", "+record-list", "--base-token", BASE, "--table-id", TABLE, "--view-id", VIEW,
-                "--offset", off, "--filter-json", filt]
+        args = ["base", "+record-list", "--base-token", BASE, "--table-id", TABLE, "--view-id", view,
+                "--offset", off]
+        if filt:
+            args += ["--filter-json", json.dumps(filt, ensure_ascii=False)]
         for f in FIELDS:
             args += ["--field-id", f]
         js, raws = _read_ndjson(args)
@@ -159,6 +176,13 @@ def _selfcheck():
     assert _AUTH.search("refresh token expired")
     assert _AUTH.search("token abc123 expired")
     assert not _AUTH.search("promotion offer expired at midnight")
+    # hôm nay -> đọc view "No File" (view tự lọc, KHÔNG gửi filter vì --filter-json thay filter của view)
+    assert _query("2026-10-16", "2026-10-16") == (VIEW_NOFILE, None)
+    # ngày cũ -> view 1. DS Order + áp lại đủ 5 điều kiện của view "No File", đổi Today thành ngày đó
+    v, f = _query("2026-10-15", "2026-10-16")
+    assert v == VIEW and f["logic"] == "and" and len(f["conditions"]) == 5
+    assert ["Create Date", "==", "ExactDate(2026-10-15)"] in f["conditions"]
+    assert ["DS Check-Done", "==", False] in f["conditions"]
     print("lark_base selfcheck OK")
 
 

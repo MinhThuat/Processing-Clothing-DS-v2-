@@ -644,7 +644,7 @@ def main():
     stats, stop, reason = Counter(), Stopper(a.until, a.limit), "hết việc"
     log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}")
     try:
-        queue = build_queue(lb.fetch_rows(), only_day)
+        queue = build_queue(lb.fetch_rows(only_day, day), only_day)
         log("queue", f"{len(queue)} nhóm cần làm (mẫu ngày {only_day})")
         i, waits = 0, 0
         while i < len(queue):
