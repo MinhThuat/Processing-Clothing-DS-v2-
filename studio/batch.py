@@ -702,7 +702,7 @@ def _locate_groups(groups, rows, srcs, gdir):
     """Với mỗi nhóm cần định vị (`_needs_locate`): dựng gdir/grid_<front>.jpg (ảnh gốc + lưới 0-1000,
     dùng chung cho các nhóm cùng front) rồi hỏi Claude khoanh CHÍNH XÁC vùng của biến thể đó -> cập
     nhật group['crop']. Không tìm thấy / judge lỗi -> giữ crop cũ. -> list nhóm KHÔNG thể gen: front
-    dùng chung với nhóm khác (ảnh nhiều biến thể) mà vẫn không có crop -> gen cả ảnh sẽ tả nhầm biến thể."""
+    dùng chung với nhóm khác hoặc dòng có Name Custom, mà vẫn không có crop -> gen cả ảnh sẽ tả nhầm biến thể."""
     failed = []
     front_counts = Counter(g["front"] for g in groups)
     grids = {}
@@ -730,7 +730,9 @@ def _locate_groups(groups, rows, srcs, gdir):
         else:
             log("locate", f"{group['variant']}/{group['color']}: không định vị được, giữ crop cũ "
                           f"{group['crop']}")
-            if group["crop"] is None and front_counts[front] > 1:
+            # ảnh dùng chung nhiều nhóm, HOẶC dòng có Name Custom (vd 'Design 3': có thể chỉ 1 dòng của ảnh
+            # nhiều design được gắn GEN, hoặc dòng anh em đã up ở lượt trước) -> gen cả ảnh sẽ lấy nhầm design
+            if group["crop"] is None and (front_counts[front] > 1 or custom):
                 failed.append(group)
     return failed
 
@@ -1461,6 +1463,10 @@ def _selfcheck():
         gC = {"front": 2, "crop": None, "variant": "default", "color": "x", "record_ids": ["c"]}
         rws = [{"record_id": k, "sku": "S-Tee-M", "custom": ""} for k in "abc"]
         assert _locate_groups([gA, gB, gC], rws, [Path("1.jpg"), Path("2.jpg")], Path(tempfile.mkdtemp())) == [gA, gB]
+        # chỉ 1 dòng (front không chung) nhưng có Name Custom 'Design 3' -> vẫn loại, không gen cả ảnh
+        rws1 = [{"record_id": "a", "sku": "S-Tee-M", "custom": "Design: Design 3"}]
+        gA1 = {**gA, "crop": None}
+        assert _locate_groups([gA1], rws1, [Path("1.jpg")], Path(tempfile.mkdtemp())) == [gA1]
     finally:
         judge.grid_overlay, judge.locate = orig_go, orig_loc
     print("batch selfcheck OK")
