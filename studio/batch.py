@@ -431,7 +431,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
             return None
         (sdir / "rehint.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
         front_idx = (r["front"] or group["front"]) - 1
-        crop = None if group["mode"] == "combined" else r["crop"]  # combined -> bbox không đáng tin, bỏ
+        crop = group["crop"] if group["mode"] == "combined" else r["crop"]  # combined: giữ vùng cắt phiên bản (nửa MEN/WOMEN)
         ctx["front_src"] = srcs[front_idx]
         ctx["front"] = make_input(srcs[front_idx], crop, sdir / "in_front_r3.png")
         ctx["cropped"] = crop is not None
