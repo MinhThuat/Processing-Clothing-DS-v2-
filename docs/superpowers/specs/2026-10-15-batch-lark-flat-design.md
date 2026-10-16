@@ -94,12 +94,12 @@ Claude trả `{mảnh: {ok, score 1-10, errors: [mã]}}` với mã lỗi cố đ
 | `art_thieu` | art thiếu chi tiết mặt trước / sai bố cục trên-dưới |
 
 **Gen lại** — chỉ mảnh lỗi; mảnh đạt giữ nguyên:
-- **Lần 1–2:** y nguyên — dùng lại `pieces.json`, `--only <mảnh>`.
-- **Lần 3–4:** Claude viết `--hint` nêu lỗi cụ thể (vd "BACK panel: plain body, NO chest
+- **Lần 1:** y nguyên — dùng lại `pieces.json`, `--only <mảnh>`.
+- **Lần 2–3:** Claude viết `--hint` nêu lỗi cụ thể (vd "BACK panel: plain body, NO chest
   graphic"), chạy lại vision (bỏ `pieces.json`) và **crop lại** (bbox chặt hơn hoặc chọn ảnh
   khác trong Link 1…N do Claude chỉ định).
 - Mỗi lần gen lại → QA bằng contact sheet nhỏ (ảnh gốc + mảnh vừa gen).
-- **Sau 4 lần vẫn lỗi:** up **bản điểm cao nhất** trong 5 bản (gốc + 4 lần), tên file thêm
+- **Sau 3 lần vẫn lỗi:** up **bản điểm cao nhất** trong 4 bản (gốc + 3 lần), tên file thêm
   `_QAFAIL`, Note ghi lỗi.
 
 ## Up lên Base
