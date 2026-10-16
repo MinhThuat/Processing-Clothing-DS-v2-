@@ -75,10 +75,11 @@ def needs_work(row):
 
 
 def build_queue(rows, day):
-    """Gom dòng cần làm CỦA NGÀY `day` (YYYY-MM-DD theo Create Date) theo bộ link; mới nhất lên trước."""
+    """Gom dòng cần làm theo bộ link; mới nhất lên trước. Lọc ngày đã do view/filter của Base làm
+    (lb._query) -> không lọc lại theo Create Date (view No File có thể chứa dòng tạo hôm trước)."""
     groups = {}
     for r in rows:
-        if r["created"][:10] == day and needs_work(r):
+        if needs_work(r):
             groups.setdefault(tuple(r["links"]), []).append(r)
     out = [{"links": list(k), "rows": v, "newest": max(x["created"] for x in v)} for k, v in groups.items()]
     out.sort(key=lambda g: g["newest"], reverse=True)
@@ -628,11 +629,19 @@ def upload_rows(rows, files, notes, dry, done_ids):
                 log("up", f"ghi note up thất bại: {e}")
 
 
-def _needs_locate(group, front_counts):
+def _needs_locate(group, front_counts, custom=""):
     """Nhóm cần định vị lại bằng ảnh lớn + lưới toạ độ: front dùng chung với nhóm khác (nhiều biến
     thể trên 1 ảnh, contact sheet ~384px/tile quá nhỏ để Claude thấy rõ từng ô), hoặc nhóm đã có crop
-    (toạ độ đoán từ tile nhỏ -> đáng nghi, định vị lại cho chính xác hơn)."""
-    return front_counts[group["front"]] > 1 or group["crop"] is not None
+    (toạ độ đoán từ tile nhỏ -> đáng nghi, định vị lại cho chính xác hơn), hoặc dòng có Name Custom
+    (vd 'Design 3': 1 dòng nhưng ảnh có nhiều design đánh số)."""
+    return front_counts[group["front"]] > 1 or group["crop"] is not None or bool(custom)
+
+
+def _variant_label(group, sub_rows):
+    """Nhãn biến thể đưa cho locate: variant của judge, hoặc Name Custom khi judge để 'default'."""
+    if group["variant"] and group["variant"] != "default":
+        return group["variant"]
+    return "; ".join(sorted({r["custom"] for r in sub_rows if r.get("custom")})) or group["variant"]
 
 
 def _locate_groups(groups, rows, srcs, gdir):
@@ -642,16 +651,17 @@ def _locate_groups(groups, rows, srcs, gdir):
     front_counts = Counter(g["front"] for g in groups)
     grids = {}
     for group in groups:
-        if not _needs_locate(group, front_counts):
+        sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
+        custom = "; ".join(r.get("custom", "") for r in sub_rows if r.get("custom"))
+        if not _needs_locate(group, front_counts, custom):
             continue
         front = group["front"]
         if front not in grids:
             grids[front] = judge.grid_overlay(srcs[front - 1], gdir / f"grid_{front}.jpg")
-        sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
         skus = "; ".join(sorted({r["sku"] for r in sub_rows}))
         kid = any(_is_kid(r["sku"]) for r in sub_rows)
         try:
-            box = judge.locate(grids[front], group["variant"], skus, kid)
+            box = judge.locate(grids[front], _variant_label(group, sub_rows), skus, kid)
         except StepError as e:
             log("locate", f"{group['variant']}/{group['color']}: lỗi, giữ crop cũ: {e}")
             continue
@@ -836,6 +846,11 @@ def _selfcheck():
     assert sku_stem("X") == "X"
     assert piece_filename("A/B-Black-Tee-M-G1", "tay_sau", failed=True) == "A_B-Black-Tee_tay_sau_QAFAIL.png"
     assert piece_filename("A-Tee-S-G1", "art") == "A-Tee_art.png"
+    # 1 nhóm, không crop, nhưng dòng có Name Custom 'Design 3' (ảnh nhiều design) -> vẫn định vị
+    g1 = {"front": 1, "crop": None, "variant": "default"}
+    assert not _needs_locate(g1, Counter([1])) and _needs_locate(g1, Counter([1]), "Design: Design 3")
+    assert _variant_label(g1, [{"custom": "Design: Design 3"}]) == "Design: Design 3"
+    assert _variant_label({**g1, "variant": "Women"}, [{"custom": "x"}]) == "Women"
     # _is_kid: size/từ khoá trẻ em trong SKU Design -> True (để judge.locate chọn áo người lớn/trẻ em)
     assert _is_kid("HKH032604A21-Black-Kid Tennis Shirt-M-G130426")
     assert _is_kid("HKH032604A21-Black-2D Hoodie-4T-G130426")
@@ -855,13 +870,12 @@ def _selfcheck():
             row("e", ["u4"], "2026-04-09T09:00:00.000+07:00", note="SKIP: mug"),
             row("f", ["u5"], "2026-04-09T09:00:00.000+07:00", gen=False),   # không gắn GEN -> bỏ
             row("g", [], "2026-04-09T09:00:00.000+07:00"),
-            row("h", ["u6"], "2026-04-09T09:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh"),
-            row("i", ["u7"], "2026-04-08T23:59:00.000+07:00"),          # ngày cũ -> không chạy
-            row("j", ["u1"], "2026-04-10T00:01:00.000+07:00")]          # ngày khác -> không chạy
+            row("h", ["u6"], "2026-04-09T09:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh")]
     q = build_queue(rows, "2026-04-09")
     assert [[r["record_id"] for r in g["rows"]] for g in q] == [["h"], ["a", "b"], ["c"]]
     assert q[1]["newest"] == "2026-04-09T03:00:00.000+07:00"
-    assert build_queue(rows, "2026-04-08")[0]["rows"][0]["record_id"] == "i"
+    # lọc ngày do Base (view No File) làm: dòng tạo hôm trước mà view vẫn trả về -> vẫn chạy
+    assert build_queue([row("i", ["u7"], "2026-04-08T23:59:00.000+07:00")], "2026-04-09")[0]["rows"][0]["record_id"] == "i"
     # chỉ làm dòng gắn tag GEN (trong view No File); dòng không GEN bị bỏ dù chưa có ảnh
     rows_g = [dict(row("p", ["v1"], "2026-04-09T01:00:00.000+07:00"), gen=True),
               dict(row("q", ["v2"], "2026-04-09T09:00:00.000+07:00"), gen=False)]
