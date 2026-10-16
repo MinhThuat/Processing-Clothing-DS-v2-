@@ -686,17 +686,22 @@ def cleanup(gdir):
 
 
 def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids):
-    """SP không phải quần áo (nonclothing.py): mỗi dòng 1 art phẳng -> up + note riêng từng dòng."""
+    """SP không phải quần áo (nonclothing.py): mỗi dòng 2 art (phẳng + giả 3D) -> up + note riêng từng dòng."""
     any_fail = False
-    for r, art, q in nonclothing.run(rows, srcs, sheet, gdir, log):
-        fail = not q["ok"]
-        any_fail |= fail
+    for r, arts in nonclothing.run(rows, srcs, sheet, gdir, log):
         od = gdir / f"nc_{r['record_id']}" / "out"; od.mkdir(parents=True, exist_ok=True)
-        f = od / piece_filename(r["sku"], "art", fail)
-        shutil.copyfile(art, f)
-        note = (f"QA FAIL {day} · art ({','.join(q['errors']) or 'điểm thấp'}) sau {nonclothing.MAX_ATTEMPTS} lần"
-                if fail else f"OK {day} · art phẳng (không phải quần áo)")
-        upload_rows([r], [f], {r["record_id"]: note}, dry, done_ids)
+        files, fails = [], {}
+        for v, (art, q) in arts.items():
+            if not q["ok"]:
+                fails[f"art_{v}"] = q["errors"] or ["điểm thấp"]
+            f = od / piece_filename(r["sku"], f"art_{v}", not q["ok"])
+            shutil.copyfile(art, f)
+            files.append(f)
+        any_fail |= bool(fails)
+        note = (f"QA FAIL {day} · " + " · ".join(f"{k} ({','.join(e)})" for k, e in fails.items())
+                + f" sau {nonclothing.MAX_ATTEMPTS} lần" if fails
+                else f"OK {day} · art phẳng + giả 3D (không phải quần áo)")
+        upload_rows([r], files, {r["record_id"]: note}, dry, done_ids)
     stats["qafail" if any_fail else "ok"] += 1
     if not dry:
         cleanup(gdir)
@@ -1346,19 +1351,22 @@ def _selfcheck():
     # nhánh SP không phải quần áo: mỗi dòng 1 art, note OK / QA FAIL riêng, file _QAFAIL khi trượt
     td_nc = Path(tempfile.mkdtemp()); art_nc = td_nc / "a.png"; Image.new("RGB", (8, 8)).save(art_nc)
     orig_run, ups = nonclothing.run, []
+    ok_q, bad_q = {"ok": True, "score": 9.0, "errors": []}, {"ok": False, "score": 5.0, "errors": ["sai_chu"]}
     nonclothing.run = lambda rows, *a, **k: [
-        (rows[0], art_nc, {"ok": True, "score": 9.0, "errors": []}),
-        (rows[1], art_nc, {"ok": False, "score": 5.0, "errors": ["sai_chu"]})]
+        (rows[0], {"phang": (art_nc, ok_q), "3d": (art_nc, ok_q)}),
+        (rows[1], {"phang": (art_nc, ok_q), "3d": (art_nc, bad_q)})]
     orig_up = upload_rows
-    globals()["upload_rows"] = lambda rows, files, notes, dry, done: ups.append((files[0].name, notes))
+    globals()["upload_rows"] = lambda rows, files, notes, dry, done: ups.append(([f.name for f in files], notes))
     try:
         st = Counter()
         rws = [{"record_id": "n1", "sku": "X-Basket-M-G1"}, {"record_id": "n2", "sku": "X-Basket-M-G1"}]
         assert process_nonclothing(rws, [], None, td_nc, "2026-10-16", True, st, set()) is None
     finally:
         nonclothing.run = orig_run; globals()["upload_rows"] = orig_up
-    assert ups[0] == ("X-Basket_art.png", {"n1": "OK 2026-10-16 · art phẳng (không phải quần áo)"})
-    assert ups[1][0] == "X-Basket_art_QAFAIL.png" and ups[1][1]["n2"].startswith("QA FAIL 2026-10-16 · art (sai_chu)")
+    assert ups[0] == (["X-Basket_art_phang.png", "X-Basket_art_3d.png"],
+                      {"n1": "OK 2026-10-16 · art phẳng + giả 3D (không phải quần áo)"})
+    assert ups[1][0] == ["X-Basket_art_phang.png", "X-Basket_art_3d_QAFAIL.png"]
+    assert ups[1][1]["n2"] == "QA FAIL 2026-10-16 · art_3d (sai_chu) sau 3 lần"
     assert st["qafail"] == 1 and st["ok"] == 0
     print("batch selfcheck OK")
 

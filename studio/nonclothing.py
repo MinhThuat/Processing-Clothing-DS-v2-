@@ -1,9 +1,12 @@
-"""Nhánh RIÊNG cho sản phẩm KHÔNG phải quần áo (giỏ, lịch, cốc, decor...): 1 art phẳng / dòng.
+"""Nhánh RIÊNG cho sản phẩm KHÔNG phải quần áo (giỏ, lịch, cốc, decor...): mỗi dòng 2 bản art —
+"phang" (phẳng lì, vector) và "3d" (giữ hiệu ứng giả 3D nổi như ảnh) — y ảnh nguồn + Name Custom.
 
 Tách hẳn khỏi luồng clothing (batch.process_subgroup / flat_pipeline pieces) — batch chỉ rẽ sang đây
 khi judge.pick trả 'skip'. Luồng:
-  Claude chọn ảnh có hình in (+ định vị nếu ảnh nhiều SP) -> codex/dola tả SP -> mỗi dòng gen 1 art
-  (màu theo cột Color, chữ/option theo Name Custom) -> Claude QA -> gen lại tối đa MAX_ATTEMPTS.
+  Claude chọn ảnh có hình in (+ định vị nếu ảnh nhiều SP) -> codex/dola tả SP -> mỗi dòng gen 2 bản
+  (màu theo cột Color, chữ/option theo Name Custom) -> Claude QA từng bản -> gen lại tối đa MAX_ATTEMPTS.
+USER RULE: thành phẩm phải Y ẢNH NGUỒN; mọi thứ gắn/đi kèm SP trong ảnh (vd squishy trong giỏ) là 1
+phần của SP -> giữ nguyên; chỉ bỏ cảnh nền, người, tay, SP khác.
 """
 import json
 from pathlib import Path
@@ -29,28 +32,47 @@ VISION = (
     "This photo shows a product (not clothing). Describe it as a precise flat-technical spec so it can "
     "be redrawn as a flat front-view drawing. Return ONLY JSON: "
     '{"product":"<type>","shape":"<outline/shape, handles, parts>","base":"<main colour(s)>",'
-    '"print":"<EVERY printed graphic and text with exact content, colours, fonts style and positions>"}. '
+    '"print":"<EVERY printed graphic and text with exact content, colours, fonts style and positions>",'
+    '"items":"<EVERY object attached to or included with the product (contents, toys, accessories, '
+    'decorations) with look and position, or none>","effects":"<raised/puffy/embossed/glossy/3D-looking '
+    'parts, or none>"}. '
     "Colours as words or hex. No prose outside the spec.")
 
-ART = (
-    "A 2D FLAT technical drawing of the {product}, FRONT view, centred on a plain light grey background. "
-    "Shape: {shape}. Main colour: {base}. Printed design, redrawn faithfully in the same place: {print}. "
-    "SOLID FLAT COLOR FILL, crisp clean edges like a technical CAD flat: NO 3D, NO perspective, NO "
-    "shading, NO shadow, NO texture, NO props or contents inside/around it, NO background scene, NO "
-    "person, NO hands, NO mockup.{custom}")
+_ART = (
+    "Reproduce this {product} EXACTLY as in the reference photo, FRONT view, centred on a plain light grey "
+    "background. Same shape and proportions: {shape}. Main colour: {base}. Every printed graphic and text "
+    "in the same place: {print}. Everything attached to or included with the product stays, in the same "
+    "place and look: {items}. Remove ONLY the background scene (room, table, wall, other products), "
+    "people and hands. ")
+ART = {
+    "phang": _ART + ("Render it as a 2D FLAT drawing: SOLID FLAT COLOR FILL, crisp clean edges like a "
+                     "technical CAD flat — NO 3D, NO shading, NO highlights, NO shadow, NO texture."),
+    "3d": _ART + ("KEEP the faux-3D look exactly as in the photo: raised/puffy/embossed printed elements, "
+                  "glossy highlights, shading and depth of the graphics and items ({effects}), fabric "
+                  "texture. Straight front view, no perspective distortion, no drop shadow on the "
+                  "background."),
+}
+VERSIONS = list(ART)
 
-QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated flat drawing ("art").
+QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated drawing ("art"), version: {version}.
 Order: colour {color} | customer options: {opts}.
-Judge the art STRICTLY (it goes to production): score 1-10 and error codes from:
- sai_hoa_tiet (printed graphics missing/extra/misplaced vs reference), sai_chu (text differs from the
- customer's text in the options, or misspelled), sai_mau (product colour/option colours wrong),
- khong_phang (3D, perspective, shading, props/contents, background scene, person), mo_nhoe (blurry).
+The art must look EXACTLY like the reference product (only the background scene, people and hands
+removed), with the customer's text/options applied. Everything attached to or included with the product
+in the reference (contents, toys, accessories) is PART of the product and must be there.
+Judge STRICTLY (it goes to production): score 1-10 and error codes from:
+ sai_hoa_tiet (printed graphics or attached/included items missing/extra/misplaced/different vs the
+ reference), sai_chu (text differs from the customer's text in the options, or misspelled), sai_mau
+ (product colour/option colours wrong), sai_kieu (wrong style for the version: {style}), nen_thua
+ (background scene, other products, person or hands left in), mo_nhoe (blurry).
 Return ONLY {{"score": 9, "errors": []}}"""
-CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "khong_phang", "mo_nhoe"}
-FIX = {"sai_hoa_tiet": "redraw EVERY printed graphic exactly as in the reference",
+STYLE = {"phang": "must be completely flat solid colours — any 3D shading/highlight/texture is wrong",
+         "3d": "must keep the raised faux-3D look of the reference — a flat cartoon look is wrong"}
+CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "sai_kieu", "nen_thua", "mo_nhoe"}
+FIX = {"sai_hoa_tiet": "copy EVERY graphic and attached/included item exactly as in the reference",
        "sai_chu": "use the customer's text EXACTLY, correctly spelled",
        "sai_mau": "use exactly the ordered colours",
-       "khong_phang": "strictly flat front view, no 3D/perspective/shadow/props/background",
+       "sai_kieu": "follow the required rendering style strictly",
+       "nen_thua": "plain light grey background only, no scene/other products/people",
        "mo_nhoe": "crisp sharp edges"}
 
 
@@ -76,6 +98,7 @@ def _gen(prompt, ref, out):
         fp.gen_panel(prompt, [ref], out)
     except Exception as e:
         raise_for(str(e), "gen")
+    fp._flatten_white(out)      # codex đôi khi trả PNG nền trong suốt -> nền trắng đục (như mảnh clothing)
 
 
 def _input(rows, srcs, sheet, gdir, log):
@@ -97,8 +120,33 @@ def _input(rows, srcs, sheet, gdir, log):
     return fp._upscaled(inp, gdir / "nc_in_up.png"), pk
 
 
+def _best_art(r, version, prompt, inp, d, log):
+    """Gen 1 bản (version) cho 1 dòng, QA, gen lại tối đa MAX_ATTEMPTS -> (path, qa) bản điểm cao nhất."""
+    best, fix = None, ""
+    for k in range(1, MAX_ATTEMPTS + 1):
+        art = d / f"art_{version}_{k}.png"
+        try:
+            _gen(prompt + fix, inp, art)
+        except StepError as e:
+            log("nc", f"{r['record_id']} {version} lần {k}: lỗi gen {e}"); continue
+        qs = judge.contact_sheet([[(inp, "REF"), (art, f"art {version}")]], d / f"sheet_qa_{version}_{k}.jpg")
+        q = norm_qa(judge.ask(QA.format(version=version, style=STYLE[version],
+                                        color=r["color"] or "as in reference",
+                                        opts=judge._opts(r.get("custom"))), [qs]))
+        log("nc", f"{r['record_id']} {version} lần {k}: {'✓' if q['ok'] else '✗'}{q['score']:.0f} {q['errors']}")
+        if not best or q["score"] > best[1]["score"]:
+            best = (art, q)
+        if q["ok"]:
+            break
+        if q["errors"]:
+            fix = " FIX: " + "; ".join(FIX[e] for e in q["errors"]) + "."
+    if not best:
+        raise StepError("gen", f"{r['record_id']} {version}: gen art lỗi {MAX_ATTEMPTS} lần")
+    return best
+
+
 def run(rows, srcs, sheet, gdir, log):
-    """-> list (row, art_path, qa) — 1 art cho MỖI dòng (tên/màu khách có thể khác nhau)."""
+    """-> list (row, {version: (art_path, qa)}) — mỗi dòng đủ VERSIONS (tên/màu khách có thể khác nhau)."""
     inp, pk = _input(rows, srcs, sheet, gdir, log)
     try:
         spec, m = fp._vision(fp._ark_clients()[0], inp, VISION, need=("product", "print"))
@@ -108,28 +156,11 @@ def run(rows, srcs, sheet, gdir, log):
     out = []
     for r in rows:
         d = gdir / f"nc_{r['record_id']}"; d.mkdir(exist_ok=True)
-        base = ART.format(product=spec.get("product") or pk.get("product") or "product",
-                          shape=spec.get("shape", ""), base=spec.get("base", ""),
-                          print=spec.get("print", ""), custom=custom_rule(r))
-        best, fix = None, ""
-        for k in range(1, MAX_ATTEMPTS + 1):
-            art = d / f"art_{k}.png"
-            try:
-                _gen(base + fix, inp, art)
-            except StepError as e:
-                log("nc", f"{r['record_id']} lần {k}: lỗi gen {e}"); continue
-            qs = judge.contact_sheet([[(inp, "REF"), (art, "art")]], d / f"sheet_qa_{k}.jpg")
-            q = norm_qa(judge.ask(QA.format(color=r["color"] or "as in reference",
-                                            opts=judge._opts(r.get("custom"))), [qs]))
-            log("nc", f"{r['record_id']} lần {k}: {'✓' if q['ok'] else '✗'}{q['score']:.0f} {q['errors']}")
-            if not best or q["score"] > best[1]["score"]:
-                best = (art, q)
-            if q["ok"]:
-                break
-            fix = " FIX: " + "; ".join(FIX[e] for e in q["errors"]) + "." if q["errors"] else fix
-        if not best:
-            raise StepError("gen", f"{r['record_id']}: gen art lỗi {MAX_ATTEMPTS} lần")
-        out.append((r, best[0], best[1]))
+        fields = dict(product=spec.get("product") or pk.get("product") or "product",
+                      shape=spec.get("shape", ""), base=spec.get("base", ""), print=spec.get("print", ""),
+                      items=spec.get("items") or "none", effects=spec.get("effects") or "as in the photo")
+        out.append((r, {v: _best_art(r, v, ART[v].format(**fields) + custom_rule(r), inp, d, log)
+                        for v in VERSIONS}))
     return out
 
 
@@ -142,6 +173,10 @@ def _selfcheck():
     s = custom_rule(r)
     assert "Green" in s and "Knox's" in s and "Black" in s
     assert custom_rule({"color": "", "custom": ""}) == ""
+    f = dict(product="basket", shape="s", base="green", print="p", items="toys", effects="puffy")
+    assert VERSIONS == ["phang", "3d"]
+    assert "FLAT" in ART["phang"].format(**f) and "puffy" in ART["3d"].format(**f)
+    assert all("toys" in ART[v].format(**f) for v in VERSIONS)          # đồ đi kèm SP luôn giữ
     print("nonclothing selfcheck OK")
 
 
