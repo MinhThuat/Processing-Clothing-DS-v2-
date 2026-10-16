@@ -144,19 +144,17 @@ def norm_pick(js, rows, n):
         ng = _norm_group(g, ids, seen, n)
         if ng:
             groups.append(ng)
-    rest = [x for x in ids if x not in seen]
-    if rest:                                   # Claude sót dòng / nhóm front sai -> dồn vào nhóm hợp lệ đầu
-        if not groups:
-            raise StepError("judge", "không có nhóm hợp lệ nào")
-        groups[0]["record_ids"] += rest
     if not groups:
         raise StepError("judge", "không có nhóm hợp lệ nào")
+    # Claude sót dòng / nhóm front sai -> KHÔNG đoán dồn vào nhóm khác (có thể sai biến thể/màu,
+    # vd lên nhầm file men/đen cho đơn women/hồng) -> để "unassigned", batch ghi LỖI riêng cho dòng đó.
+    unassigned = [x for x in ids if x not in seen]
     manual = {}                                                   # customisation không gen được -> ghi Note
     for rid, note in (js.get("manual") or {}).items():
         note = str(note)[:120]
         if rid in ids and note:
             manual[rid] = note
-    return {"skip": None, "groups": groups, "manual": manual}
+    return {"skip": None, "groups": groups, "manual": manual, "unassigned": unassigned}
 
 
 def norm_qa(js, names):
@@ -253,6 +251,7 @@ Write ONE short FIX instruction in English (<= 40 words) for the image generator
 exact errors, e.g. "BACK torso panel: plain base fabric, NO chest graphic, NO zipper".
 Also re-pick the input: "front" = label of the best FRONT photo (may differ from before) and optional
 "crop" [x0,y0,x1,y1] integers 0-1000 tight around the single garment (or null).
+Re-pick ONLY among photos of THIS variant/product type: {variant} / {garment} / {skus}.
 Return ONLY: {{"hint": "...", "front": 1, "crop": null}}"""
 
 
@@ -266,9 +265,9 @@ def qa(sheet, names, colour, n_refs):
     return norm_qa(ask(QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)), [sheet]), names)
 
 
-def rehint(sheet, fails, n_src):
+def rehint(sheet, fails, n_src, variant="default", garment="top_bottom", skus=""):
     txt = "; ".join(f"{k}: {','.join(v) or '?'}" for k, v in fails.items())
-    js = ask(REHINT.format(fails=txt, n=n_src), [sheet])
+    js = ask(REHINT.format(fails=txt, n=n_src, variant=variant, garment=garment, skus=skus or "-"), [sheet])
     front = js.get("front") if isinstance(js.get("front"), int) and 1 <= js["front"] <= n_src else None
     return {"hint": str(js.get("hint") or "")[:400], "front": front, "crop": _box(js.get("crop"))}
 
@@ -297,7 +296,10 @@ def _selfcheck():
     assert p["groups"][0]["front"] == 2 and p["groups"][0]["back"] is None and p["groups"][0]["mode"] == "infer"
     assert p["groups"][0]["crop"] == [10, 20, 900, 990]
     ids = [x for g in p["groups"] for x in g["record_ids"]]
-    assert sorted(ids) == ["r1", "r2", "r3"] and len(ids) == 3            # r3 bị sót -> vào nhóm hợp lệ đầu
+    # #1 r3 bị Claude bỏ sót -> KHÔNG được dồn nhầm vào nhóm khác (có thể sai biến thể/màu);
+    # phải rơi vào "unassigned" để batch ghi LỖI riêng cho dòng đó, không gen nhầm ảnh
+    assert sorted(ids) == ["r1", "r2"] and len(ids) == 2
+    assert p["unassigned"] == ["r3"]
     assert p["groups"][1] == {"variant": "default", "color": "pink", "matches_photo": False,
                               "record_ids": ["r2"], "front": 1, "back": None, "mode": "infer", "crop": None,
                               "back_crop": None, "garment": "top_bottom"}
@@ -346,7 +348,10 @@ def _selfcheck():
         {"variant": "Women", "color": "photo", "matches_photo": True, "front": 99, "back": None,
          "mode": "infer", "crop": None, "record_ids": ["r2", "r3"]}]}, rows_, 5)
     assert len(p3["groups"]) == 1
-    assert sorted(p3["groups"][0]["record_ids"]) == ["r1", "r2", "r3"]
+    # #1 nhóm "Women" front sai (99) bị bỏ cả nhóm -> r2/r3 KHÔNG được dồn vào nhóm "Men" hợp lệ
+    # (sai biến thể) mà phải vào "unassigned"
+    assert p3["groups"][0]["record_ids"] == ["r1"]
+    assert sorted(p3["unassigned"]) == ["r2", "r3"]
     # toàn bộ nhóm front sai -> không còn nhóm nào hợp lệ -> StepError
     try:
         norm_pick({"skip": None, "groups": [{"variant": "x", "color": "photo", "matches_photo": True,
@@ -362,7 +367,9 @@ def _selfcheck():
          "mode": "infer", "crop": None, "record_ids": ["r1", "r2", "r3"]}],
         "manual": {"r1": "skin tone S3", "zz": "unknown rid", "r2": "", "r3": "x" * 200}}, rows_, 5)
     assert p4["manual"] == {"r1": "skin tone S3", "r3": "x" * 120}   # zz bỏ (lạ), r2 bỏ (rỗng), r3 cắt 120
+    assert p4["unassigned"] == []                                   # đủ cả 3 dòng -> không ai bị bỏ sót
     assert "manual" not in norm_pick({"skip": "Magnet"}, rows_, 5)
+    assert "unassigned" not in norm_pick({"skip": "Magnet"}, rows_, 5)
     # _opts: gộp 'Name Custom' nhiều dòng/bullet thành 1 dòng cho prompt
     assert _opts("") == "-" and _opts(None) == "-"
     assert _opts("• Choose design: Men\n• Choose skin tone: S3") == \
@@ -384,6 +391,22 @@ def _selfcheck():
     assert q["art"]["ok"] is False and q["art"]["score"] == 0.0
     # ảnh mẫu trắng/mockup chung không có họa tiết -> không phải thiết kế (bài học Zip Hoodie)
     assert "BLANK" in PICK and "blank" in QA.lower()
+    # #10 rehint: phải truyền variant/garment/SKU để Claude CHỈ chọn lại ảnh ĐÚNG biến thể/loại SP
+    # (không lạc sang biến thể/SP khác trong cùng đơn nhiều dòng)
+    assert "THIS variant/product type" in REHINT
+    orig_ask = globals()["ask"]
+    captured = {}
+
+    def fake_ask(prompt, images, timeout=300):
+        captured["prompt"] = prompt
+        return {"hint": "FIX X", "front": 2, "crop": [10, 10, 500, 500]}
+    globals()["ask"] = fake_ask
+    try:
+        r = rehint(td / "s.jpg", {"tay_sau": ["mo_nhoe"]}, 3, variant="Men", garment="top", skus="SKU-A; SKU-B")
+    finally:
+        globals()["ask"] = orig_ask
+    assert r == {"hint": "FIX X", "front": 2, "crop": [10, 10, 500, 500]}
+    assert "Men" in captured["prompt"] and "/ top /" in captured["prompt"] and "SKU-A; SKU-B" in captured["prompt"]
     print("judge selfcheck OK")
 
 

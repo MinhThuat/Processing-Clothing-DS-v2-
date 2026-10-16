@@ -376,6 +376,14 @@ def _filter_by_garment(items, garment):
         return items
     return type(items)(x for x in items if keep(x))
 
+_BACK_FALLBACK = {"top_back": "top_front", "pants_back": "pants_front",
+                  "bodice_back": "bodice_front", "skirt_back": "skirt_front"}
+
+def _desc(js, key):
+    """Mô tả panel theo `key`; vision bỏ sót *_back -> suy từ mặt trước tương ứng (USER DECISION:
+    SP có phần nào thì luôn đủ 2 mặt của phần đó, không được thiếu mảnh sản xuất)."""
+    return js.get(key) or js.get(_BACK_FALLBACK.get(key, ""))
+
 def _pieces_plan(js):
     """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
     kind='dress' (cắt cong) | 'bleed' (full-bleed). side='front'/'back' -> chọn ảnh ref.
@@ -392,18 +400,18 @@ def _pieces_plan(js):
             ("ta_truoc",   SHAPE_FAN,    "shape_fan.png",    "skirt_front",  "front"),
             ("ta_sau",     SHAPE_FAN,    "shape_fan.png",    "skirt_back",   "back"),
         ]:
-            desc = js.get(key)
+            desc = _desc(js, key)
             if desc:
                 plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=shape, guide=guide))
         return plan
     if typ != "bottom":   # top / top_bottom: thân áo
         for slug, key, side in [("ao_truoc", "top_front", "front"), ("ao_sau", "top_back", "back")]:
-            desc = js.get(key)
+            desc = _desc(js, key)
             if desc:
                 plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
     if typ != "top":      # bottom / top_bottom: quần
         for slug, key, side in [("quan_truoc", "pants_front", "front"), ("quan_sau", "pants_back", "back")]:
-            desc = js.get(key)
+            desc = _desc(js, key)
             if desc:
                 plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
     if typ != "bottom":   # top / top_bottom: tay áo — giống -> 1 bộ trước/sau; khác -> trái + phải
@@ -745,6 +753,19 @@ def _selfcheck():
     assert {s["slug"] for s in top_only} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
     bottom_only = _pieces_plan({"type": "bottom", "pants_front": "c", "pants_back": "d"})
     assert {s["slug"] for s in bottom_only} == {"quan_truoc", "quan_sau"}
+    # #9 vision bỏ sót mô tả lưng (*_back) -> suy từ mặt trước tương ứng, KHÔNG được thiếu mảnh sản
+    # xuất (USER DECISION: pants_back/top_back/bodice_back/skirt_back thiếu -> lấy đúng desc front)
+    bottom_missing_back = _pieces_plan({"type": "bottom", "pants_front": "base red; x"})
+    assert {s["slug"] for s in bottom_missing_back} == {"quan_truoc", "quan_sau"}
+    assert next(s["desc"] for s in bottom_missing_back if s["slug"] == "quan_sau") == "base red; x"
+    top_missing_back = _pieces_plan({"type": "top", "top_front": "base blue; y", "sleeves_same": True,
+                                     "sl_front": "e"})
+    assert {s["slug"] for s in top_missing_back} == {"ao_truoc", "ao_sau", "tay_truoc"}
+    assert next(s["desc"] for s in top_missing_back if s["slug"] == "ao_sau") == "base blue; y"
+    dress_missing_back = _pieces_plan({"type": "dress", "bodice_front": "base x", "skirt_front": "base y"})
+    assert {s["slug"] for s in dress_missing_back} == {"than_truoc", "than_sau", "ta_truoc", "ta_sau"}
+    assert next(s["desc"] for s in dress_missing_back if s["slug"] == "than_sau") == "base x"
+    assert next(s["desc"] for s in dress_missing_back if s["slug"] == "ta_sau") == "base y"
     assert '"type":"top"' in _PIECES_SCHEMA and '"type":"bottom"' in _PIECES_SCHEMA
     assert "not a separate bottom garment" in _PIECES_SCHEMA
     # GARMENT (--garment, biết trước loại SP thật) ép lọc plan dù vision vẫn trả top_bottom đầy đủ

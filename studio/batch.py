@@ -8,7 +8,7 @@ Lark Base (view 1. DS Order) -> dòng No File chưa có Flat Pieces -> tải Lin
 -> flat_pipeline (pieces 3D + art) -> Claude QA, gen lại -> up Flat Pieces + ghi Flat Note.
 Spec: docs/superpowers/specs/2026-10-15-batch-lark-flat-design.md
 """
-import argparse, hashlib, io, json, os, re, shutil, signal, subprocess, sys, time, traceback, urllib.request
+import argparse, hashlib, io, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback, urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -214,21 +214,40 @@ def _alive(pid):
 
 
 def acquire_lock(path=LOCK):
-    if path.exists():
-        try:
-            pid = int(path.read_text().strip() or 0)
-        except ValueError:
-            pid = 0
-        if pid and pid != os.getpid() and _alive(pid):
-            sys.exit(f"Đang có batch khác chạy (PID {pid}). Chắc chắn không còn thì xoá {path}.")
-        if pid == os.getpid():
-            sys.exit(f"Lock {path} đã thuộc tiến trình này.")
+    """Tạo lock NGUYÊN TỬ bằng os.open(O_CREAT|O_EXCL): 2 tiến trình không thể cùng "thấy chưa có
+    lock" rồi cùng ghi đè (TOCTOU) — kernel chỉ cho ĐÚNG 1 lệnh open thành công. Lock đã có sẵn ->
+    đọc PID cũ: còn sống thì chặn, chết thì gỡ rồi thử tạo lại đúng 1 lần."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(os.getpid()))
+    for attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                pid = int(path.read_text().strip() or 0)
+            except (ValueError, OSError):
+                pid = 0
+            if pid == os.getpid():
+                sys.exit(f"Lock {path} đã thuộc tiến trình này.")
+            if pid and _alive(pid):
+                sys.exit(f"Đang có batch khác chạy (PID {pid}). Chắc chắn không còn thì xoá {path}.")
+            if attempt == 0:
+                path.unlink(missing_ok=True)      # PID chết (hoặc file hỏng) -> gỡ rồi thử lại 1 lần
+                continue
+            sys.exit(f"Không tạo được lock {path} (đua với tiến trình khác).")
+        else:
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return
 
 
 def release_lock(path=LOCK):
-    path.unlink(missing_ok=True)
+    """Chỉ gỡ lock nếu nó đang chứa PID CỦA MÌNH — tránh gỡ nhầm lock của 1 tiến trình batch khác."""
+    try:
+        pid = int(path.read_text().strip() or 0)
+    except (ValueError, OSError):
+        return
+    if pid == os.getpid():
+        path.unlink(missing_ok=True)
 
 
 # ---------- ảnh đầu vào ----------
@@ -260,22 +279,65 @@ def make_input(src, crop, dst):
 
 
 # ---------- pipeline ----------
-def run_pipe(args, logf, timeout):
-    """Chạy flat_pipeline --single. Hết đăng nhập (trong log/stderr) -> AuthError; exit≠0 -> raise_for."""
+_ACTIVE = set()             # Popen đang chạy (pipeline con) -> SIGTERM/SIGHUP/Ctrl+C diệt được hết
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _kill_active():
+    """Diệt CẢ process group của mọi pipeline đang chạy (không chỉ tiến trình Python cha — Codex/
+    OpenArt là cháu, subprocess.run thường chỉ kill được con trực tiếp). Gọi khi dừng giữa chừng
+    (SIGTERM/SIGHUP/Ctrl+C) để không phải đợi hết 45' timeout của nhóm."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for p in procs:
+        try:
+            if sys.platform == "win32":
+                p.kill()
+            else:
+                os.killpg(p.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass          # đã chết sẵn
+
+
+def run_pipe(args, logf, timeout, cmd=None):
+    """Chạy flat_pipeline --single trong process group RIÊNG (start_new_session) -> quá giờ diệt được
+    cả tiến trình cháu (Codex/OpenArt), không chỉ tiến trình con trực tiếp. Hết đăng nhập (trong
+    log/stderr) -> AuthError; exit≠0 -> raise_for. `cmd` (nội bộ, cho selfcheck) ghi đè lệnh chạy."""
     logf.unlink(missing_ok=True)   # pipeline ghi log kiểu append -> chỉ đọc log của lần chạy này
-    cmd = [sys.executable, str(PIPELINE), "--single", *map(str, args), "--log", str(logf)]
+    # sàn 60s chỉ áp cho lệnh pipeline THẬT (tránh timeout quá ngắn do sai sót); lệnh test (`cmd`
+    # truyền thẳng, nội bộ selfcheck) dùng đúng `timeout` được truyền, không bị ép sàn.
+    eff_timeout = timeout if cmd else max(60, timeout)
+    cmd = cmd or [sys.executable, str(PIPELINE), "--single", *map(str, args), "--log", str(logf)]
+    kw = dict(cwd=str(ROOT), text=True, encoding="utf-8", errors="replace",
+              env={**os.environ, "PYTHONUTF8": "1"})
+    if sys.platform != "win32":
+        kw["start_new_session"] = True     # process group riêng -> killpg diệt được cả cháu
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(p)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(60, timeout), cwd=str(ROOT),
-                           encoding="utf-8", errors="replace", env={**os.environ, "PYTHONUTF8": "1"})
-    except subprocess.TimeoutExpired:
-        raise StepError("quá thời gian", "pipeline")
+        try:
+            _, stderr = p.communicate(timeout=eff_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                if sys.platform == "win32":
+                    p.kill()
+                else:
+                    os.killpg(p.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            p.communicate()        # reap, tránh zombie
+            raise StepError("quá thời gian", "pipeline")
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE.discard(p)
     logtxt = logf.read_text(encoding="utf-8", errors="replace") if logf.exists() else ""
-    if _log_auth_error(logtxt, p.stderr):
+    if _log_auth_error(logtxt, stderr):
         raise AuthError("codex/ARK hết đăng nhập — xem " + str(logf))
     if _piece_quota(logtxt):
         raise QuotaError("hết hạn mức gen giữa chừng — xem " + str(logf))
     if p.returncode != 0:
-        raise_for((p.stderr or "")[-2000:], "gen")
+        raise_for((stderr or "")[-2000:], "gen")
     return logtxt
 
 
@@ -321,7 +383,11 @@ def _run_both(fns):
             except Exception as e:
                 errs.append(e)
     if errs:
-        raise errs[0]
+        # AuthError/QuotaError (dừng cả đợt / chờ rồi thử lại) không được để lỗi nhánh kia (vd
+        # timeout StepError của nhánh pieces) che mất -> ưu tiên nổi lên trước, theo thứ tự nặng dần.
+        auth = next((e for e in errs if isinstance(e, AuthError)), None)
+        quota = next((e for e in errs if isinstance(e, QuotaError)), None)
+        raise auth or quota or errs[0]
 
 
 def _pieces_json_slugs(path, garment=None):
@@ -335,6 +401,15 @@ def _slugs_match(pieces_json_path, names, garment=None):
     """True nếu bộ mảnh trong pieces.json (bỏ 'art', lọc theo garment) khớp đúng tập `names` (cũng bỏ
     'art'). Dùng ở lần gen lại 3: vision lại có thể đổi loại đồ/tay giống-khác -> đổi tên mảnh."""
     return _pieces_json_slugs(pieces_json_path, garment) == set(names)
+
+
+def _rehint_target(group, r):
+    """Chọn front/crop dùng SAU rehint. mode "combined": ảnh ghép nhiều biến thể/SP trên 1 tấm ->
+    front mới rehint trả về có thể LẠC sang biến thể khác -> GIỮ NGUYÊN front+crop của nhóm. Mode
+    khác: dùng front/crop rehint trả về (rơi về front/None cũ nếu rehint không chọn)."""
+    if group["mode"] == "combined":
+        return group["front"], group["crop"]
+    return r["front"] or group["front"], r["crop"]
 
 
 # ---------- 1 nhóm con (biến thể thiết kế + màu) ----------
@@ -454,15 +529,19 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         items = [(p, str(i)) for i, p in enumerate(srcs, 1)]
         items += [(piece_path(x), x) for x in fails if piece_path(x).exists()]
         sheet = judge.contact_sheet(judge.grid(items), sdir / "sheet_rehint.jpg")
+        skus = "; ".join(sorted({row["sku"] for row in rows}))
         try:
-            r = judge.rehint(sheet, fails, len(srcs))
+            r = judge.rehint(sheet, fails, len(srcs), variant=group["variant"], garment=group["garment"],
+                             skus=skus)
         except StepError as e:               # judge lỗi -> không phá nhóm, gen lại y nguyên crop cũ
             log("regen", f"rehint lỗi, giữ ảnh/crop cũ: {e}")
             ctx["hint"] = None
             return None
         (sdir / "rehint.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
-        front_idx = (r["front"] or group["front"]) - 1
-        crop = group["crop"] if group["mode"] == "combined" else r["crop"]  # combined: giữ vùng cắt phiên bản (nửa MEN/WOMEN)
+        # mode "combined": ảnh ghép nhiều biến thể -> GIỮ NGUYÊN front+crop của nhóm (front mới có
+        # thể lạc sang biến thể/SP khác trên cùng ảnh ghép); mode khác: dùng front/crop rehint trả về
+        front, crop = _rehint_target(group, r)
+        front_idx = front - 1
         ctx["front_src"] = srcs[front_idx]
         ctx["front"] = make_input(srcs[front_idx], crop, sdir / "in_front_r3.png")
         ctx["cropped"] = crop is not None
@@ -509,7 +588,9 @@ def upload_rows(rows, files, notes, dry, done_ids):
         for r in rows:
             rid = r["record_id"]
             if lb.get_row(rid)["has_pieces"]:
-                log("up", f"{rid} đã có Flat Pieces -> bỏ qua"); continue
+                # dòng đã có file từ trước (vd gen lại đè) -> coi là DONE, để 1 dòng khác lỗi
+                # quota/StepError sau đó trong CÙNG nhóm không ghi LỖI đè lên dòng đã xong này
+                log("up", f"{rid} đã có Flat Pieces -> bỏ qua"); done_ids.add(rid); continue
             try:
                 lb.upload_files(rid, files)
             except BaseException as e:      # Ctrl+C/SIGTERM giữa chừng cũng phải dọn file dở
@@ -529,6 +610,12 @@ def upload_rows(rows, files, notes, dry, done_ids):
         if done:
             try:
                 lb.write_notes(done)
+            except AuthError as e:
+                # hết đăng nhập ngay lúc ghi note -> KHÔNG được nuốt: dòng đã up file nhưng Note
+                # trống/cũ nếu bỏ qua, và đợt phải dừng ngay (như mọi AuthError khác) chứ không
+                # âm thầm tiếp tục nhóm sau.
+                log("up", f"ghi note up thất bại (hết đăng nhập): {e}")
+                raise
             except Exception as e:
                 log("up", f"ghi note up thất bại: {e}")
 
@@ -568,6 +655,14 @@ def process_group(g, rundir, day, dry, stats):
                 lb.write_notes({r["record_id"]: note for r in rows})
             stats["skip"] += 1
             return "skip"
+        unassigned = pick.get("unassigned") or []
+        if unassigned:
+            # Claude bỏ sót / nhóm front sai -> KHÔNG đoán dồn vào nhóm khác (sai biến thể/màu) ->
+            # ghi LỖI riêng cho đúng các dòng đó, vẫn xử lý tiếp các nhóm hợp lệ còn lại bên dưới.
+            note = f"LỖI {day}: judge (không xác định phiên bản)"
+            log("lỗi", f"unassigned (judge không xác định được): {unassigned}")
+            if not dry:
+                lb.write_notes({rid: note for rid in unassigned})
         log("pick", "; ".join(f"{g['variant']}/{g['color']}: front={g['front']} back={g['back']} "
                               f"mode={g['mode']}" for g in pick["groups"]))
         any_fail = False
@@ -619,6 +714,7 @@ def _parse_args(argv=None):
 
 
 def _raise_kbd(signum, frame):
+    _kill_active()     # diệt pipeline con ngay (không đợi executor join tiến trình đang subprocess.run)
     raise KeyboardInterrupt
 
 
@@ -669,6 +765,7 @@ def main():
     except AuthError as e:
         reason = f"hết đăng nhập: {str(e)[:200]}"
     except KeyboardInterrupt:
+        _kill_active()     # Ctrl+C ở foreground đi qua SIGINT mặc định của Python, KHÔNG qua _raise_kbd
         reason = "Ctrl+C"
     except Exception as e:
         reason = f"lỗi không lường: {e}"
@@ -802,6 +899,26 @@ def _selfcheck():
         except SystemExit:
             pass
         lk2.unlink()
+    # #2 release_lock: KHÔNG được xoá lock của tiến trình KHÁC (tránh 1 process gỡ nhầm lock của process kia)
+    lk5 = td / "other.lock"; lk5.write_text(str(os.getppid()))   # PID khác (không phải của mình)
+    release_lock(lk5)
+    assert lk5.exists(), "release_lock không được xoá lock không thuộc PID của mình"
+    lk5.unlink()
+    # #2 acquire_lock NGUYÊN TỬ: os.open(O_EXCL) phải tự chặn ghi đè dù bước kiểm tra "path.exists()"
+    # bị đánh lừa trả False (giả lập race: 2 tiến trình cùng thấy "chưa có lock" ở TOCTOU cũ)
+    lk6 = td / "race.lock"; lk6.write_text(str(os.getppid()))   # PID khác, còn sống
+    orig_exists = Path.exists
+    Path.exists = lambda self: False if self == lk6 else orig_exists(self)
+    try:
+        try:
+            acquire_lock(lk6)
+            raise AssertionError("acquire_lock atomic: không được ghi đè lock sống dù exists() bị đánh lừa")
+        except SystemExit:
+            pass
+        assert lk6.read_text() == str(os.getppid()), "lock của tiến trình khác bị ghi đè -> KHÔNG atomic"
+    finally:
+        Path.exists = orig_exists
+    lk6.unlink()
     # _piece_quota: chỉ tính dòng "✗ mảnh ..." khớp QUOTA_RE
     assert _piece_quota("[gen] ✗ mảnh ao_sau lỗi: HTTP 429 usage_limit") is True
     assert _piece_quota("[vision] lỗi codex: HTTP 429") is False
@@ -889,6 +1006,47 @@ def _selfcheck():
         assert calls["remove"] == [("r2", ["tok_r2"])]     # cleanup vẫn chạy
         assert calls["notes"] == {"r1": "note3-A"}          # note của r1 (đã up trước) vẫn được ghi
         assert done_ids3 == {"r1"}
+        # #3 ghi note cuối (write_notes) hết đăng nhập (AuthError) -> PHẢI ném tiếp, không được nuốt
+        # (up xong hết nhưng Note không ghi được thì phải dừng đợt, không âm thầm bỏ qua)
+        def fake_upload4(rid, fs):
+            pass                                            # up thành công hết
+        def fake_write_notes_auth(notes):
+            raise AuthError("hết đăng nhập lark-cli")
+        _lb.get_row, _lb.upload_files, _lb.write_notes = fake_get_row, fake_upload4, fake_write_notes_auth
+        notes4 = {"r1": "note4-A", "r2": "note4-B", "r3": "note4-C"}
+        done_ids4 = set()
+        try:
+            upload_rows(rows, files, notes4, False, done_ids4)
+            raise AssertionError("AuthError từ write_notes phải ném tiếp")
+        except AuthError:
+            pass
+        assert done_ids4 == {"r1", "r2", "r3"}              # vẫn up xong hết, chỉ ghi note thất bại
+        # lỗi khác (không phải AuthError) ở write_notes vẫn chỉ log, KHÔNG được ném (như cũ)
+        def fake_write_notes_generic(notes):
+            raise RuntimeError("note API lỗi tạm thời")
+        _lb.write_notes = fake_write_notes_generic
+        notes5 = {"r1": "note5-A", "r2": "note5-B", "r3": "note5-C"}
+        done_ids5 = set()
+        upload_rows(rows, files, notes5, False, done_ids5)      # không được ném lỗi
+        assert done_ids5 == {"r1", "r2", "r3"}
+        # #4 dòng ĐÃ có Flat Pieces (vd gen lại đè lần 2) -> bỏ qua up NHƯNG vẫn phải vào done_ids,
+        # để 1 dòng khác lỗi quota/StepError sau đó không ghi LỖI đè lên dòng đã xong này
+        def fake_get_row2(rid):
+            return {"has_pieces": rid == "r1", "pieces": [{"name": "final_a.png", "file_token": f"tok_{rid}"}]}
+        def fake_upload5(rid, fs):
+            if rid == "r2":
+                raise QuotaError("hết hạn mức")
+        calls["notes"] = None
+        _lb.get_row, _lb.upload_files, _lb.write_notes = fake_get_row2, fake_upload5, fake_write_notes
+        notes6 = {"r1": "note6-A", "r2": "note6-B", "r3": "note6-C"}
+        done_ids6 = set()
+        try:
+            upload_rows(rows, files, notes6, False, done_ids6)
+            raise AssertionError("QuotaError phải ném tiếp")
+        except QuotaError:
+            pass
+        assert done_ids6 == {"r1"}       # r1 đã có Flat Pieces từ trước -> tính là done
+        assert calls["notes"] is None    # r1 bị bỏ qua (không up) -> không có note mới nào để ghi
     finally:
         _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = orig
     # retry cùng ngày: xoá log cũ -> không đọc nhầm error từ lần trước
@@ -905,6 +1063,43 @@ def _selfcheck():
     new_log = logfile.read_text() if logfile.exists() else ""
     # lỗi cũ "429" không nên xuất hiện trong log sau khi chạy
     assert "usage_limit" not in new_log, f"log phải được refresh, không còn lỗi cũ. log mới:\n{new_log}"
+    # #6+7 run_pipe quá giờ -> phải diệt CẢ process group (không chỉ chờ/đợi), không treo đến hết
+    # thời gian lệnh thật sự chạy (ở đây là `sleep 30`, giả cho tiến trình pipeline thật)
+    if sys.platform != "win32":
+        logf6 = td / "pipe_timeout.log"; logf6.write_text("")
+        t0 = time.monotonic()
+        try:
+            run_pipe([], logf6, 0.3, cmd=["sleep", "30"])
+            raise AssertionError("run_pipe phải quá giờ")
+        except StepError as e:
+            assert e.kind == "quá thời gian"
+        assert time.monotonic() - t0 < 5, "phải diệt ngay, không chờ hết 30s của lệnh"
+        assert not _ACTIVE, "tiến trình quá giờ phải được gỡ khỏi _ACTIVE sau khi xử lý xong"
+        # _kill_active: Popen riêng process group (start_new_session) có TIẾN TRÌNH CON (sleep nền)
+        # -> killpg phải diệt được CẢ nhóm, không chỉ tiến trình cha (mô phỏng đúng lỗi Codex nêu:
+        # subprocess.run chỉ kill con trực tiếp, bỏ sót cháu Codex/OpenArt)
+        p = subprocess.Popen(["bash", "-c", "sleep 30 & wait"], start_new_session=True)
+        with _ACTIVE_LOCK:
+            _ACTIVE.add(p)
+        time.sleep(0.2)
+        pgid = os.getpgid(p.pid)
+        _kill_active()
+        p.wait(timeout=5)
+        with _ACTIVE_LOCK:
+            _ACTIVE.discard(p)
+        time.sleep(0.2)
+        try:
+            os.killpg(pgid, 0)
+            raise AssertionError("process group phải bị diệt hết (còn sót tiến trình con sleep)")
+        except ProcessLookupError:
+            pass
+    # #10 rehint: mode "combined" (ảnh ghép nhiều biến thể) phải GIỮ NGUYÊN front+crop của nhóm,
+    # bỏ qua front mới của rehint (có thể lạc sang biến thể/SP khác trên cùng ảnh ghép)
+    g_combined = {"front": 1, "crop": [0, 0, 500, 1000], "mode": "combined"}
+    assert _rehint_target(g_combined, {"front": 2, "crop": [999, 999, 1000, 1000]}) == (1, [0, 0, 500, 1000])
+    g_two = {"front": 1, "crop": [0, 0, 500, 1000], "mode": "two"}
+    assert _rehint_target(g_two, {"front": 2, "crop": [10, 10, 20, 20]}) == (2, [10, 10, 20, 20])
+    assert _rehint_target(g_two, {"front": None, "crop": None}) == (1, None)
     # #5 _parse_args: validate --date/--until TRƯỚC acquire_lock; sai -> SystemExit (ap.error)
     import contextlib
     with contextlib.redirect_stderr(io.StringIO()):
@@ -949,6 +1144,69 @@ def _selfcheck():
     except RuntimeError as e:
         assert "boom both" in str(e)
     assert calls_both.count("ok") == 1 and calls_both.count("bad") == 1   # cả 2 đều đã chạy xong
+    # #8 _run_both: AuthError/QuotaError phải được ưu tiên nổi lên trên lỗi khác, DÙ thứ tự nào
+    # (pieces timeout + art AuthError -> phải dừng đợt vì hết đăng nhập, không coi là lỗi nhóm thường)
+    def fn_err(e):
+        return lambda: (_ for _ in ()).throw(e)
+    try:
+        _run_both([fn_err(StepError("gen", "timeout")), fn_err(AuthError("hết đăng nhập"))])
+        raise AssertionError("phải ném lỗi")
+    except AuthError:
+        pass
+    try:
+        _run_both([fn_err(AuthError("a")), fn_err(QuotaError("q"))])   # AuthError ưu tiên hơn QuotaError
+        raise AssertionError("phải ném lỗi")
+    except AuthError:
+        pass
+    try:
+        _run_both([fn_err(QuotaError("q")), fn_err(StepError("gen", "x"))])
+        raise AssertionError("phải ném lỗi")
+    except QuotaError:
+        pass
+    # #1 process_group: judge trả "unassigned" (dòng Claude bỏ sót/không xác định được biến thể) ->
+    # phải ghi LỖI RIÊNG cho đúng các dòng đó, KHÔNG được gộp nhầm vào nhóm khác; các nhóm hợp lệ
+    # còn lại vẫn xử lý bình thường
+    orig_download = globals()["download"]
+    orig_pick, orig_sheet = judge.pick, judge.contact_sheet
+    orig_subgroup = globals()["process_subgroup"]
+    orig_write_notes = lb.write_notes
+    calls_pg = {"write": [], "subgroup": []}
+
+    def fake_download2(url, dst, tries=3):
+        dst.write_bytes(b"x"); return dst
+
+    def fake_sheet2(rows, out, **kw):
+        out = Path(out); out.parent.mkdir(parents=True, exist_ok=True); out.write_bytes(b"x"); return out
+
+    def fake_pick2(sheet, rows, n):
+        return {"skip": None, "manual": {}, "unassigned": ["z"],
+                "groups": [{"variant": "default", "color": "photo", "matches_photo": True, "front": 1,
+                           "back": None, "mode": "infer", "crop": None, "garment": "top_bottom",
+                           "record_ids": ["a", "b"]}]}
+
+    def fake_subgroup2(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+        calls_pg["subgroup"].append(sorted(r["record_id"] for r in rows)); return False
+
+    def fake_write_notes2(notes):
+        calls_pg["write"].append(dict(notes))
+
+    globals()["download"], judge.pick, judge.contact_sheet = fake_download2, fake_pick2, fake_sheet2
+    globals()["process_subgroup"] = fake_subgroup2
+    lb.write_notes = fake_write_notes2
+    try:
+        rows_pg = [{"record_id": "a", "sku": "S-a"}, {"record_id": "b", "sku": "S-b"},
+                   {"record_id": "z", "sku": "S-z"}]
+        g_pg = {"links": ["u1"], "rows": rows_pg, "newest": "2026-10-16T00:00:00"}
+        stats_pg = Counter()
+        kind = process_group(g_pg, Path(tempfile.mkdtemp()), "2026-10-16", False, stats_pg)
+        assert kind is None
+        assert calls_pg["subgroup"] == [["a", "b"]]             # "z" không lọt vào nhóm nào
+        assert calls_pg["write"] == [{"z": "LỖI 2026-10-16: judge (không xác định phiên bản)"}]
+    finally:
+        globals()["download"] = orig_download
+        judge.pick, judge.contact_sheet = orig_pick, orig_sheet
+        globals()["process_subgroup"] = orig_subgroup
+        lb.write_notes = orig_write_notes
     print("batch selfcheck OK")
 
 
