@@ -200,7 +200,11 @@ OWN inputs for a flat sewing-pattern generator:
    Shorts/Skirt = bottom; Jumpsuit/Set/pajamas = top_bottom; Dress = dress).
  - "front": label of the clearest photo of the FRONT of THAT variant. PREFER a clean flat /
    ghost-mannequin product image over a lifestyle photo of a person wearing it; fall back to a lifestyle
-   photo only if no flat/ghost-mannequin shot exists for that variant.
+   photo only if no flat/ghost-mannequin shot exists for that variant. NEVER choose a BLANK template /
+   generic mockup (plain white or single-colour garments with no artwork, often several product styles
+   labelled "Hoodie / Zip Hoodie / Joggers" or "FRONT / BACK" on a pastel background) when any photo shows
+   the actual printed design — those only illustrate the cut/style. A clean flat image is preferred ONLY
+   if it shows the same artwork as the design photos.
  - "back": label of a photo of the real BACK of the SAME variant, or null.
  - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows that
    variant's front and back side by side (then back = null); otherwise "infer".
@@ -232,7 +236,8 @@ Judge every piece against the reference: ok (true only if usable as a production
 score 1-10, errors = codes from:
  mo_nhoe (blurry/smeared/noisy), sai_mau (base or print colour differs from reference / required colour),
  sau_giong_truoc (a BACK piece copies front-only graphics: chest print, logo, badge, zipper, buttons),
- sai_hoa_tiet (artwork missing/extra/misplaced vs reference; a piece that replaces a printed
+ sai_hoa_tiet (artwork missing/extra/misplaced vs reference; a plain blank/white piece when the
+ garment has a printed design is sai_hoa_tiet; a piece that replaces a printed
  body/skin illusion with a pattern is sai_hoa_tiet), sai_manh (contains other parts: sleeves or
  hood on a torso piece, a person, hanger, mockup), khong_tran (torso/pants/sleeve piece not full-bleed:
  margins, border or garment outline visible), vung_den (plain areas filled black/void/glow),
@@ -377,6 +382,8 @@ def _selfcheck():
     assert q["ao_truoc"] == {"ok": True, "score": 9.0, "errors": []}
     assert q["ao_sau"] == {"ok": False, "score": 7.0, "errors": ["sau_giong_truoc"]}
     assert q["art"]["ok"] is False and q["art"]["score"] == 0.0
+    # ảnh mẫu trắng/mockup chung không có họa tiết -> không phải thiết kế (bài học Zip Hoodie)
+    assert "BLANK" in PICK and "blank" in QA.lower()
     print("judge selfcheck OK")
 
 
