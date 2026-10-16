@@ -78,8 +78,9 @@ Judge STRICTLY (it goes to production): score 1-10 and error codes from:
  contents inside it, a background scene or mockup, white margins/borders or a drop shadow instead of a
  flat print filling the frame), mo_nhoe (blurry).
 Return ONLY {{"score": 9, "errors": []}}"""
-STYLE = {"phang": "must be completely flat solid colours — ANY shading, gradient, highlight, glow, bevel "
-                  "or texture on ANY graphic (even subtle) is wrong",
+STYLE = {"phang": "must be flat — shading, highlights, glow, bevels or texture that imitate DEPTH/3D on a "
+                  "graphic are wrong; colour bands/stripes that are part of the design itself (e.g. a "
+                  "rainbow pattern) and tiny eye catch-lights are fine",
          "3d": "must reproduce the printed graphics faithfully with their raised faux-3D look, shading and "
                "texture as in the reference — a flat cartoon look is wrong when the reference print has "
                "3D/raised effects; if the reference print itself is flat, a faithful copy is correct"}
