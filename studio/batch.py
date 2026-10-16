@@ -418,8 +418,11 @@ def _rehint_target(group, r):
     front mới rehint trả về có thể LẠC sang biến thể khác -> GIỮ NGUYÊN front+crop của nhóm. Mode
     khác: dùng front/crop rehint trả về (rơi về front/None cũ nếu rehint không chọn). Rehint chọn
     đúng ẢNH SAU của nhóm làm front (hay gặp khi mảnh lỗi là mảnh lưng) -> giữ front cũ, vì vision lại
-    với front = ảnh lưng sẽ tả sai mọi mảnh trước (lỗi thật: Tennis Hulk 16/10)."""
-    if group["mode"] == "combined" or (r["front"] and r["front"] == group.get("back")):
+    với front = ảnh lưng sẽ tả sai mọi mảnh trước (lỗi thật: Tennis Hulk 16/10). Nhóm ĐÃ có crop (định
+    vị biến thể / pick) -> giữ nguyên: rehint trả crop null = cả ảnh nhiều design -> vision tả nhầm
+    design khác (lỗi thật: Design 2 bị tả thành Design 3, 16/10)."""
+    if (group["mode"] == "combined" or group.get("crop")
+            or (r["front"] and r["front"] == group.get("back"))):
         return group["front"], group["crop"]
     return r["front"] or group["front"], r["crop"]
 
@@ -814,7 +817,7 @@ def main():
     only_day = a.date or day                 # chỉ làm mẫu tạo ngày này (mẫu ngày cũ bỏ qua)
     rundir = BATCH / day; rundir.mkdir(parents=True, exist_ok=True)
     _LOGF = open(rundir / "batch.log", "a", encoding="utf-8")
-    stats, stop, reason = Counter(), Stopper(a.until, a.limit), "hết việc"
+    stats, stop, reason, queue = Counter(), Stopper(a.until, a.limit), "hết việc", []
     log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}")
     try:
         queue = build_queue(lb.fetch_rows(only_day, day), only_day)
@@ -853,7 +856,8 @@ def main():
                    f" · log: {rundir / 'batch.log'}")
         try:
             log("done", summary)
-            notify(summary)
+            if queue or reason != "hết việc":   # watch_gen.sh chạy mỗi giờ: không có mẫu mới -> không báo Lark
+                notify(summary)
         finally:
             release_lock()
 
@@ -1185,12 +1189,14 @@ def _selfcheck():
     # bỏ qua front mới của rehint (có thể lạc sang biến thể/SP khác trên cùng ảnh ghép)
     g_combined = {"front": 1, "crop": [0, 0, 500, 1000], "mode": "combined"}
     assert _rehint_target(g_combined, {"front": 2, "crop": [999, 999, 1000, 1000]}) == (1, [0, 0, 500, 1000])
-    g_two = {"front": 1, "crop": [0, 0, 500, 1000], "mode": "two"}
+    g_two = {"front": 1, "crop": None, "mode": "two"}
     assert _rehint_target(g_two, {"front": 2, "crop": [10, 10, 20, 20]}) == (2, [10, 10, 20, 20])
     assert _rehint_target(g_two, {"front": None, "crop": None}) == (1, None)
-    g_two_b = {**g_two, "back": 2}       # rehint chọn ảnh SAU làm front -> giữ front+crop cũ
-    assert _rehint_target(g_two_b, {"front": 2, "crop": None}) == (1, [0, 0, 500, 1000])
+    g_two_b = {**g_two, "back": 2}       # rehint chọn ảnh SAU làm front -> giữ front cũ
+    assert _rehint_target(g_two_b, {"front": 2, "crop": None}) == (1, None)
     assert _rehint_target(g_two_b, {"front": 3, "crop": None}) == (3, None)
+    g_loc = {"front": 1, "crop": [249, 209, 532, 572], "mode": "infer"}   # đã định vị ô design
+    assert _rehint_target(g_loc, {"front": 1, "crop": None}) == (1, [249, 209, 532, 572])
     # #5 _parse_args: validate --date/--until TRƯỚC acquire_lock; sai -> SystemExit (ap.error)
     import contextlib
     with contextlib.redirect_stderr(io.StringIO()):

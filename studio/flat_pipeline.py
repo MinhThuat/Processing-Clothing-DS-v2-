@@ -491,6 +491,12 @@ CROP_NOTE = (" The FIRST reference image is a close crop of exactly this panel: 
              "that crop. The LAST reference shows the whole garment for context only — do NOT copy other "
              "parts of it (other panels, skirt, pants, sleeves) into this panel.")
 
+# mặt sau TỰ SUY (không có ảnh lưng): ref là ảnh TRƯỚC -> model hay chép hình in mặt trước (nơ, ngực,
+# logo) sang mảnh sau/tay sau (lỗi thật: Design 2 tay_sau có nơ). Chỉ theo mô tả, không chép mặt trước.
+INFER_NOTE = (" This is a BACK panel INFERRED from a front-only photo: the reference shows the FRONT. Use it "
+              "only for fabric colour and style; do NOT copy any front graphic (bows, chest prints, logos, "
+              "buttons, zips) onto this panel — follow ONLY the given panel description.")
+
 def _make_piece(spec, refs, work, out, flat=False):
     """Gen 1 mảnh -> file <out.stem>_<slug><suffix>. Váy: cắt cong (cutout); áo/quần/tay: full-bleed.
     flat=True -> vẽ VECTOR phẳng (bỏ 3D/bóng); flat=False (mặc định) -> giữ chi tiết/nổi giả-3D."""
@@ -503,7 +509,7 @@ def _make_piece(spec, refs, work, out, flat=False):
         crop = work / f"crop_{spec['slug']}.png"
         crop_norm(ref, spec["box"], Image.open(ref).size, crop)
         ctx = [ref]
-    note = CROP_NOTE if crop else ""
+    note = (CROP_NOTE if crop else "") + (INFER_NOTE if spec.get("inferred") else "")
     if spec["kind"] == "dress":
         tmp = work / f"gen_{spec['slug']}.png"
         base = DRESS_FLAT if flat else DRESS_FAITHFUL
@@ -689,7 +695,7 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
     log("crop", f"loại: {typ}{tay}")
     plan = _pieces_plan(js)
     if not back and not combined:   # mặt sau tự suy: box sau nằm trên ảnh TRƯỚC -> cắt ra thì chép y mặt trước
-        plan = [{**sp, "box": None} if sp["side"] == "back" else sp for sp in plan]
+        plan = [{**sp, "box": None, "inferred": True} if sp["side"] == "back" else sp for sp in plan]
     if only:
         want = set(only if isinstance(only, (list, tuple, set)) else str(only).split(","))
         plan = [s for s in plan if _slug_wanted(s["slug"], want)]
@@ -956,7 +962,9 @@ def _selfcheck():
         pr, rf = seen[-1]
         assert Image.open(rf[0]).size == (500, 320) and rf[-1] == src and CROP_NOTE in pr
         _make_piece({**spec, "box": None}, {"front": src, "back": src}, td, td / "o.png")
-        assert seen[-1][1] == [src] and CROP_NOTE not in seen[-1][0]
+        assert seen[-1][1] == [src] and CROP_NOTE not in seen[-1][0] and INFER_NOTE not in seen[-1][0]
+        _make_piece({**spec, "box": None, "inferred": True}, {"front": src, "back": src}, td, td / "o.png")
+        assert INFER_NOTE in seen[-1][0]
     finally:
         gen_panel = orig_gen
     assert _strip_ties("base purple; torn openings, lower left; dark green tied sash motif, right hip") \

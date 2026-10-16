@@ -48,14 +48,19 @@ _ART = (
     "colour {base}. Every printed graphic and text in the same place and proportions as the reference "
     "photo: {print}. ")
 ART = {
-    "phang": _ART + ("Render it as clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean edges — "
-                     "NO 3D, NO shading, NO highlights, NO texture."),
     "3d": _ART + ("Reproduce the printed artwork FAITHFULLY as printed in the photo and KEEP its faux-3D "
                   "look: raised/puffy/embossed shading, glossy highlights, bevels and depth of the printed "
                   "graphics ({effects}), plus the printed fabric texture. It is still a flat print file, not "
                   "a photo of the product."),
 }
-VERSIONS = list(ART)
+# bản phẳng vẽ LẠI TỪ bản 3D đã đạt (ref = file in 3D, không phải ảnh SP): giữ y bố cục/chữ/màu, chỉ bỏ
+# bóng -> model dễ ra phẳng thật hơn (gen thẳng từ ảnh SP hay sót bóng 3D, sai bố cục chữ).
+FLAT_FROM_3D = (
+    "The reference image is a finished PRINT FILE whose graphics have faux-3D shading. Redraw the EXACT "
+    "same print — same layout, every graphic, text, font style, sizes and colours, filling the frame edge "
+    "to edge — as clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean edges, NO 3D, NO shading, "
+    "NO gradient, NO highlights, NO glow, NO texture. Change nothing else.")
+VERSIONS = ["3d", "phang"]      # 3d trước: bản phẳng lấy bản 3D làm ref
 
 QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated PRINT FILE ("art"), version: {version}.
 Order: colour {color} | customer options: {opts}.
@@ -145,13 +150,14 @@ def _input(rows, srcs, sheet, gdir, log):
     return fp._upscaled(inp, gdir / "nc_in_up.png"), pk
 
 
-def _best_art(r, version, prompt, inp, d, log):
-    """Gen 1 bản (version) cho 1 dòng, QA, gen lại tối đa MAX_ATTEMPTS -> (path, qa) bản điểm cao nhất."""
+def _best_art(r, version, prompt, inp, d, log, ref=None):
+    """Gen 1 bản (version) cho 1 dòng từ `ref` (mặc định ảnh SP `inp`), QA so với ảnh SP, gen lại tối đa
+    MAX_ATTEMPTS -> (path, qa) bản điểm cao nhất."""
     best, fix = None, ""
     for k in range(1, MAX_ATTEMPTS + 1):
         art = d / f"art_{version}_{k}.png"
         try:
-            _gen(prompt + fix, inp, art)
+            _gen(prompt + fix, ref or inp, art)
         except StepError as e:
             log("nc", f"{r['record_id']} {version} lần {k}: lỗi gen {e}"); continue
         # ô lớn (QA_TILE) để Claude thấy bóng/gradient nhỏ trên bản phẳng — ô 384px mặc định bỏ sót
@@ -186,8 +192,9 @@ def run(rows, srcs, sheet, gdir, log):
         fields = dict(product=spec.get("product") or pk.get("product") or "product",
                       surface=spec.get("surface") or "front", base=spec.get("base", ""),
                       print=spec.get("print", ""), effects=spec.get("effects") or "as in the photo")
-        out.append((r, {v: _best_art(r, v, ART[v].format(**fields) + custom_rule(r), inp, d, log)
-                        for v in VERSIONS}))
+        a3d = _best_art(r, "3d", ART["3d"].format(**fields) + custom_rule(r), inp, d, log)
+        flat = _best_art(r, "phang", FLAT_FROM_3D + custom_rule(r), inp, d, log, ref=a3d[0])
+        out.append((r, {"3d": a3d, "phang": flat}))
     return out
 
 
@@ -201,9 +208,9 @@ def _selfcheck():
     assert "Green" in s and "Knox's" in s and "Black" in s and "do NOT print the numbers" in s
     assert custom_rule({"color": "", "custom": ""}) == ""
     f = dict(product="basket", surface="front panel", base="green", print="p", effects="puffy")
-    assert VERSIONS == ["phang", "3d"]
-    assert "FLAT" in ART["phang"].format(**f) and "puffy" in ART["3d"].format(**f)
-    assert all("PRINT FILE" in ART[v].format(**f) and "NO contents" in ART[v].format(**f) for v in VERSIONS)
+    assert VERSIONS == ["3d", "phang"] and "puffy" in ART["3d"].format(**f)
+    assert "PRINT FILE" in ART["3d"].format(**f) and "NO contents" in ART["3d"].format(**f)
+    assert "FLAT" in FLAT_FROM_3D and "NO shading" in FLAT_FROM_3D
     import tempfile
     t = Path(tempfile.mkdtemp()) / "t.png"
     im = Image.new("RGB", (100, 80), "white"); im.paste((0, 128, 0), (10, 20, 90, 80)); im.save(t)
