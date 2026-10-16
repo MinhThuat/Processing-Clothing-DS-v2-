@@ -17,7 +17,7 @@ VIEW_NOFILE = "vewRdGQSXj"      # No File (team định nghĩa: No File, chưa D
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
 F_NOTE = "fldGVXw4ph"           # Flat Note (text)
 N_LINKS = 20
-FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note", "Name Custom"]
+FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note", "Name Custom", "Gen"]
           + [f"Link {i}" for i in range(1, N_LINKS + 1)])
 _MD = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
 _URL = re.compile(r"https?://[^\s)\]]+")
@@ -50,15 +50,16 @@ def parse_row(raw):
         "pieces": raw.get("Flat Pieces") or [],
         "note": (raw.get("Flat Note") or "").strip(),
         "custom": (raw.get("Name Custom") or "").strip(),
+        "gen": "GEN" in (raw.get("Gen") or []),      # tag GEN -> làm trước
     }
 
 
-def _cli(args, timeout=300):
+def _cli(args, timeout=300, cwd=None):
     """Chạy lark-cli, trả JSON stdout. Lỗi đăng nhập -> AuthError, lỗi khác -> StepError('lark')."""
     cmd = ["lark-cli", *map(str, args), "--profile", PROFILE, "--as", "user"]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", cwd=cwd)
     except subprocess.TimeoutExpired:
         raise StepError("lark", f"lark-cli quá {timeout}s: {' '.join(map(str, args[:2]))}")
     m = re.search(r"\{.*\}", p.stdout or "", re.S)
@@ -127,13 +128,23 @@ def get_row(rid):
     return parse_row(raws[0])
 
 
-def upload_files(rid, files):
-    """Up nhiều file vào Flat Pieces của 1 dòng trong 1 lệnh (lark-cli nối thêm, không thay)."""
+def _upload_args(rid, files):
+    """lark-cli chỉ cho đọc file trong thư mục đang chạy / /tmp / ~/files -> chạy TẠI thư mục chứa
+    các file (cùng 1 thư mục out/) và truyền tên file ngắn. -> (args, cwd)."""
+    files = [Path(f) for f in files]
+    cwd = files[0].parent
+    assert all(f.parent == cwd for f in files), "mọi file up phải cùng 1 thư mục"
     args = ["base", "+record-upload-attachment", "--base-token", BASE, "--table-id", TABLE,
             "--record-id", rid, "--field-id", F_PIECES]
     for f in files:
-        args += ["--file", Path(f).resolve()]
-    _cli(args, timeout=900)
+        args += ["--file", f.name]
+    return args, cwd
+
+
+def upload_files(rid, files):
+    """Up nhiều file vào Flat Pieces của 1 dòng trong 1 lệnh (lark-cli nối thêm, không thay)."""
+    args, cwd = _upload_args(rid, files)
+    _cli(args, timeout=900, cwd=str(cwd.resolve()))
 
 
 def remove_files(rid, tokens):
@@ -171,7 +182,7 @@ def _selfcheck():
                     "Name Custom": "  • Choose design: Men\n• Choose skin tone: S3  "})
     assert r2["has_pieces"] and r2["pieces"][0]["file_token"] == "t1" and r2["note"] == "SKIP: x"
     assert r2["custom"] == "• Choose design: Men\n• Choose skin tone: S3"
-    assert len(FIELDS) == 7 + N_LINKS
+    assert len(FIELDS) == 8 + N_LINKS
     # _AUTH: chỉ bắt 'expired' đi kèm 'token' (tránh bắt nhầm link ảnh/khuyến mãi hết hạn)
     assert _AUTH.search("refresh token expired")
     assert _AUTH.search("token abc123 expired")
@@ -183,6 +194,12 @@ def _selfcheck():
     assert v == VIEW and f["logic"] == "and" and len(f["conditions"]) == 5
     assert ["Create Date", "==", "ExactDate(2026-10-15)"] in f["conditions"]
     assert ["DS Check-Done", "==", False] in f["conditions"]
+    # cột Gen (tag GEN) -> row["gen"]
+    assert parse_row({**raw, "Gen": ["GEN"]})["gen"] is True and parse_row(raw)["gen"] is False
+    # up: lark-cli chỉ đọc file trong thư mục đang chạy -> chạy TẠI thư mục chứa file, truyền tên ngắn
+    a_, cwd_ = _upload_args("recA", [Path("/x/out/a_ao_truoc.png"), Path("/x/out/a_art.png")])
+    assert cwd_ == Path("/x/out") and a_.count("--file") == 2
+    assert "a_ao_truoc.png" in a_ and "a_art.png" in a_ and not any("/x/out/" in str(v) for v in a_)
     print("lark_base selfcheck OK")
 
 
