@@ -19,6 +19,7 @@ from PIL import Image
 
 import judge
 import lark_base as lb
+import nonclothing
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
 from flat_pipeline import _pieces_plan, _filter_by_garment
 
@@ -69,9 +70,9 @@ def piece_filename(sku, slug, failed=False):
 
 # ---------- hàng đợi ----------
 def needs_work(row):
-    """Dòng (đã qua view No File) có gắn tag GEN, chưa có ảnh Flat Pieces, có link, chưa bị SKIP."""
-    return (row.get("gen", False) and not row["has_pieces"] and bool(row["links"])
-            and not row["note"].upper().startswith("SKIP"))
+    """Dòng (đã qua view No File) có gắn tag GEN, chưa có ảnh Flat Pieces, có link. Dòng note SKIP cũ
+    (SP không phải quần áo, trước đây bỏ qua) nay vẫn làm: đi nhánh art phẳng (nonclothing.py)."""
+    return row.get("gen", False) and not row["has_pieces"] and bool(row["links"])
 
 
 def build_queue(rows, day):
@@ -684,6 +685,24 @@ def cleanup(gdir):
         p.unlink(missing_ok=True)
 
 
+def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids):
+    """SP không phải quần áo (nonclothing.py): mỗi dòng 1 art phẳng -> up + note riêng từng dòng."""
+    any_fail = False
+    for r, art, q in nonclothing.run(rows, srcs, sheet, gdir, log):
+        fail = not q["ok"]
+        any_fail |= fail
+        od = gdir / f"nc_{r['record_id']}" / "out"; od.mkdir(parents=True, exist_ok=True)
+        f = od / piece_filename(r["sku"], "art", fail)
+        shutil.copyfile(art, f)
+        note = (f"QA FAIL {day} · art ({','.join(q['errors']) or 'điểm thấp'}) sau {nonclothing.MAX_ATTEMPTS} lần"
+                if fail else f"OK {day} · art phẳng (không phải quần áo)")
+        upload_rows([r], [f], {r["record_id"]: note}, dry, done_ids)
+    stats["qafail" if any_fail else "ok"] += 1
+    if not dry:
+        cleanup(gdir)
+    return None
+
+
 def process_group(g, rundir, day, dry, stats):
     """-> None (gen xong), 'skip', hoặc kind của StepError. QuotaError/AuthError ném tiếp lên main."""
     gid = group_id(g)
@@ -703,13 +722,9 @@ def process_group(g, rundir, day, dry, stats):
                                     gdir / "sheet_pick.jpg")
         pick = judge.pick(sheet, rows, len(srcs))
         (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
-        if pick["skip"]:
-            note = f"SKIP: {pick['skip']}"
-            log("skip", note)
-            if not dry:
-                lb.write_notes({r["record_id"]: note for r in rows})
-            stats["skip"] += 1
-            return "skip"
+        if pick["skip"]:                   # KHÔNG phải quần áo -> nhánh riêng, không đụng luồng clothing
+            log("nc", f"không phải quần áo ({pick['skip']}) -> art phẳng")
+            return process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids)
         unassigned = pick.get("unassigned") or []
         if unassigned:
             # Claude bỏ sót / nhóm front sai -> KHÔNG đoán dồn vào nhóm khác (sai biến thể/màu) ->
@@ -869,20 +884,20 @@ def _selfcheck():
             row("b", ["u1"], "2026-04-09T03:00:00.000+07:00"),
             row("c", ["u2"], "2026-04-09T02:00:00.000+07:00"),
             row("d", ["u3"], "2026-04-09T09:00:00.000+07:00", hp=True),
-            row("e", ["u4"], "2026-04-09T09:00:00.000+07:00", note="SKIP: mug"),
+            row("e", ["u4"], "2026-04-09T09:00:00.000+07:00", note="SKIP: mug"),   # SKIP cũ -> vẫn làm (art phẳng)
             row("f", ["u5"], "2026-04-09T09:00:00.000+07:00", gen=False),   # không gắn GEN -> bỏ
             row("g", [], "2026-04-09T09:00:00.000+07:00"),
             row("h", ["u6"], "2026-04-09T09:00:00.000+07:00", note="LỖI 2026-10-15: tải ảnh")]
     q = build_queue(rows, "2026-04-09")
-    assert [[r["record_id"] for r in g["rows"]] for g in q] == [["h"], ["a", "b"], ["c"]]
-    assert q[1]["newest"] == "2026-04-09T03:00:00.000+07:00"
+    assert [[r["record_id"] for r in g["rows"]] for g in q] == [["e"], ["h"], ["a", "b"], ["c"]]
+    assert q[2]["newest"] == "2026-04-09T03:00:00.000+07:00"
     # lọc ngày do Base (view No File) làm: dòng tạo hôm trước mà view vẫn trả về -> vẫn chạy
     assert build_queue([row("i", ["u7"], "2026-04-08T23:59:00.000+07:00")], "2026-04-09")[0]["rows"][0]["record_id"] == "i"
     # chỉ làm dòng gắn tag GEN (trong view No File); dòng không GEN bị bỏ dù chưa có ảnh
     rows_g = [dict(row("p", ["v1"], "2026-04-09T01:00:00.000+07:00"), gen=True),
               dict(row("q", ["v2"], "2026-04-09T09:00:00.000+07:00"), gen=False)]
     assert [g["rows"][0]["record_id"] for g in build_queue(rows_g, "2026-04-09")] == ["p"]
-    assert group_id(q[1]).startswith("S-a-Tee_") and len(group_id(q[1])) <= 80
+    assert group_id(q[2]).startswith("S-a-Tee_") and len(group_id(q[1])) <= 80
     # ghi chú
     assert note_ok("2026-10-16", 6, {"tay_sau": 1}) == "OK 2026-10-16 · 6 mảnh + art · gen lại: tay_sau×1"
     assert note_ok("2026-10-16", 4, {}) == "OK 2026-10-16 · 4 mảnh + art"
@@ -1328,6 +1343,23 @@ def _selfcheck():
         judge.grid_overlay, judge.locate = orig_grid_overlay, orig_locate
         globals()["process_subgroup"] = orig_subgroup
         lb.write_notes = orig_write_notes
+    # nhánh SP không phải quần áo: mỗi dòng 1 art, note OK / QA FAIL riêng, file _QAFAIL khi trượt
+    td_nc = Path(tempfile.mkdtemp()); art_nc = td_nc / "a.png"; Image.new("RGB", (8, 8)).save(art_nc)
+    orig_run, ups = nonclothing.run, []
+    nonclothing.run = lambda rows, *a, **k: [
+        (rows[0], art_nc, {"ok": True, "score": 9.0, "errors": []}),
+        (rows[1], art_nc, {"ok": False, "score": 5.0, "errors": ["sai_chu"]})]
+    orig_up = upload_rows
+    globals()["upload_rows"] = lambda rows, files, notes, dry, done: ups.append((files[0].name, notes))
+    try:
+        st = Counter()
+        rws = [{"record_id": "n1", "sku": "X-Basket-M-G1"}, {"record_id": "n2", "sku": "X-Basket-M-G1"}]
+        assert process_nonclothing(rws, [], None, td_nc, "2026-10-16", True, st, set()) is None
+    finally:
+        nonclothing.run = orig_run; globals()["upload_rows"] = orig_up
+    assert ups[0] == ("X-Basket_art.png", {"n1": "OK 2026-10-16 · art phẳng (không phải quần áo)"})
+    assert ups[1][0] == "X-Basket_art_QAFAIL.png" and ups[1][1]["n2"].startswith("QA FAIL 2026-10-16 · art (sai_chu)")
+    assert st["qafail"] == 1 and st["ok"] == 0
     print("batch selfcheck OK")
 
 
