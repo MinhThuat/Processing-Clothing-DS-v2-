@@ -20,12 +20,13 @@ Chạy:
 
 Yêu cầu: codex đã đăng nhập + `openart login`; ARK_API_KEY (env hoặc .env cạnh script).
 """
-import argparse, base64, io, json, os, re, subprocess, sys, tempfile, time
+import argparse, base64, io, json, os, re, subprocess, sys, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _T0 = time.time()
 _LOGF = None  # file handle nếu ghi log ra file
+_LOG_LOCK = threading.Lock()   # gen song song nhiều mảnh -> log() không bị xen dòng
 
 def _open_log(path):
     global _LOGF
@@ -36,9 +37,10 @@ def _open_log(path):
 def log(stage, msg=""):
     """Log 1 dòng có mốc thời gian + tên giai đoạn -> stdout VÀ file (flush ngay)."""
     line = f"[+{time.time() - _T0:6.1f}s][{stage:<9}] {msg}"
-    print(line, flush=True)
-    if _LOGF:
-        _LOGF.write(line + "\n"); _LOGF.flush()
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _LOGF:
+            _LOGF.write(line + "\n"); _LOGF.flush()
 
 EMIT = None   # nếu set: crop/panel ghi thẳng vào thư mục này (cho UI web poll)
 COLOR = None  # --color: ép màu nền vải (batch: nhóm con màu khác ảnh gốc)
@@ -530,6 +532,8 @@ def cutout(path, T=12):
 
 
 # ---------- 4. workers từng người ----------
+GEN_WORKERS = int(os.getenv("FLAT_GEN_WORKERS", "3"))   # gen song song mấy mảnh cùng lúc (codex tự xếp hàng tối đa 4)
+
 def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, only=None, cache=None, flat=False):
     """1 người/1 trang phục -> mỗi mảnh 1 file.
       áo+quần: full-bleed chữ nhật. váy: cắt cong (cutout), nền trong suốt.
@@ -559,13 +563,17 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
         want = set(only if isinstance(only, (list, tuple, set)) else str(only).split(","))
         plan = [s for s in plan if _slug_wanted(s["slug"], want)]
     outs, errs = [], []
-    for spec in plan:
-        log("gen", f"gen mảnh {spec['slug']} ({'phẳng' if flat else '3D'}) ...")
-        try:
-            outs.append(_make_piece(spec, refs, work, out, flat=flat))
-        except Exception as e:                  # 1 mảnh lỗi -> làm tiếp mảnh khác (batch gen lại sau)
-            log("gen", f"  ✗ mảnh {spec['slug']} lỗi: {str(e)[:300]}")
-            errs.append(e)
+    with ThreadPoolExecutor(max_workers=GEN_WORKERS) as ex:
+        futs = []
+        for spec in plan:
+            log("gen", f"gen mảnh {spec['slug']} ({'phẳng' if flat else '3D'}) ...")
+            futs.append((spec, ex.submit(_make_piece, spec, refs, work, out, flat=flat)))
+        for spec, fut in futs:                  # đợi theo đúng thứ tự plan -> outs giữ nguyên thứ tự
+            try:
+                outs.append(fut.result())
+            except Exception as e:              # 1 mảnh lỗi -> làm tiếp mảnh khác (batch gen lại sau)
+                log("gen", f"  ✗ mảnh {spec['slug']} lỗi: {str(e)[:300]}")
+                errs.append(e)
     log("done", f"{len(outs)} mảnh: " + ", ".join(o.name for o in outs))
     if errs and not outs:
         raise errs[-1]
@@ -692,6 +700,50 @@ def _selfcheck():
     ex = _prompt_extra()
     assert "heliconia pink" in ex and "FIX: NO chest graphic on back" in ex
     globals()["COLOR"], globals()["HINT"] = None, None
+    # GEN_WORKERS: đọc FLAT_GEN_WORKERS (mặc định 3)
+    assert GEN_WORKERS == int(os.getenv("FLAT_GEN_WORKERS", "3"))
+    # run_pieces_one chạy song song (ThreadPoolExecutor): giữ thứ tự theo plan, 1 mảnh lỗi
+    # không chặn mảnh khác, tất cả lỗi -> raise lỗi cuối cùng (theo thứ tự plan)
+    cache_dir = Path(tempfile.mkdtemp())
+    cache_path = cache_dir / "pieces.json"
+    cache_path.write_text(json.dumps({"type": "top_bottom", "top_front": "base white; x", "top_back": "b",
+                                      "pants_front": "c", "pants_back": "d", "sleeves_same": True,
+                                      "sl_front": "e", "sl_back": "f"}), encoding="utf-8")
+    img_in = cache_dir / "front.png"; Image.new("RGB", (10, 10), "white").save(img_in)
+    log_calls = []
+    orig_log, orig_make_piece = globals()["log"], globals()["_make_piece"]
+
+    def fake_log(stage, msg=""):
+        log_calls.append((stage, msg))
+
+    def fake_make_piece(spec, refs, work, out, flat=False):
+        if spec["slug"] == "quan_sau":
+            raise RuntimeError("boom quan_sau")
+        time.sleep(0.01)
+        return out.with_name(f"{out.stem}_{spec['slug']}{out.suffix}")
+
+    globals()["log"], globals()["_make_piece"] = fake_log, fake_make_piece
+    try:
+        result = run_pieces_one(None, img_in, cache_dir / "final.png", cache=cache_path)
+    finally:
+        globals()["log"], globals()["_make_piece"] = orig_log, orig_make_piece
+    assert result == cache_dir / "final_ao_truoc.png"          # mảnh đầu plan, không lỗi
+    assert any(s == "gen" and m.startswith("  ✗ mảnh quan_sau lỗi: boom quan_sau") for s, m in log_calls)
+    done_msg = next(m for s, m in log_calls if s == "done")
+    assert done_msg == "5 mảnh: " + ", ".join(
+        f"final_{slug}.png" for slug in ["ao_truoc", "ao_sau", "quan_truoc", "tay_truoc", "tay_sau"])
+    # tất cả mảnh lỗi -> raise lỗi CUỐI CÙNG theo thứ tự plan (tay_sau)
+    def fail_all(spec, refs, work, out, flat=False):
+        raise RuntimeError(f"fail {spec['slug']}")
+    globals()["log"], globals()["_make_piece"] = fake_log, fail_all
+    try:
+        try:
+            run_pieces_one(None, img_in, cache_dir / "final2.png", cache=cache_path)
+            raise AssertionError("phải raise khi tất cả mảnh lỗi")
+        except RuntimeError as e:
+            assert "fail tay_sau" in str(e)
+    finally:
+        globals()["log"], globals()["_make_piece"] = orig_log, orig_make_piece
     print("selfcheck OK")
 
 

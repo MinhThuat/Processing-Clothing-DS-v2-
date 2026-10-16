@@ -10,7 +10,9 @@ Spec: docs/superpowers/specs/2026-10-15-batch-lark-flat-design.md
 """
 import argparse, hashlib, io, json, os, re, shutil, signal, subprocess, sys, time, traceback, urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from itertools import count
 from pathlib import Path
 
 from PIL import Image
@@ -305,6 +307,22 @@ def _gen_soft(fn):
         log("gen", f"lỗi gen (tính 1 lần hỏng): {str(e)[:200]}")
 
 
+def _run_both(fns):
+    """Chạy các callable không đối số đồng thời (vd gen pieces + gen art, mỗi cái 1 luồng codex).
+    Đợi TẤT CẢ chạy xong rồi mới raise lỗi ĐẦU TIÊN theo thứ tự `fns` — để AuthError/QuotaError/
+    StepError vẫn nổi lên như chạy tuần tự, không bỏ dở nhánh còn lại."""
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        futs = [ex.submit(fn) for fn in fns]
+        errs = []
+        for f in futs:
+            try:
+                f.result()
+            except Exception as e:
+                errs.append(e)
+    if errs:
+        raise errs[0]
+
+
 def _pieces_json_slugs(path):
     """pieces.json -> tập slug mảnh (không gồm 'art') theo plan hiện tại (flat_pipeline._pieces_plan)."""
     return {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")))}
@@ -330,14 +348,14 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     if group["mode"] == "two" else None),
            "hint": None}
     n = Counter()
+    pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
 
     def pipe(args):
         left = deadline - time.monotonic()
         if left <= 0:
             raise StepError("quá thời gian", "nhóm > 45 phút")
-        n["pipe"] += 1
         extra = (["--color", color] if color else []) + (["--hint", ctx["hint"]] if ctx["hint"] else [])
-        return run_pipe(args + extra, sdir / f"pipe_{n['pipe']:02d}.log", left)
+        return run_pipe(args + extra, sdir / f"pipe_{next(pipe_no):02d}.log", left)
 
     def mode_args():
         return ((["--back", ctx["back"]] if ctx["back"] else [])
@@ -358,9 +376,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         _gen_soft(lambda: pipe(["--art", "--front", ctx["front"], "-o", sdir / "art.png",
                                 "--emit", sdir / "art_work"]))
 
-    # lần 0
-    gen_pieces()
-    gen_art()
+    # lần 0: pieces (3 mảnh/luồng) + art chạy SONG SONG -> tổng 4 luồng codex (đúng mức cho phép)
+    _run_both([gen_pieces, gen_art])
     pj = sdir / "pieces.json"
     if not pj.exists():
         raise StepError("gen", "vision không ra pieces.json")
@@ -394,7 +411,9 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         for x in todo:
             piece_path(x).unlink(missing_ok=True)
         slugs = [x for x in todo if x != "art"]
-        if slugs:
+        need_art = "art" in todo
+
+        def do_pieces():
             if attempt == 3:
                 # lần 3: vision lại (crop + hint mới, từ rehint_fn) -> có thể đổi loại đồ/tay
                 # giống-khác -> tên mảnh lệch với bản gốc (USER DECISION: khi lệch thì quay về
@@ -416,7 +435,12 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                         gen_pieces(only=missing, cache=True)
             else:
                 gen_pieces(only=slugs, cache=True)     # lần 1-2: y nguyên; lần 4: dùng pieces.json hiện tại
-        if "art" in todo:
+
+        if slugs and need_art:
+            _run_both([do_pieces, gen_art])            # song song: mảnh (3 luồng) + art = 4 luồng codex
+        elif slugs:
+            do_pieces()
+        elif need_art:
             gen_art()
 
     def rehint_fn(fails):
@@ -890,6 +914,23 @@ def _selfcheck():
         log("test", "msg")  # phải không ném lỗi
     finally:
         sys.stdout = old_stdout
+    # _run_both: cả 2 callable đều chạy xong; lỗi ở 1 cái -> raise SAU KHI cái kia đã chạy xong
+    calls_both = []
+    _run_both([lambda: calls_both.append("a"), lambda: calls_both.append("b")])
+    assert set(calls_both) == {"a", "b"}
+
+    def ok_fn():
+        time.sleep(0.02); calls_both.append("ok")
+
+    def bad_fn():
+        calls_both.append("bad"); raise RuntimeError("boom both")
+    calls_both.clear()
+    try:
+        _run_both([bad_fn, ok_fn])
+        raise AssertionError("_run_both phải raise khi 1 callable lỗi")
+    except RuntimeError as e:
+        assert "boom both" in str(e)
+    assert calls_both.count("ok") == 1 and calls_both.count("bad") == 1   # cả 2 đều đã chạy xong
     print("batch selfcheck OK")
 
 
