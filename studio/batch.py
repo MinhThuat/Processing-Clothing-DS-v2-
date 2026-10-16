@@ -316,18 +316,18 @@ def _slugs_match(pieces_json_path, names):
     return _pieces_json_slugs(pieces_json_path) == set(names)
 
 
-# ---------- 1 nhóm con màu ----------
-def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
-    """Gen pieces 3D + art cho 1 nhóm con màu -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
+# ---------- 1 nhóm con (biến thể thiết kế + màu) ----------
+def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+    """Gen pieces 3D + art cho 1 nhóm con (biến thể + màu) -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
     shutil.rmtree(sdir, ignore_errors=True)    # thử lại cùng ngày: bỏ log/mảnh/pieces.json của lần trước
     sdir.mkdir(parents=True)
-    color = None if sub["matches_photo"] else sub["color"]
+    color = None if group["matches_photo"] else group["color"]
     colour_desc = color or "same as the reference photo"
-    ctx = {"front": make_input(srcs[pick["front"] - 1], pick["crop"], sdir / "in_front.png"),
-           "front_src": srcs[pick["front"] - 1],         # ảnh gốc chưa cắt, để QA luôn so với ảnh thật
-           "cropped": pick["crop"] is not None,
-           "back": (make_input(srcs[pick["back"] - 1], None, sdir / "in_back.png")
-                    if pick["mode"] == "two" else None),
+    ctx = {"front": make_input(srcs[group["front"] - 1], group["crop"], sdir / "in_front.png"),
+           "front_src": srcs[group["front"] - 1],        # ảnh gốc chưa cắt, để QA luôn so với ảnh thật
+           "cropped": group["crop"] is not None,
+           "back": (make_input(srcs[group["back"] - 1], None, sdir / "in_back.png")
+                    if group["mode"] == "two" else None),
            "hint": None}
     n = Counter()
 
@@ -341,7 +341,7 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
 
     def mode_args():
         return ((["--back", ctx["back"]] if ctx["back"] else [])
-                + (["--combined"] if pick["mode"] == "combined" else []))
+                + (["--combined"] if group["mode"] == "combined" else []))
 
     def piece_path(name):
         return sdir / ("art.png" if name == "art" else f"final_{name}.png")
@@ -430,8 +430,8 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
             ctx["hint"] = None
             return None
         (sdir / "rehint.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
-        front_idx = (r["front"] or pick["front"]) - 1
-        crop = None if pick["mode"] == "combined" else r["crop"]   # combined -> bbox không đáng tin, bỏ
+        front_idx = (r["front"] or group["front"]) - 1
+        crop = None if group["mode"] == "combined" else r["crop"]  # combined -> bbox không đáng tin, bỏ
         ctx["front_src"] = srcs[front_idx]
         ctx["front"] = make_input(srcs[front_idx], crop, sdir / "in_front_r3.png")
         ctx["cropped"] = crop is not None
@@ -537,12 +537,12 @@ def process_group(g, rundir, day, dry, stats):
                 lb.write_notes({r["record_id"]: note for r in rows})
             stats["skip"] += 1
             return "skip"
-        log("pick", f"front={pick['front']} back={pick['back']} mode={pick['mode']} "
-                    f"màu={[c['color'] for c in pick['colors']]}")
+        log("pick", "; ".join(f"{g['variant']}/{g['color']}: front={g['front']} back={g['back']} "
+                              f"mode={g['mode']}" for g in pick["groups"]))
         any_fail = False
-        for k, sub in enumerate(pick["colors"], 1):
-            sub_rows = [r for r in rows if r["record_id"] in sub["record_ids"]]
-            any_fail |= process_subgroup(sub, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline, done_ids)
+        for k, group in enumerate(pick["groups"], 1):
+            sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
+            any_fail |= process_subgroup(group, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline, done_ids)
         stats["qafail" if any_fail else "ok"] += 1
         if not dry:
             cleanup(gdir)

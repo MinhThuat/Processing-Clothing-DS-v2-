@@ -107,44 +107,52 @@ def _opts(custom):
     return " / ".join(parts) if parts else "-"
 
 
-def norm_pick(js, rows, n):
-    if js.get("skip"):
-        return {"skip": str(js["skip"])[:150]}
-    front = js.get("front")
+def _norm_group(g, ids, seen, n):
+    """1 nhóm (biến thể + màu) -> dict chuẩn hoá, hoặc None nếu front sai / hết record_id hợp lệ."""
+    front = g.get("front")
     if not isinstance(front, int) or not 1 <= front <= n:
-        raise StepError("judge", f"front không hợp lệ: {front!r}")
-    back = js.get("back")
+        return None                            # front sai -> bỏ cả nhóm, record_id dồn sang nhóm khác
+    back = g.get("back")
     back = back if isinstance(back, int) and 1 <= back <= n and back != front else None
-    mode = js.get("mode") if js.get("mode") in ("infer", "two", "combined") else "infer"
+    mode = g.get("mode") if g.get("mode") in ("infer", "two", "combined") else "infer"
     if mode == "two" and back is None:
         mode = "infer"
     if mode != "two":
         back = None
+    rids = [x for x in (g.get("record_ids") or []) if x in ids and x not in seen]
+    if not rids:
+        return None
+    seen |= set(rids)
+    color = str(g.get("color") or "photo")
+    # combined = ảnh ghép nhiều biến thể -> crop vẫn có thể đáng tin (vùng riêng của 1 biến thể),
+    # vẫn qua _box để lọc vùng quá nhỏ/toạ độ hỏng
+    return {"variant": str(g.get("variant") or "default"), "color": color, "record_ids": rids,
+            "matches_photo": bool(g.get("matches_photo", True)) or color.lower() == "photo",
+            "front": front, "back": back, "mode": mode, "crop": _box(g.get("crop"))}
+
+
+def norm_pick(js, rows, n):
+    if js.get("skip"):
+        return {"skip": str(js["skip"])[:150]}
     ids = [r["record_id"] for r in rows]
-    seen, colors = set(), []
-    for c in js.get("colors") or []:
-        rids = [x for x in (c.get("record_ids") or []) if x in ids and x not in seen]
-        if not rids:
-            continue
-        seen |= set(rids)
-        color = str(c.get("color") or "photo")
-        colors.append({"color": color, "record_ids": rids,
-                       "matches_photo": bool(c.get("matches_photo", True)) or color.lower() == "photo"})
+    seen, groups = set(), []
+    for g in js.get("groups") or []:
+        ng = _norm_group(g, ids, seen, n)
+        if ng:
+            groups.append(ng)
     rest = [x for x in ids if x not in seen]
-    if rest:                                   # Claude sót dòng -> coi như màu ảnh gốc
-        photo = next((c for c in colors if c["matches_photo"]), None)
-        if photo:
-            photo["record_ids"] += rest
-        else:
-            colors.append({"color": "photo", "matches_photo": True, "record_ids": rest})
-    crop = None if mode == "combined" else _box(js.get("crop"))   # combined = ảnh ghép 2 mặt -> bbox
+    if rest:                                   # Claude sót dòng / nhóm front sai -> dồn vào nhóm hợp lệ đầu
+        if not groups:
+            raise StepError("judge", "không có nhóm hợp lệ nào")
+        groups[0]["record_ids"] += rest
+    if not groups:
+        raise StepError("judge", "không có nhóm hợp lệ nào")
     manual = {}                                                   # customisation không gen được -> ghi Note
     for rid, note in (js.get("manual") or {}).items():
         note = str(note)[:120]
         if rid in ids and note:
             manual[rid] = note
-    return {"skip": None, "front": front, "back": back, "mode": mode,    # từ contact sheet thu nhỏ, không
-            "crop": crop, "colors": colors, "manual": manual}            # đáng tin -> không cắt
+    return {"skip": None, "groups": groups, "manual": manual}
 
 
 def norm_qa(js, names):
@@ -168,28 +176,33 @@ the PRINT, not real skin.
 1. Is the product a GARMENT / APPAREL item (t-shirt, shirt, hoodie, dress, skirt, pants, jogger, jersey,
 jumpsuit, pajamas, athletic set, kids clothing...)? If NOT (magnet, plaque, vase, mug, tumbler, decor,
 cap, guest book, patch, accessory...) return {{"skip": "<short reason with the product type>"}}.
-2. Otherwise choose inputs for a flat sewing-pattern generator:
- - "front": label of the clearest photo of the FRONT of the whole garment. PREFER a clean flat /
-   ghost-mannequin product image of the garment (front, and back if shown) over a lifestyle photo of
-   a person wearing it; fall back to a lifestyle photo only if no flat/ghost-mannequin shot exists.
- - "back": label of a photo of the real BACK of the SAME garment, or null.
- - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows the
-   front and back side by side (then back = null); otherwise "infer".
+2. Otherwise split the order rows into GROUPS: rows sharing the same DESIGN VARIANT (e.g. a men's vs
+women's print — read "Choose design" in customer options) AND the same garment colour form one group.
+A listing with one design has one group per colour (or a single group if one colour). Pick EACH group's
+OWN inputs for a flat sewing-pattern generator:
+ - "variant": short words naming the design variant (e.g. "Men", "Women"), or "default" if there is
+   only one design.
+ - "color": the garment colour this group's rows ask for. Read colour words in SKU Design / Color;
+   personal names, sizes and design numbers are NOT colours; a row without a colour uses "photo".
+ - "matches_photo": true if that colour is the one shown in the photos, else false.
+ - "front": label of the clearest photo of the FRONT of THAT variant. PREFER a clean flat /
+   ghost-mannequin product image over a lifestyle photo of a person wearing it; fall back to a lifestyle
+   photo only if no flat/ghost-mannequin shot exists for that variant.
+ - "back": label of a photo of the real BACK of the SAME variant, or null.
+ - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows that
+   variant's front and back side by side (then back = null); otherwise "infer".
  - "crop": [x0,y0,x1,y1] integers 0-1000 relative to THAT single photo's own width/height (NOT the
-   contact sheet); MUST be null when mode is "combined"; only crop when the photo shows several
-   different people/outfits (tight around ONE outfit), else null.
- - "colors": split the order rows by the garment colour each row asks for. Read colour words in
-   SKU Design / Color; personal names, sizes and design numbers are NOT colours; a row without a colour
-   uses the photo colour. Each item {{"color": "<colour words, or 'photo'>", "matches_photo": true|false,
-   "record_ids": [...]}}; every record_id exactly once.
- - If several design variants appear among the photos (e.g. a men's and a women's version), pick the
-   front/back from the variant that the most rows' customer options asked for.
+   contact sheet). When one photo shows SEVERAL variants side by side (e.g. men's front/back next to
+   women's front/back), set "crop" to the region covering ONLY this group's variant (both its front and
+   back) and use mode "combined". Also crop when a photo shows several unrelated people/outfits (tight
+   around ONE outfit). Otherwise null.
+ - "record_ids": this group's order rows' record_id; every record_id exactly once across ALL groups.
+   Rows whose customer options don't name a variant go to the variant shown in the most photos.
  - "manual": {{"record_id": "<short Vietnamese note of the customer options the generated file will NOT
-   match, e.g. 'design Women', 'skin tone S3', 'tên: Anna', 'ảnh khách'>"}} — include only rows with
-   such unmet customer options (a skin tone code, a name, a customer photo, a design variant different
-   from the chosen photo); omit rows with no such options.
-Return ONLY: {{"skip": null, "front": 1, "back": null, "mode": "infer", "crop": null, "colors": [...],
-"manual": {{}}}}"""
+   match, e.g. 'skin tone S3', 'tên: Anna', 'ảnh khách'>"}} — include only rows with such unmet
+   customer options (a skin tone code, a name, a customer photo); omit rows with no such options.
+Return ONLY: {{"skip": null, "groups": [{{"variant": "default", "color": "photo", "matches_photo": true,
+"front": 1, "back": null, "mode": "infer", "crop": null, "record_ids": [...]}}], "manual": {{}}}}"""
 
 QA = """Top row = {n_refs} REFERENCE photo(s) of the real garment. Other tiles = generated flat pieces,
 label = piece name. Required base fabric colour: {colour}.
@@ -252,26 +265,57 @@ def _selfcheck():
              {"record_id": "r2", "sku": "X-Pink-Hoodie-S-G1", "color": ""},
              {"record_id": "r3", "sku": "X-Hoodie-M-G1", "color": ""}]
     assert norm_pick({"skip": "Magnet Die Cut"}, rows_, 5) == {"skip": "Magnet Die Cut"}
-    p = norm_pick({"skip": None, "front": 2, "back": 2, "mode": "two", "crop": [10, 20, 900, 990],
-                   "colors": [{"color": "black", "matches_photo": True, "record_ids": ["r1", "zz"]},
-                              {"color": "pink", "matches_photo": False, "record_ids": ["r2", "r1"]}]},
+    # 1 nhóm, back trùng front -> bỏ back/mode; record_id lạ bị lọc; r3 sót -> vào nhóm hợp lệ đầu tiên
+    p = norm_pick({"skip": None, "groups": [
+        {"variant": "default", "color": "black", "matches_photo": True, "front": 2, "back": 2,
+         "mode": "two", "crop": [10, 20, 900, 990], "record_ids": ["r1", "zz"]},
+        {"variant": "default", "color": "pink", "matches_photo": False, "front": 1, "back": None,
+         "mode": "infer", "crop": None, "record_ids": ["r2", "r1"]}]}, rows_, 5)
+    assert p["groups"][0]["front"] == 2 and p["groups"][0]["back"] is None and p["groups"][0]["mode"] == "infer"
+    assert p["groups"][0]["crop"] == [10, 20, 900, 990]
+    ids = [x for g in p["groups"] for x in g["record_ids"]]
+    assert sorted(ids) == ["r1", "r2", "r3"] and len(ids) == 3            # r3 bị sót -> vào nhóm hợp lệ đầu
+    assert p["groups"][1] == {"variant": "default", "color": "pink", "matches_photo": False,
+                              "record_ids": ["r2"], "front": 1, "back": None, "mode": "infer", "crop": None}
+    # mode "combined": vùng cắt quá nhỏ (< 20% diện tích) -> _box bỏ -> None (vẫn áp dụng cho nhóm)
+    p2 = norm_pick({"skip": None, "groups": [
+        {"variant": "default", "color": "photo", "matches_photo": True, "front": 1, "back": None,
+         "mode": "combined", "crop": [390, 50, 760, 400], "record_ids": ["r1", "r2", "r3"]}]}, rows_, 5)
+    assert p2["groups"][0]["mode"] == "combined" and p2["groups"][0]["crop"] is None
+    # mode "combined" với vùng cắt hợp lệ -> GIỮ (khác nhóm màu cũ: vùng cắt riêng của 1 biến thể
+    # trên ảnh ghép nhiều biến thể là đáng tin) -> 2 nhóm Men/Women mỗi nhóm giữ front/crop riêng
+    p2b = norm_pick({"skip": None, "groups": [
+        {"variant": "Men", "color": "photo", "matches_photo": True, "front": 1, "back": None,
+         "mode": "combined", "crop": [0, 0, 500, 1000], "record_ids": ["r1"]},
+        {"variant": "Women", "color": "photo", "matches_photo": True, "front": 2, "back": None,
+         "mode": "combined", "crop": [500, 0, 1000, 1000], "record_ids": ["r2", "r3"]}]}, rows_, 5)
+    assert p2b["groups"][0]["variant"] == "Men" and p2b["groups"][0]["front"] == 1
+    assert p2b["groups"][0]["crop"] == [0, 0, 500, 1000]
+    assert p2b["groups"][1]["variant"] == "Women" and p2b["groups"][1]["front"] == 2
+    assert p2b["groups"][1]["crop"] == [500, 0, 1000, 1000]
+    # nhóm front sai (99) -> bị bỏ, record_id của nó dồn vào nhóm hợp lệ đầu tiên
+    p3 = norm_pick({"skip": None, "groups": [
+        {"variant": "Men", "color": "photo", "matches_photo": True, "front": 1, "back": None,
+         "mode": "infer", "crop": None, "record_ids": ["r1"]},
+        {"variant": "Women", "color": "photo", "matches_photo": True, "front": 99, "back": None,
+         "mode": "infer", "crop": None, "record_ids": ["r2", "r3"]}]}, rows_, 5)
+    assert len(p3["groups"]) == 1
+    assert sorted(p3["groups"][0]["record_ids"]) == ["r1", "r2", "r3"]
+    # toàn bộ nhóm front sai -> không còn nhóm nào hợp lệ -> StepError
+    try:
+        norm_pick({"skip": None, "groups": [{"variant": "x", "color": "photo", "matches_photo": True,
+                   "front": 99, "back": None, "mode": "infer", "crop": None, "record_ids": ["r1"]}]},
                   rows_, 5)
-    assert p["front"] == 2 and p["back"] is None and p["mode"] == "infer"   # back trùng front -> bỏ
-    assert p["crop"] == [10, 20, 900, 990]
-    ids = [x for c in p["colors"] for x in c["record_ids"]]
-    assert sorted(ids) == ["r1", "r2", "r3"] and len(ids) == 3             # r3 bị sót -> vào nhóm 'photo'
-    assert p["colors"][1] == {"color": "pink", "matches_photo": False, "record_ids": ["r2"]}
-    # mode "combined" -> crop luôn None (dù model trả về bbox) vì bbox ước lượng từ contact sheet
-    # thu nhỏ, không đáng tin cho ảnh ghép 2 người
-    p2 = norm_pick({"skip": None, "front": 1, "back": None, "mode": "combined",
-                    "crop": [390, 50, 760, 400], "colors": []}, rows_, 5)
-    assert p2["mode"] == "combined" and p2["crop"] is None
+        raise AssertionError("mọi nhóm front sai phải lỗi")
+    except StepError as e:
+        assert e.kind == "judge"
     # manual: lọc record_id lạ, giá trị rỗng; skip thì không có key "manual"
     assert p["manual"] == {}                              # không truyền "manual" -> {}
-    p3 = norm_pick({"skip": None, "front": 1, "back": None, "mode": "infer", "crop": None, "colors": [],
-                    "manual": {"r1": "design Women", "zz": "unknown rid", "r2": "", "r3": "x" * 200}},
-                   rows_, 5)
-    assert p3["manual"] == {"r1": "design Women", "r3": "x" * 120}   # zz bỏ (lạ), r2 bỏ (rỗng), r3 cắt 120
+    p4 = norm_pick({"skip": None, "groups": [
+        {"variant": "default", "color": "photo", "matches_photo": True, "front": 1, "back": None,
+         "mode": "infer", "crop": None, "record_ids": ["r1", "r2", "r3"]}],
+        "manual": {"r1": "skin tone S3", "zz": "unknown rid", "r2": "", "r3": "x" * 200}}, rows_, 5)
+    assert p4["manual"] == {"r1": "skin tone S3", "r3": "x" * 120}   # zz bỏ (lạ), r2 bỏ (rỗng), r3 cắt 120
     assert "manual" not in norm_pick({"skip": "Magnet"}, rows_, 5)
     # _opts: gộp 'Name Custom' nhiều dòng/bullet thành 1 dòng cho prompt
     assert _opts("") == "-" and _opts(None) == "-"
@@ -280,15 +324,11 @@ def _selfcheck():
     # prompt: phải nhắc hình cơ thể in = họa tiết, ưu tiên ảnh phẳng, có key "manual"
     for p_txt in (PICK, QA):
         assert "not real skin" in p_txt
-    assert "ghost-mannequin" in PICK and '"manual"' in PICK
+    assert "ghost-mannequin" in PICK and '"manual"' in PICK and '"variant"' in PICK
     assert "sai_hoa_tiet" in QA and "printed body/skin illusion" in " ".join(QA.split())
     # _box: vùng cắt quá nhỏ (< 20% diện tích 1000x1000) -> bỏ, tránh cắt lọt vào giữa 2 người
     assert _box([390, 50, 760, 400]) is None                 # area 129,500 < 200,000
     assert _box([100, 100, 700, 900]) == [100, 100, 700, 900]  # area 480,000 -> giữ
-    try:
-        norm_pick({"front": 9, "colors": []}, rows_, 5); raise AssertionError("front sai phải lỗi")
-    except StepError as e:
-        assert e.kind == "judge"
     q = norm_qa({"pieces": {"ao_truoc": {"ok": True, "score": 9, "errors": []},
                             "ao_sau": {"ok": True, "score": 7, "errors": ["sau_giong_truoc", "xyz"]}}},
                 ["ao_truoc", "ao_sau", "art"])
