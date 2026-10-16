@@ -394,15 +394,17 @@ def _desc(js, key):
     return js.get(key) or js.get(_BACK_FALLBACK.get(key, ""))
 
 def _box(js, key):
-    """Box 0-1000 của panel `key` (vision 'boxes'); hỏng/quá nhỏ (<3% mỗi chiều) -> None (dùng ảnh nguyên).
-    Tay phải thiếu -> mượn tay trái (như desc)."""
+    """Box 0-1000 của panel `key` (vision 'boxes'); hỏng/nhỏ (<15% mỗi chiều) -> None (dùng ảnh nguyên).
+    Tay áo (sl_/sr_) luôn None: thử thật, box tay áo của vision hay lệch (trúng cổ/đầu người bên cạnh)."""
+    if key.startswith(("sl_", "sr_")):
+        return None
     boxes = js.get("boxes") if isinstance(js.get("boxes"), dict) else {}
-    b = boxes.get(key) or boxes.get(key.replace("sr_", "sl_"))
+    b = boxes.get(key)
     if not (isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)):
         return None
     x0, x1 = sorted((max(0, b[0]), min(1000, b[2])))
     y0, y1 = sorted((max(0, b[1]), min(1000, b[3])))
-    return [int(x0), int(y0), int(x1), int(y1)] if x1 - x0 >= 30 and y1 - y0 >= 30 else None
+    return [int(x0), int(y0), int(x1), int(y1)] if x1 - x0 >= 150 and y1 - y0 >= 150 else None
 
 def _pieces_plan(js):
     """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
@@ -635,15 +637,27 @@ def cutout(path, T=12):
 # ---------- 4. workers từng người ----------
 GEN_WORKERS = int(os.getenv("FLAT_GEN_WORKERS", "3"))   # gen song song mấy mảnh cùng lúc (codex tự xếp hàng tối đa 4)
 
+MIN_SIDE = 1024
+
+def _upscaled(src, dst, min_side=MIN_SIDE):
+    """Lưu src -> dst, phóng (LANCZOS) nếu cạnh dài < min_side: ảnh nhỏ (vd 1 ô cắt từ ảnh 8 design,
+    ~290px) làm vision trả box lệch và crop mảnh quá mờ."""
+    im = Image.open(src)
+    if max(im.size) < min_side:
+        k = min_side / max(im.size)
+        im = im.resize((round(im.width * k), round(im.height * k)), Image.LANCZOS)
+    im.save(dst)
+    return dst
+
 def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, only=None, cache=None, flat=False):
     """1 người/1 trang phục -> mỗi mảnh 1 file.
       áo+quần: full-bleed chữ nhật. váy: cắt cong (cutout), nền trong suốt.
       mặt sau: back (2 ảnh) / combined (1 ảnh 2 mặt) -> lưng thật; else tự suy từ trước.
       only = chỉ gen các slug này; cache = nạp lại mô tả vision cũ, BỎ vision (gen lẻ)."""
     work = _workdir("pieces_", emit_sub)
-    ref_front = work / "crop_front.png"; Image.open(img).save(ref_front)
+    ref_front = _upscaled(img, work / "crop_front.png")
     if back:
-        ref_back = work / "crop_back.png"; Image.open(back).save(ref_back)
+        ref_back = _upscaled(back, work / "crop_back.png")
     else:
         ref_back = ref_front   # combined: ảnh chứa cả 2 mặt; infer: dùng ảnh trước làm style-ref
     refs = {"front": ref_front, "back": ref_back}
@@ -652,7 +666,7 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
         log("crop", f"dùng lại mô tả cũ ({Path(cache).name})")
     else:
         source = "two" if back else ("combined" if combined else "infer")
-        vimgs = [img, back] if back else img
+        vimgs = [ref_front, ref_back] if back else ref_front   # ảnh đã phóng: vision định vị box chuẩn hơn
         log("crop", "nhìn ảnh: phân loại đồ + tả print từng mảnh ...")
         js = seed_pieces(client, vimgs, source)
         (work / "pieces.json").write_text(json.dumps(js, ensure_ascii=False), encoding="utf-8")
@@ -660,6 +674,8 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
     tay = "" if typ == "dress" else f" | tay {'khác' if not js.get('sleeves_same', True) else 'giống'}"
     log("crop", f"loại: {typ}{tay}")
     plan = _pieces_plan(js)
+    if not back and not combined:   # mặt sau tự suy: box sau nằm trên ảnh TRƯỚC -> cắt ra thì chép y mặt trước
+        plan = [{**sp, "box": None} if sp["side"] == "back" else sp for sp in plan]
     if only:
         want = set(only if isinstance(only, (list, tuple, set)) else str(only).split(","))
         plan = [s for s in plan if _slug_wanted(s["slug"], want)]
@@ -898,11 +914,17 @@ def _selfcheck():
     finally:
         globals()["log"], globals()["_make_piece"] = orig_log, orig_make_piece
     # box từng mảnh: hợp lệ -> giữ (kẹp 0-1000); hỏng/quá nhỏ/thiếu -> None; tay phải mượn tay trái
-    jb = {"boxes": {"bodice_back": [100, 50, 900, 480], "skirt_back": [0, 0, 10, 10],
-                    "sl_front": [-5, 0, 300, 1200], "bodice_front": "x"}}
+    jb = {"boxes": {"bodice_back": [100, 50, 900, 480], "skirt_back": [0, 0, 100, 100],
+                    "top_front": [-5, 0, 300, 1200], "sl_front": [0, 0, 500, 500], "bodice_front": "x"}}
     assert _box(jb, "bodice_back") == [100, 50, 900, 480]
-    assert _box(jb, "skirt_back") is None and _box(jb, "bodice_front") is None
-    assert _box(jb, "sr_front") == [0, 0, 300, 1000] and _box({}, "top_front") is None
+    assert _box(jb, "skirt_back") is None and _box(jb, "bodice_front") is None   # quá nhỏ / hỏng
+    assert _box(jb, "top_front") == [0, 0, 300, 1000] and _box({}, "top_front") is None   # kẹp biên
+    assert _box(jb, "sl_front") is None and _box(jb, "sr_front") is None          # tay áo: không cắt
+    # ảnh nhỏ -> phóng lên MIN_SIDE; ảnh đủ lớn giữ nguyên
+    tdu = Path(tempfile.mkdtemp()); Image.new("RGB", (290, 445)).save(tdu / "s.png")
+    assert max(Image.open(_upscaled(tdu / "s.png", tdu / "u.png")).size) == MIN_SIDE
+    Image.new("RGB", (1254, 1254)).save(tdu / "b.png")
+    assert Image.open(_upscaled(tdu / "b.png", tdu / "v.png")).size == (1254, 1254)
     plan_b = _pieces_plan({"type": "dress", "bodice_front": "base green", "bodice_back": "base green",
                            "skirt_front": "base purple", "skirt_back": "base purple", **jb})
     assert {s_["slug"]: s_["box"] for s_ in plan_b}["than_sau"] == [100, 50, 900, 480]
