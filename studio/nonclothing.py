@@ -1,12 +1,12 @@
 """Nhánh RIÊNG cho sản phẩm KHÔNG phải quần áo (giỏ, lịch, cốc, decor...): mỗi dòng 2 bản art —
-"phang" (phẳng lì, vector) và "3d" (giữ hiệu ứng giả 3D nổi như ảnh) — y ảnh nguồn + Name Custom.
+"phang" (phẳng lì, vector) và "3d" (giữ hiệu ứng giả 3D nổi) — đều là FILE IN (bề mặt in trải phẳng).
 
 Tách hẳn khỏi luồng clothing (batch.process_subgroup / flat_pipeline pieces) — batch chỉ rẽ sang đây
 khi judge.pick trả 'skip'. Luồng:
   Claude chọn ảnh có hình in (+ định vị nếu ảnh nhiều SP) -> codex/dola tả SP -> mỗi dòng gen 2 bản
   (màu theo cột Color, chữ/option theo Name Custom) -> Claude QA từng bản -> gen lại tối đa MAX_ATTEMPTS.
-USER RULE: thành phẩm phải Y ẢNH NGUỒN; mọi thứ gắn/đi kèm SP trong ảnh (vd squishy trong giỏ) là 1
-phần của SP -> giữ nguyên; chỉ bỏ cảnh nền, người, tay, SP khác.
+USER RULE: output là FILE IN y hình in trong ảnh nguồn (+ Name Custom), KHÔNG phải ảnh render SP;
+không gồm đồ bên trong SP (vd squishy trong giỏ) và phụ kiện rời (quai, dây, thanh treo).
 """
 import json
 from pathlib import Path
@@ -29,50 +29,54 @@ if the chosen photo shows more than one product.
 Return ONLY {{"front": <label>, "several": false, "product": "<short product type>"}}"""
 
 VISION = (
-    "This photo shows a product (not clothing). Describe it as a precise flat-technical spec so it can "
-    "be redrawn as a flat front-view drawing. Return ONLY JSON: "
-    '{"product":"<type>","shape":"<outline/shape, handles, parts>","base":"<main colour(s)>",'
-    '"print":"<EVERY printed graphic and text with exact content, colours, fonts style and positions>",'
-    '"items":"<EVERY object attached to or included with the product (contents, toys, accessories, '
-    'decorations) with look and position, or none>","effects":"<raised/puffy/embossed/glossy/3D-looking '
-    'parts, or none>"}. '
-    "Colours as words or hex. No prose outside the spec.")
+    "This photo shows a product (not clothing). Describe its PRINTED artwork so it can be redrawn as a "
+    "flat print file. Return ONLY JSON: "
+    '{"product":"<type>","surface":"<the printable surface(s) of the front, e.g. front panel + cuff band, '
+    'and their flat shape>","base":"<base colour(s) of the printed surface>",'
+    '"print":"<EVERY printed graphic and text with exact content, colours, font style and positions on '
+    'that surface>","effects":"<printed elements that look raised/puffy/embossed/glossy/3D, or none>"}. '
+    "Ignore anything placed INSIDE or ON the product that is not printed (contents, toys, fillers, "
+    "plants), and its hardware (handles, ropes, rods, hooks). Colours as words or hex. No prose.")
 
+# USER RULE: output = FILE IN (bề mặt in trải phẳng), KHÔNG phải ảnh SP; bỏ đồ bên trong / phụ kiện rời.
 _ART = (
-    "Reproduce this {product} EXACTLY as in the reference photo, FRONT view, centred on a plain light grey "
-    "background. Same shape and proportions: {shape}. Main colour: {base}. Every printed graphic and text "
-    "in the same place: {print}. Everything attached to or included with the product stays, in the same "
-    "place and look: {items}. Remove ONLY the background scene (room, table, wall, other products), "
-    "people and hands. ")
+    "The PRINT FILE for this {product}: ONLY the printed artwork of its front printable surface "
+    "({surface}), laid out FLAT and straight exactly as it is sent to the printer — like a textile print "
+    "panel filling the frame edge to edge. NO product body/outline in perspective, NO handles, ropes, "
+    "rods or hardware, NO contents or items inside/on the product, NO background scene, NO mockup. Base "
+    "colour {base}. Every printed graphic and text in the same place and proportions as the reference "
+    "photo: {print}. ")
 ART = {
-    "phang": _ART + ("Render it as a 2D FLAT drawing: SOLID FLAT COLOR FILL, crisp clean edges like a "
-                     "technical CAD flat — NO 3D, NO shading, NO highlights, NO shadow, NO texture."),
-    "3d": _ART + ("KEEP the faux-3D look exactly as in the photo: raised/puffy/embossed printed elements, "
-                  "glossy highlights, shading and depth of the graphics and items ({effects}), fabric "
-                  "texture. Straight front view, no perspective distortion, no drop shadow on the "
-                  "background."),
+    "phang": _ART + ("Render it as clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean edges — "
+                     "NO 3D, NO shading, NO highlights, NO texture."),
+    "3d": _ART + ("Reproduce the printed artwork FAITHFULLY as printed in the photo and KEEP its faux-3D "
+                  "look: raised/puffy/embossed shading, glossy highlights, bevels and depth of the printed "
+                  "graphics ({effects}), plus the printed fabric texture. It is still a flat print file, not "
+                  "a photo of the product."),
 }
 VERSIONS = list(ART)
 
-QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated drawing ("art"), version: {version}.
+QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated PRINT FILE ("art"), version: {version}.
 Order: colour {color} | customer options: {opts}.
-The art must look EXACTLY like the reference product (only the background scene, people and hands
-removed), with the customer's text/options applied. Everything attached to or included with the product
-in the reference (contents, toys, accessories) is PART of the product and must be there.
+The art must be the product's printed artwork laid out flat (as sent to the printer) — matching the
+reference print exactly, with the customer's text/options applied. Contents/items inside the product
+and hardware (handles, ropes, rods) must NOT be in it.
 Judge STRICTLY (it goes to production): score 1-10 and error codes from:
- sai_hoa_tiet (printed graphics or attached/included items missing/extra/misplaced/different vs the
- reference), sai_chu (text differs from the customer's text in the options, or misspelled), sai_mau
- (product colour/option colours wrong), sai_kieu (wrong style for the version: {style}), nen_thua
- (background scene, other products, person or hands left in), mo_nhoe (blurry).
+ sai_hoa_tiet (printed graphics missing/extra/misplaced/different vs the reference print), sai_chu (text
+ differs from the customer's text in the options, or misspelled), sai_mau (base/print colours wrong),
+ sai_kieu (wrong style for the version: {style}), khong_phai_file_in (shows the product body in
+ perspective, handles/ropes/hardware, contents inside it, a background scene or mockup instead of a flat
+ print), mo_nhoe (blurry).
 Return ONLY {{"score": 9, "errors": []}}"""
 STYLE = {"phang": "must be completely flat solid colours — any 3D shading/highlight/texture is wrong",
-         "3d": "must keep the raised faux-3D look of the reference — a flat cartoon look is wrong"}
-CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "sai_kieu", "nen_thua", "mo_nhoe"}
-FIX = {"sai_hoa_tiet": "copy EVERY graphic and attached/included item exactly as in the reference",
+         "3d": "must keep the raised faux-3D look of the printed graphics — a flat cartoon look is wrong"}
+CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "sai_kieu", "khong_phai_file_in", "mo_nhoe"}
+FIX = {"sai_hoa_tiet": "copy EVERY printed graphic exactly as in the reference",
        "sai_chu": "use the customer's text EXACTLY, correctly spelled",
        "sai_mau": "use exactly the ordered colours",
        "sai_kieu": "follow the required rendering style strictly",
-       "nen_thua": "plain light grey background only, no scene/other products/people",
+       "khong_phai_file_in": "output ONLY the flat print panel edge to edge — no product body, handles, "
+                             "contents, background or mockup",
        "mo_nhoe": "crisp sharp edges"}
 
 
@@ -157,8 +161,8 @@ def run(rows, srcs, sheet, gdir, log):
     for r in rows:
         d = gdir / f"nc_{r['record_id']}"; d.mkdir(exist_ok=True)
         fields = dict(product=spec.get("product") or pk.get("product") or "product",
-                      shape=spec.get("shape", ""), base=spec.get("base", ""), print=spec.get("print", ""),
-                      items=spec.get("items") or "none", effects=spec.get("effects") or "as in the photo")
+                      surface=spec.get("surface") or "front", base=spec.get("base", ""),
+                      print=spec.get("print", ""), effects=spec.get("effects") or "as in the photo")
         out.append((r, {v: _best_art(r, v, ART[v].format(**fields) + custom_rule(r), inp, d, log)
                         for v in VERSIONS}))
     return out
@@ -173,10 +177,10 @@ def _selfcheck():
     s = custom_rule(r)
     assert "Green" in s and "Knox's" in s and "Black" in s
     assert custom_rule({"color": "", "custom": ""}) == ""
-    f = dict(product="basket", shape="s", base="green", print="p", items="toys", effects="puffy")
+    f = dict(product="basket", surface="front panel", base="green", print="p", effects="puffy")
     assert VERSIONS == ["phang", "3d"]
     assert "FLAT" in ART["phang"].format(**f) and "puffy" in ART["3d"].format(**f)
-    assert all("toys" in ART[v].format(**f) for v in VERSIONS)          # đồ đi kèm SP luôn giữ
+    assert all("PRINT FILE" in ART[v].format(**f) and "NO contents" in ART[v].format(**f) for v in VERSIONS)
     print("nonclothing selfcheck OK")
 
 
