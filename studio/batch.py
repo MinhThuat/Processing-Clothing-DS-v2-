@@ -33,7 +33,8 @@ UA = {"User-Agent": "Mozilla/5.0"}
 _LOGF = None
 
 
-MAX_ATTEMPTS = 4         # gen lại: lần 1-2 y nguyên, lần 3-4 có hint + chọn lại ảnh/crop
+MAX_ATTEMPTS = 3         # gen lại: lần 1 y nguyên, lần 2-3 có hint + chọn lại ảnh/crop
+HINT_FROM = 2            # lần bắt đầu dùng hint (lần y nguyên thứ 2 gần như không cứu được mảnh nào)
 SAME_ERR_STOP = 5        # 5 nhóm liên tiếp lỗi cùng kiểu -> dừng đợt
 _SIZE = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|\d{1,2}XL|\d{1,2}T|\d{1,2}Y|\d{1,2}-\d{1,2}Y?"
                    r"|one ?size|free ?size|\d+(\.\d+)?\s*(x\s*\d+(\.\d+)?)?\s*(in|inch|cm)?)$", re.I)
@@ -147,15 +148,15 @@ def _quota_wait(stop, seconds, sleep=time.sleep):
 def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn):
     """QA + gen lại mảnh lỗi tối đa MAX_ATTEMPTS lần.
       qa_fn(todo) -> {name: {ok, score, errors}}   chấm bản hiện tại của các mảnh
-      regen_fn(todo, attempt, hint)                gen lại (attempt 1..4; hint từ lần 3)
-      rehint_fn({name: errors}) -> hint            gọi 1 lần trước lần 3 (viết hint + chọn lại ảnh/crop)
+      regen_fn(todo, attempt, hint)                gen lại (attempt 1..MAX_ATTEMPTS; hint từ lần HINT_FROM)
+      rehint_fn({name: errors}) -> hint            gọi 1 lần trước lần HINT_FROM (viết hint + chọn lại ảnh/crop)
       keep_fn(name, attempt)                       lưu bản hiện tại để chọn bản tốt nhất
     -> best {name: (attempt, score)}, fails {name: errors} (vẫn lỗi), regen {name: số lần gen lại}."""
     best, last, regen = {}, {}, {}
     todo, hint = list(names), None
     for attempt in range(MAX_ATTEMPTS + 1):
         if attempt:
-            if attempt == 3:
+            if attempt == HINT_FROM:
                 hint = rehint_fn({n: last[n]["errors"] for n in todo})
             regen_fn(list(todo), attempt, hint)
             for n in todo:
@@ -420,8 +421,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         need_art = "art" in todo
 
         def do_pieces():
-            if attempt == 3:
-                # lần 3: vision lại (crop + hint mới, từ rehint_fn) -> có thể đổi loại đồ/tay
+            if attempt == HINT_FROM:
+                # lần đầu có hint: vision lại (crop + hint mới, từ rehint_fn) -> có thể đổi loại đồ/tay
                 # giống-khác -> tên mảnh lệch với bản gốc (USER DECISION: khi lệch thì quay về
                 # mô tả cũ, giữ crop + hint mới).
                 v0 = sdir / "pieces_v0.json"
@@ -430,7 +431,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 old = {n for n in names if n != "art"}
                 if pj.exists() and not _slugs_match(pj, old, group["garment"]):
                     new = _pieces_json_slugs(pj, group["garment"])
-                    log("regen", f"lần 3 vision ra mảnh khác ({sorted(new)} != {sorted(old)})"
+                    log("regen", f"lần {attempt} vision ra mảnh khác ({sorted(new)} != {sorted(old)})"
                                  " -> quay lại mô tả cũ, giữ crop+hint mới")
                     for p in sdir.glob("final_*.png"):
                         if p.stem[len("final_"):] not in old:
@@ -440,7 +441,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     if missing:
                         gen_pieces(only=missing, cache=True)
             else:
-                gen_pieces(only=slugs, cache=True)     # lần 1-2: y nguyên; lần 4: dùng pieces.json hiện tại
+                gen_pieces(only=slugs, cache=True)     # lần 1: y nguyên; lần sau hint: dùng pieces.json hiện tại
 
         if slugs and need_art:
             _run_both([do_pieces, gen_art])            # song song: mảnh (3 luồng) + art = 4 luồng codex
@@ -717,7 +718,7 @@ def _selfcheck():
     assert note_ok("2026-10-16", 6, {"tay_sau": 1}) == "OK 2026-10-16 · 6 mảnh + art · gen lại: tay_sau×1"
     assert note_ok("2026-10-16", 4, {}) == "OK 2026-10-16 · 4 mảnh + art"
     assert note_fail("2026-10-16", {"tay_sau": ["sau_giong_truoc"]}) == \
-        "QA FAIL 2026-10-16 · tay_sau (sau_giong_truoc) sau 4 lần"
+        "QA FAIL 2026-10-16 · tay_sau (sau_giong_truoc) sau 3 lần"
     # dừng: limit đếm nhóm đã gen (skip không tính); 5 lỗi liên tiếp cùng kiểu
     s = Stopper(None, 2)
     s.record("skip"); assert s.reason() is None
@@ -769,12 +770,12 @@ def _selfcheck():
     def keep_fn(n, attempt):
         calls["keep"].append((n, attempt))
     best, fails, regen = improve(["A", "B", "C"], qa_fn, regen_fn, rehint_fn, keep_fn)
+    # tối đa 3 lần: lần 1 y nguyên, lần 2-3 có hint (hint lấy 1 lần trước lần 2)
     assert best == {"A": (0, 9), "B": (3, 8), "C": (1, 6)}
-    assert fails == {"C": ["mo_nhoe"]} and regen == {"B": 3, "C": 4}
+    assert fails == {"C": ["mo_nhoe"]} and regen == {"B": 3, "C": 3}
     assert calls["hint"] == 1
-    assert calls["regen"] == [(("B", "C"), 1, None), (("B", "C"), 2, None), (("B", "C"), 3, "FIX IT"),
-                              (("C",), 4, "FIX IT")]
-    assert ("A", 0) in calls["keep"] and ("C", 4) in calls["keep"]
+    assert calls["regen"] == [(("B", "C"), 1, None), (("B", "C"), 2, "FIX IT"), (("B", "C"), 3, "FIX IT")]
+    assert ("A", 0) in calls["keep"] and ("C", 3) in calls["keep"] and ("C", 4) not in calls["keep"]
     # crop theo bbox 0-1000; bbox quá nhỏ/None -> giữ nguyên ảnh
     import tempfile
     from PIL import Image as _I
