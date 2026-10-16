@@ -696,6 +696,40 @@ def _variant_label(group, sub_rows):
 
 
 LOCATE_TRIES = 3
+_DESIGN_NUM = re.compile(r"design\s*#?\s*(\d+)", re.I)
+
+
+def _check_design_photos(groups, rows, srcs, sheet, log_=None):
+    """Dòng 'Design N': Claude đọc ảnh legend có số (badge 1,2,3...) -> ảnh nào là đúng design N; front
+    pick chọn không nằm trong đó -> đổi sang ảnh đúng (pick hay đoán nhầm: Jogger Design 5 lấy bộ ④,
+    Jumpsuit Design 1 lấy bộ ④, 16/10). Không có legend / không đọc được -> giữ nguyên pick."""
+    want = []
+    for g in groups:
+        sub = [r for r in rows if r["record_id"] in g["record_ids"]]
+        m = _DESIGN_NUM.search(" ".join([g["variant"] or ""] + [r.get("custom") or "" for r in sub]
+                                        + [r["sku"] for r in sub]))
+        if m:
+            want.append((g, int(m.group(1))))
+    if not want:
+        return
+    try:
+        legend = judge.find_legend(sheet, len(srcs))
+    except StepError as e:
+        log("design", f"tìm ảnh legend lỗi: {e}"); return
+    if not legend:
+        log("design", "không có ảnh legend đánh số -> giữ ảnh pick chọn"); return
+    for g, num in want:
+        try:
+            m = judge.match_design(sheet, srcs[legend - 1], num, len(srcs), g.get("garment") or "outfit")
+        except StepError as e:
+            log("design", f"Design {num}: đọc legend lỗi, giữ front={g['front']}: {e}"); continue
+        photos = [p for p in m["photos"] if p != legend]
+        log("design", f"Design {num} = {m['desc']} -> ảnh {photos} (legend {legend}, pick front={g['front']})")
+        if photos and g["front"] not in photos:
+            log("design", f"Design {num}: pick chọn nhầm ảnh {g['front']} -> đổi sang {photos[0]}")
+            g["front"], g["crop"], g["back"], g["back_crop"] = photos[0], None, None, None
+            if g["mode"] == "two":
+                g["mode"] = "combined"     # ảnh mới thường có cả trước + sau; locate/vision tự tách
 
 
 def _locate_groups(groups, rows, srcs, gdir):
@@ -804,6 +838,7 @@ def process_group(g, rundir, day, dry, stats):
             if not dry:
                 lb.write_notes({rid: note_loi(day, "judge (không xác định phiên bản)", prev.get(rid, ""))
                                 for rid in unassigned})
+        _check_design_photos(pick["groups"], rows, srcs, sheet)
         for bad in _locate_groups(pick["groups"], rows, srcs, gdir):
             pick["groups"].remove(bad)
             log("lỗi", f"{bad['variant']}: ảnh chung nhiều biến thể, không định vị được -> không gen")
@@ -932,6 +967,8 @@ def main():
 
 
 def _selfcheck():
+    # selfcheck không được gọi claude thật: bước đọc legend mặc định "không có legend"
+    judge.find_legend = lambda sheet, n: None
     # tên file: bỏ mã lô + size; ký tự cấm -> _
     assert sku_stem("HKH032604A21-Black-2D Hoodie-L-G130426") == "HKH032604A21-Black-2D Hoodie"
     assert sku_stem("VTY022506A07-Christoph Stelzer1-Button Shirt-2XL-J150426") == \
@@ -1469,6 +1506,20 @@ def _selfcheck():
         assert _locate_groups([gA1], rws1, [Path("1.jpg")], Path(tempfile.mkdtemp())) == [gA1]
     finally:
         judge.grid_overlay, judge.locate = orig_go, orig_loc
+    # Design N: pick chọn nhầm ảnh -> đổi sang ảnh legend nói đúng; đúng sẵn -> giữ; không legend -> giữ
+    judge.find_legend = lambda sheet, n: 8
+    judge.match_design = lambda sheet, leg, num, n, garment="outfit": {"desc": "Olaf", "photos": [2, 8]}
+    gD = {"front": 4, "crop": [1, 1, 500, 500], "back": None, "back_crop": None, "mode": "combined",
+          "variant": "Design 1", "garment": "top_bottom", "record_ids": ["d"]}
+    gOK = {**gD, "front": 2, "record_ids": ["e"]}
+    rD = [{"record_id": "d", "sku": "X-Design 1-Jumpsuit", "custom": "Design: Design 1"},
+          {"record_id": "e", "sku": "X-Design 1-Jumpsuit", "custom": "Design: Design 1"}]
+    _check_design_photos([gD, gOK], rD, [Path(f"{i}.jpg") for i in range(1, 12)], Path("s.jpg"))
+    assert gD["front"] == 2 and gD["crop"] is None and gOK["front"] == 2 and gOK["crop"] == [1, 1, 500, 500]
+    judge.find_legend = lambda sheet, n: None
+    gN = {**gD, "front": 4}
+    _check_design_photos([gN], rD[:1], [Path("1.jpg")] * 11, Path("s.jpg"))
+    assert gN["front"] == 4
     print("batch selfcheck OK")
 
 

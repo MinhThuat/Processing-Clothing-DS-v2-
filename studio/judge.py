@@ -327,6 +327,31 @@ whole garment: its front, and its back too if shown side by side with the front.
 Return {{"box": null}} if this variant can't be found in the photo."""
 
 
+FIND_LEGEND = """The contact sheet shows {n} product photos labelled 1..{n}. Is there a photo where the different
+designs are marked with NUMBER badges (1, 2, 3...) on or next to each outfit (a "numbered legend")?
+Return ONLY {{"legend": <label of that photo, or null>}}"""
+
+MATCH_DESIGN = """Image 1 is the numbered legend photo: each outfit is marked with a number badge. Image 2 is a
+contact sheet of all product photos labelled 1..{n}.
+Find the outfit marked with number {num} in image 1 and describe it in a few words (colours, character).
+Then list the contact-sheet labels whose photo shows THAT SAME outfit ({garment}), best FRONT view
+first (photos showing ONLY that outfit, front+back, are best; group/legend photos last).
+Return ONLY {{"desc": "...", "photos": [labels]}} — "photos": [] if none shows it."""
+
+
+def match_design(sheet, legend_src, num, n, garment="outfit"):
+    """'Design N' -> {"desc", "photos": [label...]} theo ảnh legend có số (đọc số thật, không đoán)."""
+    js = ask(MATCH_DESIGN.format(num=num, n=n, garment=garment), [legend_src, sheet])
+    photos = [p for p in (js.get("photos") or []) if isinstance(p, int) and 1 <= p <= n]
+    return {"desc": str(js.get("desc") or "")[:200], "photos": photos}
+
+
+def find_legend(sheet, n):
+    js = ask(FIND_LEGEND.format(n=n), [sheet])
+    v = js.get("legend")
+    return v if isinstance(v, int) and 1 <= v <= n else None
+
+
 LOCATE_PIECE = """The image is {w}x{h} pixels; red grid lines are drawn every 100 px, labelled in pixels
 along the top and left edges. It shows a garment (if a FRONT and a BACK view are side by side, use the
 {view} view). Return ONLY {{"box": [x0,y0,x1,y1]}} as integer PIXEL coordinates tightly covering ONLY
@@ -552,6 +577,16 @@ def _selfcheck():
     finally:
         globals()["ask"] = orig_ask
     assert bp == [70, 170, 630, 830] and "BACK view" in captured["piece"] and "the BACK bodice" in captured["piece"]
+    # match_design: lọc nhãn ảnh ngoài 1..n / không phải số; find_legend: null / ngoài khoảng -> None
+    globals()["ask"] = lambda prompt, images, timeout=300: {"desc": "Olaf", "photos": [2, "x", 99, 8]}
+    try:
+        assert match_design(td / "s.jpg", td / "l.jpg", 1, 11) == {"desc": "Olaf", "photos": [2, 8]}
+        globals()["ask"] = lambda prompt, images, timeout=300: {"legend": 15}
+        assert find_legend(td / "s.jpg", 11) is None
+        globals()["ask"] = lambda prompt, images, timeout=300: {"legend": 8}
+        assert find_legend(td / "s.jpg", 11) == 8
+    finally:
+        globals()["ask"] = orig_ask
     print("judge selfcheck OK")
 
 
