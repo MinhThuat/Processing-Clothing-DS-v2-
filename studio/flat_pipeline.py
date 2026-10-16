@@ -484,15 +484,12 @@ def _pieces_plan(js):
     return plan
 
 def _flatten_white(path):
-    """Mảnh full-bleed phải ĐỤC (nền vải thật). Codex đôi khi trả PNG có nền trắng = trong suốt
-    -> ghép phẳng lên trắng để không bị 'thủng' khi đặt lên mockup tối."""
-    # ponytail: ghép lên TRẮNG (màu vải phổ biến nhất); đồ nền tối hầu như không có vùng trong suốt.
+    """Mảnh full-bleed phải ĐỤC -> bỏ hẳn kênh alpha, GIỮ màu RGB. Codex hay trả PNG có alpha SAI: vẫn tô
+    đúng màu ở RGB nhưng đánh dấu cả vùng vải là (bán) trong suốt; ghép lên trắng theo alpha như trước ra
+    vệt TRẮNG LOANG (lỗi thật: Jogger tay_truoc bản phẳng 16/10 — kể cả điểm alpha=0 vẫn mang màu thiết kế)."""
     im = Image.open(path)
-    if im.mode in ("RGBA", "LA") or "transparency" in im.info:
-        im = im.convert("RGBA")
-        bg = Image.new("RGB", im.size, (255, 255, 255))
-        bg.paste(im, mask=im.split()[-1])
-        bg.save(path)
+    if im.mode != "RGB":
+        im.convert("RGB").save(path)
 
 def _slug_wanted(slug, want):
     """Khớp slug với danh sách chọn (--only). Tay: chọn 'tay_truoc'/'tay_sau' (chung) khớp cả
@@ -537,8 +534,10 @@ def _make_piece(spec, refs, work, out, flat=False):
         cutout(tmp).save(dst)                               # cắt theo silhouette, nền trong suốt
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
+        raw = work / f"raw_{spec['slug']}.png"            # giữ bản gốc model trả (soi lỗi vùng trong suốt)
         gen_panel(tpl.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]), desc=spec["desc"])
-                  + note, [crop or ref, *ctx], dst)
+                  + note, [crop or ref, *ctx], raw)
+        Image.open(raw).save(dst)
         _flatten_white(dst)                                 # full-bleed: đục, nền vải trắng
     return dst
 
@@ -614,13 +613,19 @@ def _run(cmd, timeout):
         raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"rc={p.returncode}")
 
 def _chatgpt_gen(prompt, refs, out, timeout=420):
-    cmd = _launcher(CHATGPT_BIN) + [CHATGPT_BIN, prompt, "-o", str(out), "--size", "auto",
-           "--backend", "codex", "--quiet"]
+    # xin JPEG (không có kênh trong suốt) rồi lưu PNG: PNG để model tự chọn nền trong suốt -> nó đánh dấu
+    # nhầm vùng vải trơn là trong suốt + vẽ viền tối loang (vignette) ở đó (lỗi thật: Jogger tay_truoc 16/10)
+    tmp = Path(out).with_name(Path(out).stem + "_gen.jpg")
+    tmp.unlink(missing_ok=True)
+    cmd = _launcher(CHATGPT_BIN) + [CHATGPT_BIN, prompt, "-o", str(tmp), "--size", "auto",
+           "--backend", "codex", "--quiet", "--format", "jpeg"]
     for r in refs:
         cmd += ["-i", str(r)]
     _run(cmd, timeout)
-    if not Path(out).exists():
+    if not tmp.exists():
         raise RuntimeError("chatgpt-imagegen không tạo file")
+    Image.open(tmp).convert("RGB").save(out)
+    tmp.unlink(missing_ok=True)
     return out
 
 def _openart_gen(prompt, refs, out, timeout=300):
@@ -888,10 +893,10 @@ def _selfcheck():
     cp = Path(tempfile.mktemp(suffix=".png")); im2.save(cp)
     co = cutout(cp)
     assert co.mode == "RGBA" and co.width < 60 and co.height < 60
-    # flatten: PNG trong suốt -> đục nền trắng (mảnh full-bleed không bị thủng)
+    # flatten: PNG có alpha -> RGB đục, GIỮ màu dưới alpha (không loang trắng)
     q = Path(tempfile.mktemp(suffix=".png")); Image.new("RGBA", (4, 4), (10, 20, 30, 0)).save(q)
     _flatten_white(q)
-    assert Image.open(q).convert("RGB").getpixel((0, 0)) == (255, 255, 255)
+    assert Image.open(q).mode == "RGB" and Image.open(q).getpixel((0, 0)) == (10, 20, 30)
     # --only: chọn tay chung khớp cả biến thể trái/phải; không lẫn sang áo/quần
     assert _slug_wanted("tay_trai_truoc", {"tay_truoc"}) and _slug_wanted("tay_phai_sau", {"tay_sau"})
     assert not _slug_wanted("tay_trai_sau", {"tay_truoc"})
