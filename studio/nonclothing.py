@@ -19,6 +19,7 @@ from batch_errors import StepError, raise_for
 
 MAX_ATTEMPTS = 3
 QA_MIN = 8
+QA_TILE = 768
 
 PICK = """The contact sheet shows {n} product photos of ONE listing (not clothing), labelled 1..{n}.
 Order rows: {rows}.
@@ -58,25 +59,34 @@ VERSIONS = list(ART)
 
 QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated PRINT FILE ("art"), version: {version}.
 Order: colour {color} | customer options: {opts}.
+(List numbering like "1." "2." in the options only separates several names: the names go together in
+the ONE design, e.g. "James / Ellie", WITHOUT the numbers — that is correct, not sai_chu.)
 The art must be the product's printed artwork laid out flat (as sent to the printer) — matching the
 reference print exactly, with the customer's text/options applied. Contents/items inside the product
 and hardware (handles, ropes, rods) must NOT be in it.
 Judge STRICTLY (it goes to production): score 1-10 and error codes from:
  sai_hoa_tiet (printed graphics missing/extra/misplaced/different vs the reference print), sai_chu (text
  differs from the customer's text in the options, or misspelled), sai_mau (base/print colours wrong),
- sai_kieu (wrong style for the version: {style}), khong_phai_file_in (shows the product body in
- perspective, handles/ropes/hardware, contents inside it, a background scene or mockup instead of a flat
- print), mo_nhoe (blurry).
+ sai_kieu (wrong style for the version: {style}), sai_bo_cuc (text or graphics laid out differently from
+ the reference print: different relative size, position, line breaks or font style; list numbers like
+ "1." printed), khong_phai_file_in (shows the product body in perspective, handles/ropes/hardware,
+ contents inside it, a background scene or mockup, white margins/borders or a drop shadow instead of a
+ flat print filling the frame), mo_nhoe (blurry).
 Return ONLY {{"score": 9, "errors": []}}"""
-STYLE = {"phang": "must be completely flat solid colours — any 3D shading/highlight/texture is wrong",
-         "3d": "must keep the raised faux-3D look of the printed graphics — a flat cartoon look is wrong"}
-CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "sai_kieu", "khong_phai_file_in", "mo_nhoe"}
+STYLE = {"phang": "must be completely flat solid colours — ANY shading, gradient, highlight, glow, bevel "
+                  "or texture on ANY graphic (even subtle) is wrong",
+         "3d": "must reproduce the printed graphics faithfully with their raised faux-3D look, shading and "
+               "texture as in the reference — a flat cartoon look is wrong when the reference print has "
+               "3D/raised effects; if the reference print itself is flat, a faithful copy is correct"}
+CODES = {"sai_hoa_tiet", "sai_chu", "sai_mau", "sai_kieu", "sai_bo_cuc", "khong_phai_file_in", "mo_nhoe"}
 FIX = {"sai_hoa_tiet": "copy EVERY printed graphic exactly as in the reference",
        "sai_chu": "use the customer's text EXACTLY, correctly spelled",
        "sai_mau": "use exactly the ordered colours",
        "sai_kieu": "follow the required rendering style strictly",
-       "khong_phai_file_in": "output ONLY the flat print panel edge to edge — no product body, handles, "
-                             "contents, background or mockup",
+       "sai_bo_cuc": "keep the text and graphics at the same relative size, position, line breaks and "
+                     "font style as the reference print; no list numbers",
+       "khong_phai_file_in": "output ONLY the flat print panel filling the frame edge to edge — no "
+                             "product body, handles, contents, background, margins, shadow or mockup",
        "mo_nhoe": "crisp sharp edges"}
 
 
@@ -86,7 +96,9 @@ def custom_rule(row):
     opts = judge._opts(row.get("custom"))
     if opts != "-":
         s += (f" Apply the customer's personalisation: {opts}. Replace any sample name/text in the "
-              "design with the customer's text exactly as given (same font style and position).")
+              "design with the customer's text exactly as given (same font style and position). List "
+              "numbering like '1.' '2.' only separates several names — put all the names in this ONE "
+              "design but do NOT print the numbers.")
     return s
 
 
@@ -96,6 +108,14 @@ def norm_qa(js):
     return {"ok": not errs and score >= QA_MIN, "score": float(score), "errors": errs}
 
 
+def _trim_white(path, thr=245):
+    """Cắt viền gần-trắng (>= thr) quanh hình in. Toàn trắng -> giữ nguyên."""
+    im = Image.open(path).convert("RGB")
+    box = im.convert("L").point(lambda v: 255 if v < thr else 0).getbbox()
+    if box and box != (0, 0, *im.size):
+        im.crop(box).save(path)
+
+
 def _gen(prompt, ref, out):
     """gen_panel trong tiến trình; lỗi -> AuthError/QuotaError/StepError('gen') như luồng clothing."""
     try:
@@ -103,6 +123,7 @@ def _gen(prompt, ref, out):
     except Exception as e:
         raise_for(str(e), "gen")
     fp._flatten_white(out)      # codex đôi khi trả PNG nền trong suốt -> nền trắng đục (như mảnh clothing)
+    _trim_white(out)            # file in phải tràn khung: cắt dải trắng thừa model hay chừa ở mép
 
 
 def _input(rows, srcs, sheet, gdir, log):
@@ -133,7 +154,9 @@ def _best_art(r, version, prompt, inp, d, log):
             _gen(prompt + fix, inp, art)
         except StepError as e:
             log("nc", f"{r['record_id']} {version} lần {k}: lỗi gen {e}"); continue
-        qs = judge.contact_sheet([[(inp, "REF"), (art, f"art {version}")]], d / f"sheet_qa_{version}_{k}.jpg")
+        # ô lớn (QA_TILE) để Claude thấy bóng/gradient nhỏ trên bản phẳng — ô 384px mặc định bỏ sót
+        qs = judge.contact_sheet([[(inp, "REF"), (art, f"art {version}")]], d / f"sheet_qa_{version}_{k}.jpg",
+                                 tile=QA_TILE)
         q = norm_qa(judge.ask(QA.format(version=version, style=STYLE[version],
                                         color=r["color"] or "as in reference",
                                         opts=judge._opts(r.get("custom"))), [qs]))
@@ -175,12 +198,17 @@ def _selfcheck():
     assert not norm_qa(None)["ok"]
     r = {"color": "Green", "custom": "• Enter Name: Knox's\n• Choose Name Color: Black"}
     s = custom_rule(r)
-    assert "Green" in s and "Knox's" in s and "Black" in s
+    assert "Green" in s and "Knox's" in s and "Black" in s and "do NOT print the numbers" in s
     assert custom_rule({"color": "", "custom": ""}) == ""
     f = dict(product="basket", surface="front panel", base="green", print="p", effects="puffy")
     assert VERSIONS == ["phang", "3d"]
     assert "FLAT" in ART["phang"].format(**f) and "puffy" in ART["3d"].format(**f)
     assert all("PRINT FILE" in ART[v].format(**f) and "NO contents" in ART[v].format(**f) for v in VERSIONS)
+    import tempfile
+    t = Path(tempfile.mkdtemp()) / "t.png"
+    im = Image.new("RGB", (100, 80), "white"); im.paste((0, 128, 0), (10, 20, 90, 80)); im.save(t)
+    _trim_white(t); assert Image.open(t).size == (80, 60)
+    Image.new("RGB", (50, 50), "white").save(t); _trim_white(t); assert Image.open(t).size == (50, 50)
     print("nonclothing selfcheck OK")
 
 
