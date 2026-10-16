@@ -249,7 +249,11 @@ def _codex_vision(content, timeout=240):
         mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
         ld.exec_module(mod)
         _CIG = mod                          # gán SAU khi nạp xong: luồng song song không thấy module dở
-    access, account, _ = _CIG._extract_access_token(_CIG._load_auth())
+    try:
+        auth = _CIG._load_auth()
+    except SystemExit as e:                 # chatgpt-imagegen sys.exit khi chưa login -> để _vision fallback dola
+        raise RuntimeError(f"codex chưa đăng nhập: {e}")
+    access, account, _ = _CIG._extract_access_token(auth)
     if not access:
         raise RuntimeError("codex chưa đăng nhập")
     # ponytail: không tự refresh token hết hạn; bước gen (chatgpt-imagegen) tự refresh rồi lần sau chạy được
@@ -622,6 +626,7 @@ def _openart_gen(prompt, refs, out, timeout=300):
 def gen_panel(prompt, refs, out):
     """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt Seedream 4.5."""
     prompt = prompt + _prompt_extra()
+    Path(out).unlink(missing_ok=True)       # tool trả rc=0 mà không ghi file -> không nhận nhầm file lần trước
     try:
         log("gen", "  → thử chatgpt-imagegen (codex) ...")
         r = _chatgpt_gen(prompt, refs, out)

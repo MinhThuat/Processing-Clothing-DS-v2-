@@ -69,9 +69,26 @@ def piece_filename(sku, slug, failed=False):
 
 
 # ---------- hàng đợi ----------
-def needs_work(row):
+LOI_MAX = 2     # dòng LỖI cùng ngày: thử tối đa 2 lượt rồi thôi (cron chạy mỗi giờ -> khỏi đốt hạn mức)
+_LOI_N = re.compile(r"\(lần (\d+)\)\s*$")
+
+
+def note_loi(day, kind, prev=""):
+    """Note LỖI kèm số lượt thử trong ngày: 'LỖI <day>: <kind> (lần n)' (n tăng nếu note cũ cùng ngày)."""
+    n = 1
+    if (prev or "").startswith(f"LỖI {day}"):
+        m = _LOI_N.search(prev)
+        n = (int(m.group(1)) if m else 1) + 1
+    return f"LỖI {day}: {kind} (lần {n})"
+
+
+def needs_work(row, day=None):
     """Dòng (đã qua view No File) có gắn tag GEN, chưa có ảnh Flat Pieces, có link. Dòng note SKIP cũ
     (SP không phải quần áo, trước đây bỏ qua) nay vẫn làm: đi nhánh art phẳng (nonclothing.py)."""
+    if day and row["note"].startswith(f"LỖI {day}"):
+        m = _LOI_N.search(row["note"])
+        if (int(m.group(1)) if m else 1) >= LOI_MAX:
+            return False
     return row.get("gen", False) and not row["has_pieces"] and bool(row["links"])
 
 
@@ -80,7 +97,7 @@ def build_queue(rows, day):
     (lb._query) -> không lọc lại theo Create Date (view No File có thể chứa dòng tạo hôm trước)."""
     groups = {}
     for r in rows:
-        if needs_work(r):
+        if needs_work(r, day):
             groups.setdefault(tuple(r["links"]), []).append(r)
     out = [{"links": list(k), "rows": v, "newest": max(x["created"] for x in v)} for k, v in groups.items()]
     out.sort(key=lambda g: g["newest"], reverse=True)
@@ -526,7 +543,9 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     for p in sdir.glob("final_*.png"):
                         if p.stem[len("final_"):] not in old:
                             p.unlink(missing_ok=True)
-                    shutil.copyfile(v0, pj)
+                    js0 = json.loads(v0.read_text(encoding="utf-8"))
+                    js0.pop("boxes", None)       # box v0 tính trên ảnh CŨ, ảnh đầu vào đã đổi -> gen từ ảnh nguyên
+                    pj.write_text(json.dumps(js0, ensure_ascii=False), encoding="utf-8")
                     missing = [x for x in slugs if not piece_path(x).exists()]
                     if missing:
                         gen_pieces(only=missing, cache=True)
@@ -653,7 +672,9 @@ def _variant_label(group, sub_rows):
 def _locate_groups(groups, rows, srcs, gdir):
     """Với mỗi nhóm cần định vị (`_needs_locate`): dựng gdir/grid_<front>.jpg (ảnh gốc + lưới 0-1000,
     dùng chung cho các nhóm cùng front) rồi hỏi Claude khoanh CHÍNH XÁC vùng của biến thể đó -> cập
-    nhật group['crop']. Không tìm thấy / judge lỗi -> giữ crop cũ, không phá nhóm/đợt."""
+    nhật group['crop']. Không tìm thấy / judge lỗi -> giữ crop cũ. -> list nhóm KHÔNG thể gen: front
+    dùng chung với nhóm khác (ảnh nhiều biến thể) mà vẫn không có crop -> gen cả ảnh sẽ tả nhầm biến thể."""
+    failed = []
     front_counts = Counter(g["front"] for g in groups)
     grids = {}
     for group in groups:
@@ -670,13 +691,16 @@ def _locate_groups(groups, rows, srcs, gdir):
             box = judge.locate(grids[front], _variant_label(group, sub_rows), skus, kid)
         except StepError as e:
             log("locate", f"{group['variant']}/{group['color']}: lỗi, giữ crop cũ: {e}")
-            continue
+            box = None
         if box:
             group["crop"] = box
             log("locate", f"{group['variant']}/{group['color']}: crop={box}")
         else:
             log("locate", f"{group['variant']}/{group['color']}: không định vị được, giữ crop cũ "
                           f"{group['crop']}")
+            if group["crop"] is None and front_counts[front] > 1:
+                failed.append(group)
+    return failed
 
 
 # ---------- 1 nhóm ----------
@@ -715,7 +739,11 @@ def process_group(g, rundir, day, dry, stats):
     """-> None (gen xong), 'skip', hoặc kind của StepError. QuotaError/AuthError ném tiếp lên main."""
     gid = group_id(g)
     gdir = rundir / gid; gdir.mkdir(parents=True, exist_ok=True)
-    rows, deadline, done_ids = g["rows"], time.monotonic() + GROUP_TIMEOUT, set()
+    # done_ids lưu trong g: chờ hạn mức xong main gọi lại nhóm này -> chỉ làm các dòng CHƯA up
+    done_ids = g.setdefault("done", set())
+    rows, deadline = [r for r in g["rows"] if r["record_id"] not in done_ids], time.monotonic() + GROUP_TIMEOUT
+    if not rows:
+        return None
     log("group", f"=== {gid} · {len(rows)} dòng · {len(g['links'])} link · {g['newest'][:10]} ===")
     try:
         srcs = []
@@ -737,11 +765,18 @@ def process_group(g, rundir, day, dry, stats):
         if unassigned:
             # Claude bỏ sót / nhóm front sai -> KHÔNG đoán dồn vào nhóm khác (sai biến thể/màu) ->
             # ghi LỖI riêng cho đúng các dòng đó, vẫn xử lý tiếp các nhóm hợp lệ còn lại bên dưới.
-            note = f"LỖI {day}: judge (không xác định phiên bản)"
             log("lỗi", f"unassigned (judge không xác định được): {unassigned}")
+            prev = {r["record_id"]: r.get("note", "") for r in rows}
             if not dry:
-                lb.write_notes({rid: note for rid in unassigned})
-        _locate_groups(pick["groups"], rows, srcs, gdir)
+                lb.write_notes({rid: note_loi(day, "judge (không xác định phiên bản)", prev.get(rid, ""))
+                                for rid in unassigned})
+        for bad in _locate_groups(pick["groups"], rows, srcs, gdir):
+            pick["groups"].remove(bad)
+            log("lỗi", f"{bad['variant']}: ảnh chung nhiều biến thể, không định vị được -> không gen")
+            prev = {r["record_id"]: r.get("note", "") for r in rows}
+            if not dry:
+                lb.write_notes({rid: note_loi(day, "không định vị được phiên bản", prev.get(rid, ""))
+                                for rid in bad["record_ids"]})
         (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
         log("pick", "; ".join(f"{g['variant']}/{g['color']}: front={g['front']} back={g['back']} "
                               f"mode={g['mode']}" for g in pick["groups"]))
@@ -759,7 +794,7 @@ def process_group(g, rundir, day, dry, stats):
         kind = e.kind if isinstance(e, StepError) else "lỗi khác"
         log("lỗi", f"{gid}: {e}" + ("" if isinstance(e, StepError) else "\n" + traceback.format_exc()))
         stats["loi"] += 1
-        left = {r["record_id"]: f"LỖI {day}: {kind}" for r in rows if r["record_id"] not in done_ids}
+        left = {r["record_id"]: note_loi(day, kind, r.get("note", "")) for r in rows if r["record_id"] not in done_ids}
         if left and not dry:
             try:
                 lb.write_notes(left)
@@ -1298,7 +1333,7 @@ def _selfcheck():
         kind = process_group(g_pg, Path(tempfile.mkdtemp()), "2026-10-16", False, stats_pg)
         assert kind is None
         assert calls_pg["subgroup"] == [["a", "b"]]             # "z" không lọt vào nhóm nào
-        assert calls_pg["write"] == [{"z": "LỖI 2026-10-16: judge (không xác định phiên bản)"}]
+        assert calls_pg["write"] == [{"z": "LỖI 2026-10-16: judge (không xác định phiên bản) (lần 1)"}]
     finally:
         globals()["download"] = orig_download
         judge.pick, judge.contact_sheet = orig_pick, orig_sheet
@@ -1347,7 +1382,8 @@ def _selfcheck():
         assert sorted(calls_pg2["locate"]) == [("Design 2", "S-a-Tee-L-G1", False),
                                                ("Design 3", "S-b-Tee-4T-G1", True)]
         assert calls_pg2["subgroup_crop"]["Design 2"] == [100, 100, 600, 600]  # định vị được -> cập nhật crop
-        assert calls_pg2["subgroup_crop"]["Design 3"] is None                 # không định vị được -> giữ cũ
+        # ảnh chung nhiều biến thể mà không định vị được -> KHÔNG gen (gen cả ảnh sẽ tả nhầm design khác)
+        assert "Design 3" not in calls_pg2["subgroup_crop"]
     finally:
         globals()["download"] = orig_download
         judge.pick, judge.contact_sheet = orig_pick, orig_sheet
@@ -1374,6 +1410,26 @@ def _selfcheck():
     assert ups[1][0] == ["X-Basket_art_phang.png", "X-Basket_art_3d_QAFAIL.png"]
     assert ups[1][1]["n2"] == "QA FAIL 2026-10-16 · art_3d (sai_chu) sau 3 lần"
     assert st["qafail"] == 1 and st["ok"] == 0
+    # LỖI cùng ngày: đếm lượt, quá LOI_MAX thì thôi (cron mỗi giờ không đốt hạn mức mãi)
+    assert note_loi("2026-10-16", "tải ảnh") == "LỖI 2026-10-16: tải ảnh (lần 1)"
+    assert note_loi("2026-10-16", "gen", "LỖI 2026-10-16: tải ảnh (lần 1)") == "LỖI 2026-10-16: gen (lần 2)"
+    assert note_loi("2026-10-16", "gen", "LỖI 2026-10-16: gen") == "LỖI 2026-10-16: gen (lần 2)"
+    assert note_loi("2026-10-16", "gen", "LỖI 2026-10-15: gen (lần 5)") == "LỖI 2026-10-16: gen (lần 1)"
+    base_r = {"gen": True, "has_pieces": False, "links": ["u"]}
+    assert needs_work({**base_r, "note": "LỖI 2026-10-16: gen (lần 1)"}, "2026-10-16")
+    assert not needs_work({**base_r, "note": "LỖI 2026-10-16: gen (lần 2)"}, "2026-10-16")
+    assert needs_work({**base_r, "note": "LỖI 2026-10-15: gen (lần 2)"}, "2026-10-16")
+    # locate thất bại trên ảnh chung nhiều biến thể -> nhóm đó bị loại (không gen cả ảnh)
+    orig_go, orig_loc = judge.grid_overlay, judge.locate
+    judge.grid_overlay, judge.locate = (lambda src, out, **k: out), (lambda *a, **k: None)
+    try:
+        gA = {"front": 1, "crop": None, "variant": "Design 1", "color": "x", "record_ids": ["a"]}
+        gB = {"front": 1, "crop": None, "variant": "Design 2", "color": "x", "record_ids": ["b"]}
+        gC = {"front": 2, "crop": None, "variant": "default", "color": "x", "record_ids": ["c"]}
+        rws = [{"record_id": k, "sku": "S-Tee-M", "custom": ""} for k in "abc"]
+        assert _locate_groups([gA, gB, gC], rws, [Path("1.jpg"), Path("2.jpg")], Path(tempfile.mkdtemp())) == [gA, gB]
+    finally:
+        judge.grid_overlay, judge.locate = orig_go, orig_loc
     print("batch selfcheck OK")
 
 

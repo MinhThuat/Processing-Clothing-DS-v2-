@@ -183,8 +183,8 @@ def run(rows, srcs, sheet, gdir, log):
         inp, pk = _input(r, srcs, sheet, d, log)
         try:
             spec, m = fp._vision(client, inp, VISION, need=("product", "print"))
-        except SystemExit as e:                 # _vision hết model -> sys.exit
-            raise StepError("vision", str(e))
+        except SystemExit as e:                 # _vision hết model -> sys.exit; hết login/quota -> dừng đợt
+            raise_for(str(e), "vision")
         (d / "nc_vision.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
         fields = dict(product=spec.get("product") or pk.get("product") or "product",
                       surface=spec.get("surface") or "front", base=spec.get("base", ""),

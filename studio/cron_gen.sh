@@ -5,8 +5,12 @@
 # batch.py tự khoá (batch.lock): lượt trước chưa xong thì lượt này tự thoát, không chạy chồng.
 # Log theo dõi: flat_studio_data/cron_gen.log (mỗi lượt 1 khối, kèm output batch).
 cd "$(dirname "$0")" || exit 1
-export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# node bản mới nhất của nvm (claude, lark-cli, codex nằm ở đó) — không ghi cứng số phiên bản
+NODE_BIN=$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)
+export PATH="$NODE_BIN:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 LOG=../flat_studio_data/cron_gen.log
+# log > 5MB -> đổi sang cron_gen.log.1 (giữ 1 bản cũ)
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 5000000 ] && mv -f "$LOG" "$LOG.1"
 now=$(date +%H%M)
 {
   echo "=== $(date '+%F %T') [${1:-cron}] ==="
