@@ -298,7 +298,9 @@ _PIECES_SCHEMA = (
     "top_*/pants_* = the TORSO/BODY resp. LEGS panel (top EXCLUDES sleeves, hood, collar). "
     "sl_front/sl_back = the LEFT sleeve's front-facing / back-facing print; sr_front/sr_back = the RIGHT "
     "sleeve's. sleeves_same = true if both sleeves carry the SAME print (then sr_* may repeat sl_*), "
-    "false if the two sleeves clearly differ.")
+    "false if the two sleeves clearly differ. "
+    "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
+    "PRINT: describe them as artwork on the panel, never as bare skin or an opening.")
 _PIECES_INTRO = {
     "infer": ("This photo shows the FRONT of a person's outfit. " + _PIECES_SCHEMA +
               " Only the front is visible: INFER each *_back / *_sau panel from the front — keep the same "
@@ -409,7 +411,9 @@ OUTFIT_PROMPT = (
     "zipper, hood, collar, sleeve prints, cuffs. "
     "bottom.desc = the lower garment (or skirt): type, base colour, and every visible front detail — "
     "knee patches, side stripes, pockets, waistband, hems. "
-    "Colours as words or hex. Be specific and positional; no prose outside the spec.")
+    "Colours as words or hex. Be specific and positional; no prose outside the spec. "
+    "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
+    "PRINT: describe them as artwork on the panel, never as bare skin or an opening.")
 
 def seed_outfit(client, img):
     w, h = Image.open(img).size
@@ -646,6 +650,8 @@ def _selfcheck():
     for src in ("infer", "two", "combined"):
         pr = _PIECES_INTRO[src]
         assert '"type"' in pr and "top_back" in pr and "bodice_back" in pr, src
+        assert "never as bare skin or an opening" in pr, src     # hình cơ thể in = họa tiết, không phải da thật
+    assert "never as bare skin or an opening" in OUTFIT_PROMPT
     # plan: váy -> 4 mảnh; tay giống -> 6 (tay_truoc/sau); tay khác -> 8 (trái/phải × trước/sau)
     d = _pieces_plan({"type": "dress", "bodice_front": "base a", "bodice_back": "b",
                       "skirt_front": "c", "skirt_back": "d"})

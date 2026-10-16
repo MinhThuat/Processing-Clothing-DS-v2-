@@ -96,6 +96,17 @@ def _box(b):
     return [int(v) for v in b] if ok else None
 
 
+_BULLET = re.compile(r"^[•\-\*]\s*")
+
+
+def _opts(custom):
+    """'Name Custom' (nhiều dòng/bullet) -> 1 dòng ngắn cho prompt, hoặc '-' nếu rỗng."""
+    if not custom:
+        return "-"
+    parts = [_BULLET.sub("", p.strip()) for p in custom.split("\n") if p.strip()]
+    return " / ".join(parts) if parts else "-"
+
+
 def norm_pick(js, rows, n):
     if js.get("skip"):
         return {"skip": str(js["skip"])[:150]}
@@ -127,8 +138,13 @@ def norm_pick(js, rows, n):
         else:
             colors.append({"color": "photo", "matches_photo": True, "record_ids": rest})
     crop = None if mode == "combined" else _box(js.get("crop"))   # combined = ảnh ghép 2 mặt -> bbox
+    manual = {}                                                   # customisation không gen được -> ghi Note
+    for rid, note in (js.get("manual") or {}).items():
+        note = str(note)[:120]
+        if rid in ids and note:
+            manual[rid] = note
     return {"skip": None, "front": front, "back": back, "mode": mode,    # từ contact sheet thu nhỏ, không
-            "crop": crop, "colors": colors}                              # đáng tin -> không cắt
+            "crop": crop, "colors": colors, "manual": manual}            # đáng tin -> không cắt
 
 
 def norm_qa(js, names):
@@ -144,15 +160,18 @@ def norm_qa(js, names):
 
 # ---------- 3 câu hỏi ----------
 PICK = """The contact sheet shows {n} product photos of ONE listing, labelled 1..{n}.
-Order rows that use these photos (record_id | SKU Design | Color column):
+Order rows that use these photos (record_id | SKU Design | Color | customer options):
 {rows}
 
+Realistic body parts depicted ON the garment (muscles, abs, chest, skin, tattoos, faces) are part of
+the PRINT, not real skin.
 1. Is the product a GARMENT / APPAREL item (t-shirt, shirt, hoodie, dress, skirt, pants, jogger, jersey,
 jumpsuit, pajamas, athletic set, kids clothing...)? If NOT (magnet, plaque, vase, mug, tumbler, decor,
 cap, guest book, patch, accessory...) return {{"skip": "<short reason with the product type>"}}.
 2. Otherwise choose inputs for a flat sewing-pattern generator:
- - "front": label of the clearest photo of the FRONT of the whole garment (sharp, uncropped, least
-   occluded; prefer real worn/flat photos over size charts, text banners or close-ups).
+ - "front": label of the clearest photo of the FRONT of the whole garment. PREFER a clean flat /
+   ghost-mannequin product image of the garment (front, and back if shown) over a lifestyle photo of
+   a person wearing it; fall back to a lifestyle photo only if no flat/ghost-mannequin shot exists.
  - "back": label of a photo of the real BACK of the SAME garment, or null.
  - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows the
    front and back side by side (then back = null); otherwise "infer".
@@ -163,17 +182,27 @@ cap, guest book, patch, accessory...) return {{"skip": "<short reason with the p
    SKU Design / Color; personal names, sizes and design numbers are NOT colours; a row without a colour
    uses the photo colour. Each item {{"color": "<colour words, or 'photo'>", "matches_photo": true|false,
    "record_ids": [...]}}; every record_id exactly once.
-Return ONLY: {{"skip": null, "front": 1, "back": null, "mode": "infer", "crop": null, "colors": [...]}}"""
+ - If several design variants appear among the photos (e.g. a men's and a women's version), pick the
+   front/back from the variant that the most rows' customer options asked for.
+ - "manual": {{"record_id": "<short Vietnamese note of the customer options the generated file will NOT
+   match, e.g. 'design Women', 'skin tone S3', 'tên: Anna', 'ảnh khách'>"}} — include only rows with
+   such unmet customer options (a skin tone code, a name, a customer photo, a design variant different
+   from the chosen photo); omit rows with no such options.
+Return ONLY: {{"skip": null, "front": 1, "back": null, "mode": "infer", "crop": null, "colors": [...],
+"manual": {{}}}}"""
 
 QA = """Top row = {n_refs} REFERENCE photo(s) of the real garment. Other tiles = generated flat pieces,
 label = piece name. Required base fabric colour: {colour}.
+Realistic body parts depicted ON the garment (muscles, abs, chest, skin, tattoos, faces) are part of
+the PRINT, not real skin.
 Pieces: {names}. Suffix _truoc = FRONT panel, _sau = BACK panel; ao = torso, quan = pants, tay = sleeve,
 than = dress bodice, ta = dress skirt; "art" = one flat technical drawing of the whole outfit (front).
 Judge every piece against the reference: ok (true only if usable as a production print file),
 score 1-10, errors = codes from:
  mo_nhoe (blurry/smeared/noisy), sai_mau (base or print colour differs from reference / required colour),
  sau_giong_truoc (a BACK piece copies front-only graphics: chest print, logo, badge, zipper, buttons),
- sai_hoa_tiet (artwork missing/extra/misplaced vs reference), sai_manh (contains other parts: sleeves or
+ sai_hoa_tiet (artwork missing/extra/misplaced vs reference; a piece that replaces a printed
+ body/skin illusion with a pattern is sai_hoa_tiet), sai_manh (contains other parts: sleeves or
  hood on a torso piece, a person, hanger, mockup), khong_tran (torso/pants/sleeve piece not full-bleed:
  margins, border or garment outline visible), vung_den (plain areas filled black/void/glow),
  cat_loi (dress cut-out broken / missing corners), art_thieu (art misses front details or wrong
@@ -192,7 +221,8 @@ Return ONLY: {{"hint": "...", "front": 1, "crop": null}}"""
 
 
 def pick(sheet, rows, n):
-    lines = "\n".join(f"{r['record_id']} | {r['sku']} | {r['color'] or '-'}" for r in rows)
+    lines = "\n".join(f"{r['record_id']} | {r['sku']} | {r['color'] or '-'} | {_opts(r.get('custom'))}"
+                      for r in rows)
     return norm_pick(ask(PICK.format(n=n, rows=lines), [sheet]), rows, n)
 
 
@@ -236,6 +266,22 @@ def _selfcheck():
     p2 = norm_pick({"skip": None, "front": 1, "back": None, "mode": "combined",
                     "crop": [390, 50, 760, 400], "colors": []}, rows_, 5)
     assert p2["mode"] == "combined" and p2["crop"] is None
+    # manual: lọc record_id lạ, giá trị rỗng; skip thì không có key "manual"
+    assert p["manual"] == {}                              # không truyền "manual" -> {}
+    p3 = norm_pick({"skip": None, "front": 1, "back": None, "mode": "infer", "crop": None, "colors": [],
+                    "manual": {"r1": "design Women", "zz": "unknown rid", "r2": "", "r3": "x" * 200}},
+                   rows_, 5)
+    assert p3["manual"] == {"r1": "design Women", "r3": "x" * 120}   # zz bỏ (lạ), r2 bỏ (rỗng), r3 cắt 120
+    assert "manual" not in norm_pick({"skip": "Magnet"}, rows_, 5)
+    # _opts: gộp 'Name Custom' nhiều dòng/bullet thành 1 dòng cho prompt
+    assert _opts("") == "-" and _opts(None) == "-"
+    assert _opts("• Choose design: Men\n• Choose skin tone: S3") == \
+        "Choose design: Men / Choose skin tone: S3"
+    # prompt: phải nhắc hình cơ thể in = họa tiết, ưu tiên ảnh phẳng, có key "manual"
+    for p_txt in (PICK, QA):
+        assert "not real skin" in p_txt
+    assert "ghost-mannequin" in PICK and '"manual"' in PICK
+    assert "sai_hoa_tiet" in QA and "printed body/skin illusion" in " ".join(QA.split())
     # _box: vùng cắt quá nhỏ (< 20% diện tích 1000x1000) -> bỏ, tránh cắt lọt vào giữa 2 người
     assert _box([390, 50, 760, 400]) is None                 # area 129,500 < 200,000
     assert _box([100, 100, 700, 900]) == [100, 100, 700, 900]  # area 480,000 -> giữ

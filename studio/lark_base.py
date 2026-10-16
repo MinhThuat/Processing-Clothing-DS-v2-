@@ -16,7 +16,7 @@ VIEW = "vew0cgQ2cZ"             # 1. DS Order
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
 F_NOTE = "fldGVXw4ph"           # Flat Note (text)
 N_LINKS = 20
-FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note"]
+FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note", "Name Custom"]
           + [f"Link {i}" for i in range(1, N_LINKS + 1)])
 _MD = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
 _URL = re.compile(r"https?://[^\s)\]]+")
@@ -48,6 +48,7 @@ def parse_row(raw):
         "has_pieces": bool(raw.get("Flat Pieces")),
         "pieces": raw.get("Flat Pieces") or [],
         "note": (raw.get("Flat Note") or "").strip(),
+        "custom": (raw.get("Name Custom") or "").strip(),
     }
 
 
@@ -143,14 +144,17 @@ def _selfcheck():
     assert clean_url(None) == "" and clean_url("") == "" and clean_url("không có link") == ""
     raw = {"record_id": "recA", "SKU Design": " HKH-Black-2D Hoodie-L-G1 ", "Color": None,
            "Create Date": "2026-04-13T11:22:20.000+07:00", "Check File": ["No File", "Urgent"],
-           "Flat Pieces": [], "Flat Note": None, "Link 1": f"[{u}]({u})", "Link 3": u}
+           "Flat Pieces": [], "Flat Note": None, "Name Custom": None,
+           "Link 1": f"[{u}]({u})", "Link 3": u}
     r = parse_row(raw)
     assert r["record_id"] == "recA" and r["sku"] == "HKH-Black-2D Hoodie-L-G1" and r["color"] == ""
-    assert r["links"] == [u, u] and r["has_pieces"] is False and r["note"] == ""
+    assert r["links"] == [u, u] and r["has_pieces"] is False and r["note"] == "" and r["custom"] == ""
     assert r["check_file"] == ["No File", "Urgent"]
-    r2 = parse_row({**raw, "Flat Pieces": [{"file_token": "t1", "name": "a.png"}], "Flat Note": "SKIP: x"})
+    r2 = parse_row({**raw, "Flat Pieces": [{"file_token": "t1", "name": "a.png"}], "Flat Note": "SKIP: x",
+                    "Name Custom": "  • Choose design: Men\n• Choose skin tone: S3  "})
     assert r2["has_pieces"] and r2["pieces"][0]["file_token"] == "t1" and r2["note"] == "SKIP: x"
-    assert len(FIELDS) == 6 + N_LINKS
+    assert r2["custom"] == "• Choose design: Men\n• Choose skin tone: S3"
+    assert len(FIELDS) == 7 + N_LINKS
     # _AUTH: chỉ bắt 'expired' đi kèm 'token' (tránh bắt nhầm link ảnh/khuyến mãi hết hạn)
     assert _AUTH.search("refresh token expired")
     assert _AUTH.search("token abc123 expired")

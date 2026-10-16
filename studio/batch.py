@@ -457,16 +457,20 @@ def process_subgroup(sub, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
     note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen)
-    upload_rows(rows, files, note, dry, done_ids)
+    manual = pick.get("manual") or {}
+    notes = {r["record_id"]: note + (f" · CẦN CHỈNH: {manual[r['record_id']]}"
+                                     if r["record_id"] in manual else "") for r in rows}
+    upload_rows(rows, files, notes, dry, done_ids)
     return bool(fails)
 
 
-def upload_rows(rows, files, note, dry, done_ids):
-    """Up cùng bộ file cho từng dòng; dòng đã có Flat Pieces -> bỏ qua.
+def upload_rows(rows, files, notes, dry, done_ids):
+    """Up cùng bộ file cho từng dòng, mỗi dòng ghi Note riêng (`notes`: record_id -> text, có thể khác
+    nhau khi có 'CẦN CHỈNH'); dòng đã có Flat Pieces -> bỏ qua.
     `done_ids` (set dùng chung của cả nhóm) được cập nhật ngay khi 1 dòng up xong, để lỗi giữa chừng
     (quota/lỗi lạ ở dòng sau) không mất note của các dòng đã up trước đó, và không bị ghi LỖI nhầm."""
     if dry:
-        log("dry", f"[không ghi Base] {len(rows)} dòng · {len(files)} file · note: {note}")
+        log("dry", f"[không ghi Base] {len(rows)} dòng · {len(files)} file · note: {notes}")
         return
     names = {f.name for f in files}
     done = {}
@@ -487,7 +491,7 @@ def upload_rows(rows, files, note, dry, done_ids):
                 if isinstance(e, (AuthError, QuotaError, KeyboardInterrupt, SystemExit)):
                     raise
                 raise StepError("up", f"{rid}: {e}")
-            done[rid] = note
+            done[rid] = notes[rid]
             done_ids.add(rid)
             log("up", f"{rid} ✓ {len(files)} file")
     finally:
@@ -802,23 +806,26 @@ def _selfcheck():
             calls["notes"] = dict(notes)
         _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = \
             fake_get_row, fake_upload, fake_remove, fake_write_notes
+        # notes: dict record_id -> note riêng (khác nhau mỗi dòng, vd dòng có "CẦN CHỈNH")
+        notes1 = {"r1": "note1-A", "r2": "note1-B", "r3": "note1-C"}
         done_ids = set()
         try:
-            upload_rows(rows, files, "note1", False, done_ids)
+            upload_rows(rows, files, notes1, False, done_ids)
             raise AssertionError("QuotaError phải ném tiếp")
         except QuotaError:
             pass
         assert done_ids == {"r1"}
-        assert calls["notes"] == {"r1": "note1"}
+        assert calls["notes"] == {"r1": "note1-A"}          # đúng note riêng của r1, không phải của r2/r3
         assert calls["remove"] == [("r2", ["tok_r2"])]
         # lỗi lạ (không phải StepError) -> StepError kind "up"
         def fake_upload2(rid, fs):
             if rid == "r2":
                 raise RuntimeError("boom")
         _lb.upload_files = fake_upload2
+        notes2 = {"r1": "note2-A", "r2": "note2-B", "r3": "note2-C"}
         done_ids2 = set()
         try:
-            upload_rows(rows, files, "note2", False, done_ids2)
+            upload_rows(rows, files, notes2, False, done_ids2)
             raise AssertionError("phải ném StepError")
         except StepError as e:
             assert e.kind == "up" and "r2" in str(e) and "boom" in str(e)
@@ -829,15 +836,16 @@ def _selfcheck():
             if rid == "r2":
                 raise KeyboardInterrupt
         _lb.upload_files = fake_upload3
+        notes3 = {"r1": "note3-A", "r2": "note3-B", "r3": "note3-C"}
         calls["remove"] = []; calls["notes"] = None
         done_ids3 = set()
         try:
-            upload_rows(rows, files, "note3", False, done_ids3)
+            upload_rows(rows, files, notes3, False, done_ids3)
             raise AssertionError("KeyboardInterrupt phải ném tiếp")
         except KeyboardInterrupt:
             pass
         assert calls["remove"] == [("r2", ["tok_r2"])]     # cleanup vẫn chạy
-        assert calls["notes"] == {"r1": "note3"}            # note của r1 (đã up trước) vẫn được ghi
+        assert calls["notes"] == {"r1": "note3-A"}          # note của r1 (đã up trước) vẫn được ghi
         assert done_ids3 == {"r1"}
     finally:
         _lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes = orig
