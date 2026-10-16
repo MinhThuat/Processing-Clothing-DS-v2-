@@ -11,9 +11,10 @@ now=$(date +%H%M)
 {
   echo "=== $(date '+%F %T') [${1:-cron}] ==="
   if { [ "$now" -ge 0830 ] && [ "$now" -lt 1200 ]; } || { [ "$now" -ge 1300 ] && [ "$now" -lt 1730 ]; }; then
-    python3 batch.py
-    echo "--- xong $(date '+%T') (exit $?)"
+    python3 batch.py; rc=$?
+    echo "--- xong $(date '+%T') (exit $rc)"
   else
     echo "--- ngoài giờ chạy (08:30-12:00, 13:00-17:30) -> bỏ qua"
   fi
 } >> "$LOG" 2>&1
+exit "${rc:-0}"

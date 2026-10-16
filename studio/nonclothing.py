@@ -8,7 +8,7 @@ khi judge.pick trả 'skip'. Luồng:
 USER RULE: output là FILE IN y hình in trong ảnh nguồn (+ Name Custom), KHÔNG phải ảnh render SP;
 không gồm đồ bên trong SP (vd squishy trong giỏ) và phụ kiện rời (quai, dây, thanh treo).
 """
-import json
+import json, shutil
 from pathlib import Path
 
 from PIL import Image
@@ -114,14 +114,6 @@ def norm_qa(js):
     return {"ok": not errs and score >= QA_MIN, "score": float(score), "errors": errs}
 
 
-def _trim_white(path, thr=245):
-    """Cắt viền gần-trắng (>= thr) quanh hình in. Toàn trắng -> giữ nguyên."""
-    im = Image.open(path).convert("RGB")
-    box = im.convert("L").point(lambda v: 255 if v < thr else 0).getbbox()
-    if box and box != (0, 0, *im.size):
-        im.crop(box).save(path)
-
-
 def _gen(prompt, ref, out):
     """gen_panel trong tiến trình; lỗi -> AuthError/QuotaError/StepError('gen') như luồng clothing."""
     try:
@@ -129,26 +121,28 @@ def _gen(prompt, ref, out):
     except Exception as e:
         raise_for(str(e), "gen")
     fp._flatten_white(out)      # codex đôi khi trả PNG nền trong suốt -> nền trắng đục (như mảnh clothing)
-    _trim_white(out)            # file in phải tràn khung: cắt dải trắng thừa model hay chừa ở mép
 
 
-def _input(rows, srcs, sheet, gdir, log):
-    """Claude chọn ảnh có hình in; ảnh nhiều SP -> định vị (lưới pixel) 1 SP -> ảnh đầu vào đã phóng."""
-    lines = "; ".join(f"{r['sku']} | colour {r['color'] or '-'} | {judge._opts(r.get('custom'))}" for r in rows)
+def _input(r, srcs, sheet, d, log):
+    """Cho 1 DÒNG: Claude chọn ảnh có hình in đúng biến thể/màu của dòng; ảnh nhiều SP -> định vị (lưới
+    pixel) 1 SP -> ảnh đầu vào đã phóng. Theo từng dòng vì 1 nhóm (chung bộ link) có thể gồm nhiều
+    biến thể/màu (vd giỏ Green + Purple) — dùng chung 1 ảnh thì dòng kia gen/QA theo sai mẫu."""
+    rows = [r]
+    lines = f"{r['sku']} | colour {r['color'] or '-'} | {judge._opts(r.get('custom'))}"
     pk = judge.ask(PICK.format(n=len(srcs), rows=lines), [sheet])
     front = pk.get("front") if isinstance(pk.get("front"), int) and 1 <= pk["front"] <= len(srcs) else 1
     src, box = srcs[front - 1], None
     if pk.get("several"):
-        grid = judge.grid_overlay(src, gdir / "nc_grid.jpg")
+        grid = judge.grid_overlay(src, d / "nc_grid.jpg")
         color = rows[0]["color"] or "the ordered"
         box = judge.locate(grid, f"one single {color} product", rows[0]["sku"], False)
     log("nc", f"ảnh {front} ({pk.get('product', '?')}), box={box}")
-    inp = gdir / "nc_in.png"
+    inp = d / "nc_in.png"
     if box:
         fp.crop_norm(src, box, Image.open(src).size, inp)
     else:
         Image.open(src).convert("RGB").save(inp)
-    return fp._upscaled(inp, gdir / "nc_in_up.png"), pk
+    return fp._upscaled(inp, d / "nc_in_up.png"), pk
 
 
 def _best_art(r, version, prompt, inp, d, log, ref=None):
@@ -168,10 +162,10 @@ def _best_art(r, version, prompt, inp, d, log, ref=None):
                                         color=r["color"] or "as in reference",
                                         opts=judge._opts(r.get("custom"))), [qs]))
         log("nc", f"{r['record_id']} {version} lần {k}: {'✓' if q['ok'] else '✗'}{q['score']:.0f} {q['errors']}")
+        if q["ok"]:
+            return art, q                       # bản ĐẠT luôn thắng bản trượt điểm cao hơn
         if not best or q["score"] > best[1]["score"]:
             best = (art, q)
-        if q["ok"]:
-            break
         if q["errors"]:
             fix = " FIX: " + "; ".join(FIX[e] for e in q["errors"]) + "."
     if not best:
@@ -180,23 +174,24 @@ def _best_art(r, version, prompt, inp, d, log, ref=None):
 
 
 def run(rows, srcs, sheet, gdir, log):
-    """-> list (row, {version: (art_path, qa)}) — mỗi dòng đủ VERSIONS (tên/màu khách có thể khác nhau)."""
-    inp, pk = _input(rows, srcs, sheet, gdir, log)
-    try:
-        spec, m = fp._vision(fp._ark_clients()[0], inp, VISION, need=("product", "print"))
-    except SystemExit as e:                     # _vision hết model -> sys.exit
-        raise StepError("vision", str(e))
-    (gdir / "nc_vision.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
-    out = []
+    """Generator: yield (row, {version: (art_path, qa)}) NGAY khi xong từng dòng -> batch up luôn, dòng
+    sau lỗi không làm mất dòng đã xong. Mỗi dòng chọn ảnh + vision riêng (biến thể/màu có thể khác)."""
+    client = fp._ark_clients()[0]
     for r in rows:
-        d = gdir / f"nc_{r['record_id']}"; d.mkdir(exist_ok=True)
+        d = gdir / f"nc_{r['record_id']}"
+        shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)   # bỏ file lần chạy trước
+        inp, pk = _input(r, srcs, sheet, d, log)
+        try:
+            spec, m = fp._vision(client, inp, VISION, need=("product", "print"))
+        except SystemExit as e:                 # _vision hết model -> sys.exit
+            raise StepError("vision", str(e))
+        (d / "nc_vision.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
         fields = dict(product=spec.get("product") or pk.get("product") or "product",
                       surface=spec.get("surface") or "front", base=spec.get("base", ""),
                       print=spec.get("print", ""), effects=spec.get("effects") or "as in the photo")
         a3d = _best_art(r, "3d", ART["3d"].format(**fields) + custom_rule(r), inp, d, log)
         flat = _best_art(r, "phang", FLAT_FROM_3D + custom_rule(r), inp, d, log, ref=a3d[0])
-        out.append((r, {"3d": a3d, "phang": flat}))
-    return out
+        yield r, {"3d": a3d, "phang": flat}
 
 
 def _selfcheck():
@@ -212,11 +207,18 @@ def _selfcheck():
     assert VERSIONS == ["3d", "phang"] and "puffy" in ART["3d"].format(**f)
     assert "PRINT FILE" in ART["3d"].format(**f) and "NO contents" in ART["3d"].format(**f)
     assert "FLAT" in FLAT_FROM_3D and "NO shading" in FLAT_FROM_3D
+    # bản ĐẠT thắng bản trượt điểm cao hơn (lần 1: 9 điểm nhưng sai_chu; lần 2: 8, đạt -> lấy lần 2)
     import tempfile
-    t = Path(tempfile.mkdtemp()) / "t.png"
-    im = Image.new("RGB", (100, 80), "white"); im.paste((0, 128, 0), (10, 20, 90, 80)); im.save(t)
-    _trim_white(t); assert Image.open(t).size == (80, 60)
-    Image.new("RGB", (50, 50), "white").save(t); _trim_white(t); assert Image.open(t).size == (50, 50)
+    g, orig = globals(), (_gen, judge.ask, judge.contact_sheet)
+    answers = iter([{"score": 9, "errors": ["sai_chu"]}, {"score": 8, "errors": []}])
+    g["_gen"] = lambda prompt, ref, out: None
+    judge.ask, judge.contact_sheet = (lambda *a, **k: next(answers)), (lambda *a, **k: None)
+    try:
+        d = Path(tempfile.mkdtemp())
+        art, q = _best_art({"record_id": "x", "color": ""}, "3d", "p", d / "in.png", d, lambda *a: None)
+    finally:
+        g["_gen"], judge.ask, judge.contact_sheet = orig
+    assert art.name == "art_3d_2.png" and q["ok"]
     print("nonclothing selfcheck OK")
 
 
