@@ -45,6 +45,7 @@ def log(stage, msg=""):
 EMIT = None   # nếu set: crop/panel ghi thẳng vào thư mục này (cho UI web poll)
 COLOR = None  # --color: ép màu nền vải (batch: nhóm con màu khác ảnh gốc)
 HINT = None   # --hint: ghi chú sửa lỗi QA ghép cuối prompt (batch: gen lại lần 3-4)
+GARMENT = None  # --garment top|bottom|top_bottom|dress: ép loại SP thật (batch, từ judge.pick); None = để vision tự quyết
 
 def _prompt_extra():
     """Phần ghép thêm vào MỌI prompt gen theo --color/--hint (rỗng nếu không truyền)."""
@@ -167,6 +168,21 @@ OUTFIT_FLAT = (
     "NO shadow, NO folds/wrinkles. NO person, no head, no hands, no feet, no hanger, no mockup. "
     "Redraw EVERY visible front detail faithfully in the right place and colour. "
     "TOP garment: {top}. BOTTOM garment: {bottom}.")
+# SP chỉ có áo hoặc chỉ có quần (USER RULE: không vẽ phần SP không có) -> 1 mảnh art riêng.
+OUTFIT_FLAT_TOP = (
+    "A 2D FLAT technical fashion-flat drawing of a TOP garment laid flat, FRONT view, on a plain light "
+    "grey background. Draw it as a flat, symmetric garment silhouette, fully visible. SOLID FLAT COLOR "
+    "FILL only, crisp clean edges like a technical CAD flat: NO fabric texture, NO 3D, NO shading, NO "
+    "gradient, NO shadow, NO folds/wrinkles. NO person, no head, no hands, no feet, no hanger, no mockup. "
+    "Redraw EVERY visible front detail faithfully in the right place and colour. "
+    "TOP garment: {top}.")
+OUTFIT_FLAT_BOTTOM = (
+    "A 2D FLAT technical fashion-flat drawing of a BOTTOM garment (pants/shorts/skirt) laid flat, FRONT "
+    "view, on a plain light grey background. Draw it as a flat, symmetric garment silhouette, fully "
+    "visible. SOLID FLAT COLOR FILL only, crisp clean edges like a technical CAD flat: NO fabric texture, "
+    "NO 3D, NO shading, NO gradient, NO shadow, NO folds/wrinkles. NO person, no head, no hands, no feet, "
+    "no hanger, no mockup. Redraw EVERY visible front detail faithfully in the right place and colour. "
+    "BOTTOM garment: {bottom}.")
 
 
 # ---------- 1. dola-seed vision ----------
@@ -301,6 +317,14 @@ _PIECES_SCHEMA = (
     "sl_front/sl_back = the LEFT sleeve's front-facing / back-facing print; sr_front/sr_back = the RIGHT "
     "sleeve's. sleeves_same = true if both sleeves carry the SAME print (then sr_* may repeat sl_*), "
     "false if the two sleeves clearly differ. "
+    "If it is a TOP ONLY (no separate bottom garment — e.g. a T-shirt/sweatshirt/hoodie, even if its print "
+    "depicts fake pants/shorts/underwear/legs below the waist): "
+    '{"type":"top","top_front":"..","top_back":"..","sleeves_same":true,"sl_front":"..","sl_back":"..",'
+    '"sr_front":"..","sr_back":".."}. '
+    "If it is a BOTTOM ONLY (pants/jogger/shorts, or a skirt — describe the skirt in pants_* too): "
+    '{"type":"bottom","pants_front":"..","pants_back":".."}. '
+    "Printed underwear/legs/body on the LOWER part of a top are PART OF THE TOP's print, not a separate "
+    "bottom garment. "
     "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
     "PRINT: describe them as artwork on the panel, never as bare skin or an opening.")
 _PIECES_INTRO = {
@@ -316,9 +340,16 @@ _PIECES_INTRO = {
                  " Describe front panels from the front view and back panels from the back view (real back)."),
 }
 
+def _pieces_prompt(source):
+    """Prompt vision cho seed_pieces; ép GARMENT (--garment) vào cuối prompt nếu có truyền."""
+    p = _PIECES_INTRO[source]
+    if GARMENT:
+        p += f" The product is known to be: {GARMENT} — use exactly that type."
+    return p
+
 def seed_pieces(client, imgs, source):
     """imgs: 1 path (infer/combined) hoặc [front, back] (two). Trả JSON {type, panel descs}."""
-    js, _ = _vision(client, imgs, _PIECES_INTRO[source], need=("type",))
+    js, _ = _vision(client, imgs, _pieces_prompt(source), need=("type",))
     return js
 
 # nhãn gửi model cho từng slug full-bleed (PANEL_BLEED {label})
@@ -331,10 +362,28 @@ _BLEED_LABEL = {
     "tay_phai_truoc": "front-facing panel of the RIGHT sleeve", "tay_phai_sau": "back-facing panel of the RIGHT sleeve",
 }
 
+def _filter_by_garment(items, garment):
+    """Lọc theo garment thật (--garment, từ judge.pick): top -> bỏ quan_*; bottom -> bỏ ao_*/tay_*.
+    `items` = plan (list dict có 'slug') HOẶC tập/list slug string (batch.py dùng lại để lọc tên mảnh
+    mong đợi từ pieces.json) -> trả về cùng kiểu (list/set) đầu vào."""
+    def slug(x):
+        return x["slug"] if isinstance(x, dict) else x
+    if garment == "top":
+        keep = lambda x: not slug(x).startswith("quan_")
+    elif garment == "bottom":
+        keep = lambda x: not (slug(x).startswith("ao_") or slug(x).startswith("tay"))
+    else:
+        return items
+    return type(items)(x for x in items if keep(x))
+
 def _pieces_plan(js):
     """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
-    kind='dress' (cắt cong) | 'bleed' (full-bleed). side='front'/'back' -> chọn ảnh ref."""
+    kind='dress' (cắt cong) | 'bleed' (full-bleed). side='front'/'back' -> chọn ảnh ref.
+    type 'top'/'bottom' -> chỉ mảnh áo/tay hoặc chỉ mảnh quần (SP chỉ có 1 phần). GARMENT (--garment,
+    biết trước loại SP thật từ SKU) lọc lại plan nếu vision vẫn trả loại khác (vd top_bottom thừa quần)."""
     typ = (js.get("type") or "top_bottom").strip()
+    if typ not in ("dress", "top_bottom", "top", "bottom"):
+        typ = "top_bottom"
     plan = []
     if typ == "dress":
         for slug, shape, guide, key, side in [
@@ -347,22 +396,28 @@ def _pieces_plan(js):
             if desc:
                 plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=shape, guide=guide))
         return plan
-    # top_bottom: thân áo + quần
-    for slug, key, side in [("ao_truoc", "top_front", "front"), ("ao_sau", "top_back", "back"),
-                            ("quan_truoc", "pants_front", "front"), ("quan_sau", "pants_back", "back")]:
-        desc = js.get(key)
-        if desc:
-            plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
-    # tay áo: giống -> 1 bộ trước/sau; khác -> trái + phải, mỗi bên trước/sau
-    if js.get("sleeves_same", True):
-        sleeves = [("tay_truoc", "sl_front", "front"), ("tay_sau", "sl_back", "back")]
-    else:
-        sleeves = [("tay_trai_truoc", "sl_front", "front"), ("tay_trai_sau", "sl_back", "back"),
-                   ("tay_phai_truoc", "sr_front", "front"), ("tay_phai_sau", "sr_back", "back")]
-    for slug, key, side in sleeves:
-        desc = js.get(key) or js.get(key.replace("sr_", "sl_"))   # thiếu tay phải -> mượn trái
-        if desc:
-            plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
+    if typ != "bottom":   # top / top_bottom: thân áo
+        for slug, key, side in [("ao_truoc", "top_front", "front"), ("ao_sau", "top_back", "back")]:
+            desc = js.get(key)
+            if desc:
+                plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
+    if typ != "top":      # bottom / top_bottom: quần
+        for slug, key, side in [("quan_truoc", "pants_front", "front"), ("quan_sau", "pants_back", "back")]:
+            desc = js.get(key)
+            if desc:
+                plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
+    if typ != "bottom":   # top / top_bottom: tay áo — giống -> 1 bộ trước/sau; khác -> trái + phải
+        if js.get("sleeves_same", True):
+            sleeves = [("tay_truoc", "sl_front", "front"), ("tay_sau", "sl_back", "back")]
+        else:
+            sleeves = [("tay_trai_truoc", "sl_front", "front"), ("tay_trai_sau", "sl_back", "back"),
+                       ("tay_phai_truoc", "sr_front", "front"), ("tay_phai_sau", "sr_back", "back")]
+        for slug, key, side in sleeves:
+            desc = js.get(key) or js.get(key.replace("sr_", "sl_"))   # thiếu tay phải -> mượn trái
+            if desc:
+                plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug]))
+    if GARMENT and GARMENT != typ:
+        plan = _filter_by_garment(plan, GARMENT)
     return plan
 
 def _flatten_white(path):
@@ -413,6 +468,7 @@ OUTFIT_PROMPT = (
     "zipper, hood, collar, sleeve prints, cuffs. "
     "bottom.desc = the lower garment (or skirt): type, base colour, and every visible front detail — "
     "knee patches, side stripes, pockets, waistband, hems. "
+    "If there is no separate bottom (or top) garment, set its desc to 'none'. "
     "Colours as words or hex. Be specific and positional; no prose outside the spec. "
     "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
     "PRINT: describe them as artwork on the panel, never as bare skin or an opening.")
@@ -579,8 +635,19 @@ def run_pieces_one(client, img, out, emit_sub="", back=None, combined=False, onl
         raise errs[-1]
     return outs[0] if outs else out
 
+def _art_prompt(top, bot):
+    """Chọn template art theo GARMENT (--garment, biết trước SP chỉ có áo/quần) nếu có, không thì theo
+    desc 'none'/rỗng (vision tự nhận SP không có phần đó)."""
+    none_top = not top or top.strip().lower() == "none"
+    none_bot = not bot or bot.strip().lower() == "none"
+    if GARMENT == "top" or (GARMENT is None and none_bot and not none_top):
+        return OUTFIT_FLAT_TOP.format(top=top)
+    if GARMENT == "bottom" or (GARMENT is None and none_top and not none_bot):
+        return OUTFIT_FLAT_BOTTOM.format(bottom=bot)
+    return OUTFIT_FLAT.format(top=top, bottom=bot)
+
 def run_art_one(client, img, out, emit_sub="", **_):
-    """1 người: vision tả cả bộ -> gen 1 bản vẽ phẳng nguyên bộ, mặt trước."""
+    """1 người: vision tả cả bộ -> gen 1 bản vẽ phẳng, mặt trước (chỉ áo / chỉ quần / cả bộ tuỳ SP)."""
     work = _workdir("art_", emit_sub)
     log("crop", "nhìn ảnh: tả chi tiết cả bộ ...")
     js, _, _ = seed_outfit(client, img)
@@ -589,8 +656,8 @@ def run_art_one(client, img, out, emit_sub="", **_):
     log("crop", f"trên: {top[:60]}… | dưới: {bot[:60]}…")
     ref = work / "crop_outfit.png"
     Image.open(img).save(ref)
-    log("gen", "gen bản vẽ phẳng nguyên bộ ...")
-    gen_panel(OUTFIT_FLAT.format(top=top, bottom=bot), [ref], out)
+    log("gen", "gen bản vẽ phẳng ...")
+    gen_panel(_art_prompt(top, bot), [ref], out)
     log("done", str(out))
     return out
 
@@ -672,10 +739,38 @@ def _selfcheck():
     diff = _pieces_plan({**tb, "sleeves_same": False})
     assert {s["slug"] for s in diff} == {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau",
                                          "tay_trai_truoc", "tay_trai_sau", "tay_phai_truoc", "tay_phai_sau"}
+    # type "top"/"bottom": SP chỉ có 1 phần -> chỉ gen phần đó (USER RULE: không gen phần SP không có)
+    top_only = _pieces_plan({"type": "top", "top_front": "base white; x", "top_back": "b",
+                             "sleeves_same": True, "sl_front": "e", "sl_back": "f"})
+    assert {s["slug"] for s in top_only} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
+    bottom_only = _pieces_plan({"type": "bottom", "pants_front": "c", "pants_back": "d"})
+    assert {s["slug"] for s in bottom_only} == {"quan_truoc", "quan_sau"}
+    assert '"type":"top"' in _PIECES_SCHEMA and '"type":"bottom"' in _PIECES_SCHEMA
+    assert "not a separate bottom garment" in _PIECES_SCHEMA
+    # GARMENT (--garment, biết trước loại SP thật) ép lọc plan dù vision vẫn trả top_bottom đầy đủ
+    globals()["GARMENT"] = "top"
+    assert {s["slug"] for s in _pieces_plan({**tb, "sleeves_same": True})} == \
+        {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
+    globals()["GARMENT"] = "bottom"
+    assert {s["slug"] for s in _pieces_plan({**tb, "sleeves_same": True})} == {"quan_truoc", "quan_sau"}
+    assert "known to be: bottom" in _pieces_prompt("infer")
+    globals()["GARMENT"] = None
+    assert "known to be" not in _pieces_prompt("infer")
     # 2 kiểu vẽ: PANEL_BLEED (3D) vs PANEL_BLEED_FLAT (phẳng) format OK; váy có DRESS_FLAT
     for tpl in (PANEL_BLEED, PANEL_BLEED_FLAT):
         assert "{" not in tpl.format(label="x", base="white", desc="y")
     assert "FLAT VECTOR" in DRESS_FLAT and "NO 3D" in PANEL_BLEED_FLAT
+    # art templates mới (SP chỉ có áo / chỉ có quần) format OK, không còn {} sót lại
+    assert "{" not in OUTFIT_FLAT_TOP.format(top="x")
+    assert "{" not in OUTFIT_FLAT_BOTTOM.format(bottom="y")
+    assert "none" in OUTFIT_PROMPT
+    # _art_prompt: GARMENT ép chọn template; không có GARMENT thì theo desc 'none'/rỗng
+    assert _art_prompt("a top", "none").startswith("A 2D FLAT technical fashion-flat drawing of a TOP")
+    assert _art_prompt("", "a bottom").startswith("A 2D FLAT technical fashion-flat drawing of a BOTTOM")
+    assert _art_prompt("a top", "a bottom").startswith("A 2D FLAT technical fashion-flat drawing of a COMPLETE")
+    globals()["GARMENT"] = "top"
+    assert _art_prompt("a top", "a bottom").startswith("A 2D FLAT technical fashion-flat drawing of a TOP")
+    globals()["GARMENT"] = None
     # cutout: đọc file (PIL, an toàn path Unicode) -> cắt vật thể theo silhouette, ra RGBA nhỏ hơn
     im2 = Image.new("RGB", (60, 60), "white"); ImageDraw.Draw(im2).rectangle([20, 20, 40, 40], fill="red")
     cp = Path(tempfile.mktemp(suffix=".png")); im2.save(cp)
@@ -768,6 +863,8 @@ if __name__ == "__main__":
                     help="coi --front là 1 bộ đồ, bỏ bước tách người (batch đã tự crop)")
     ap.add_argument("--color", help="ép màu nền vải (vd 'heliconia pink'), giữ họa tiết")
     ap.add_argument("--hint", help="ghi chú sửa lỗi ghép cuối mọi prompt gen")
+    ap.add_argument("--garment", choices=["top", "bottom", "top_bottom", "dress"],
+                    help="ép loại SP thật (biết trước từ SKU, vd 3D Tshirt -> top); mặc định để vision tự quyết")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
@@ -775,7 +872,7 @@ if __name__ == "__main__":
     elif a.front:
         if a.emit:
             globals()["EMIT"] = a.emit
-        globals()["COLOR"], globals()["HINT"] = a.color, a.hint
+        globals()["COLOR"], globals()["HINT"], globals()["GARMENT"] = a.color, a.hint, a.garment
         out = Path(a.out)
         logpath = _open_log(a.log or out.with_suffix(".log"))
         log("start", f"log -> {logpath}")

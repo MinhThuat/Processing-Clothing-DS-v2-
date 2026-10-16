@@ -20,7 +20,7 @@ from PIL import Image
 import judge
 import lark_base as lb
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
-from flat_pipeline import _pieces_plan
+from flat_pipeline import _pieces_plan, _filter_by_garment
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expanduser()
@@ -323,15 +323,17 @@ def _run_both(fns):
         raise errs[0]
 
 
-def _pieces_json_slugs(path):
-    """pieces.json -> tập slug mảnh (không gồm 'art') theo plan hiện tại (flat_pipeline._pieces_plan)."""
-    return {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")))}
+def _pieces_json_slugs(path, garment=None):
+    """pieces.json -> tập slug mảnh (không gồm 'art') theo plan hiện tại (flat_pipeline._pieces_plan),
+    lọc theo `garment` (SP chỉ có áo/quần, từ judge.pick) nếu truyền — phòng vision vẫn trả thừa phần."""
+    slugs = {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")))}
+    return _filter_by_garment(slugs, garment) if garment else slugs
 
 
-def _slugs_match(pieces_json_path, names):
-    """True nếu bộ mảnh trong pieces.json (bỏ 'art') khớp đúng tập `names` (cũng bỏ 'art').
-    Dùng ở lần gen lại 3: vision lại có thể đổi loại đồ/tay giống-khác -> đổi tên mảnh."""
-    return _pieces_json_slugs(pieces_json_path) == set(names)
+def _slugs_match(pieces_json_path, names, garment=None):
+    """True nếu bộ mảnh trong pieces.json (bỏ 'art', lọc theo garment) khớp đúng tập `names` (cũng bỏ
+    'art'). Dùng ở lần gen lại 3: vision lại có thể đổi loại đồ/tay giống-khác -> đổi tên mảnh."""
+    return _pieces_json_slugs(pieces_json_path, garment) == set(names)
 
 
 # ---------- 1 nhóm con (biến thể thiết kế + màu) ----------
@@ -341,11 +343,13 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     sdir.mkdir(parents=True)
     color = None if group["matches_photo"] else group["color"]
     colour_desc = color or "same as the reference photo"
+    back_crop = group.get("back_crop")
     ctx = {"front": make_input(srcs[group["front"] - 1], group["crop"], sdir / "in_front.png"),
            "front_src": srcs[group["front"] - 1],        # ảnh gốc chưa cắt, để QA luôn so với ảnh thật
            "cropped": group["crop"] is not None,
-           "back": (make_input(srcs[group["back"] - 1], None, sdir / "in_back.png")
+           "back": (make_input(srcs[group["back"] - 1], back_crop, sdir / "in_back.png")
                     if group["mode"] == "two" else None),
+           "back_cropped": group["mode"] == "two" and back_crop is not None,
            "hint": None}
     n = Counter()
     pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
@@ -354,7 +358,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         left = deadline - time.monotonic()
         if left <= 0:
             raise StepError("quá thời gian", "nhóm > 45 phút")
-        extra = (["--color", color] if color else []) + (["--hint", ctx["hint"]] if ctx["hint"] else [])
+        extra = ((["--color", color] if color else []) + (["--hint", ctx["hint"]] if ctx["hint"] else [])
+                 + ["--garment", group["garment"]])
         return run_pipe(args + extra, sdir / f"pipe_{next(pipe_no):02d}.log", left)
 
     def mode_args():
@@ -381,7 +386,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     pj = sdir / "pieces.json"
     if not pj.exists():
         raise StepError("gen", "vision không ra pieces.json")
-    want = {p["slug"] for p in _pieces_plan(json.loads(pj.read_text(encoding="utf-8")))}
+    want = _pieces_json_slugs(pj, group["garment"])
     have = {p.stem[len("final_"):] for p in sdir.glob("final_*.png")}
     names = sorted(want | have)              # mảnh lỗi lần 0 (thiếu file) vẫn vào danh sách -> QA chấm 0 -> gen lại
     if not names:
@@ -398,6 +403,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
             # -- bbox ước lượng từ contact sheet không đáng tin); kèm bản đã cắt nếu có cắt thật
             refs = ([(ctx["front_src"], "REF photo")]
                     + ([(ctx["front"], "REF crop")] if ctx["cropped"] else [])
+                    + ([(srcs[group["back"] - 1], "REF back photo")] if ctx["back_cropped"] else [])
                     + ([(ctx["back"], "REF back")] if ctx["back"] else []))
             sheet = judge.contact_sheet([refs] + judge.grid([(piece_path(x), x) for x in have], cols=4),
                                         sdir / f"sheet_qa_{n['qa']}.jpg")
@@ -422,8 +428,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 shutil.copyfile(pj, v0)
                 gen_pieces(only=slugs, cache=False)
                 old = {n for n in names if n != "art"}
-                if pj.exists() and not _slugs_match(pj, old):
-                    new = _pieces_json_slugs(pj)
+                if pj.exists() and not _slugs_match(pj, old, group["garment"]):
+                    new = _pieces_json_slugs(pj, group["garment"])
                     log("regen", f"lần 3 vision ra mảnh khác ({sorted(new)} != {sorted(old)})"
                                  " -> quay lại mô tả cũ, giữ crop+hint mới")
                     for p in sdir.glob("final_*.png"):
@@ -812,6 +818,13 @@ def _selfcheck():
     assert _slugs_match(p_same, same_names) is True
     assert _slugs_match(p_diff, same_names) is False
     assert _slugs_match(p_diff, diff_names) is True
+    # #2b garment (từ judge.pick, SP chỉ có áo/quần) lọc lại _pieces_json_slugs/_slugs_match dù pieces.json
+    # (vision) vẫn trả top_bottom đầy đủ -> tên mảnh mong đợi (và so khớp lần 3) phải bỏ phần SP không có
+    assert _pieces_json_slugs(p_same) == same_names                       # không garment -> không lọc
+    assert _pieces_json_slugs(p_same, "top") == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
+    assert _pieces_json_slugs(p_same, "bottom") == {"quan_truoc", "quan_sau"}
+    assert _slugs_match(p_same, {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}, "top") is True
+    assert _slugs_match(p_same, same_names, "top") is False                # còn quan_* -> không khớp nữa
     # upload_rows: lỗi giữa chừng không mất note dòng đã up, không ghi LỖI nhầm dòng đã up
     import lark_base as _lb
     orig = (_lb.get_row, _lb.upload_files, _lb.remove_files, _lb.write_notes)
