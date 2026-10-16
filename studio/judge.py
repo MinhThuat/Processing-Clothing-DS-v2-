@@ -239,8 +239,8 @@ cap, guest book, patch, accessory...) return {{"skip": "<short reason with the p
 women's print — read "Choose design" in customer options) AND the same garment colour form one group.
 A listing with one design has one group per colour (or a single group if one colour). The product type
 written in SKU Design (e.g. "T-shirt"/"Tshirt" = short sleeves, "Sweatshirt" = long sleeves no hood,
-"Hoodie", "Jogger"/"Pants"/"Shorts", "Skirt", "Dress", "Jumpsuit", "Set") is part of the variant: choose
-photos showing exactly that product type, and set "garment" accordingly. Printed underwear, legs or body
+"Hoodie", "Jogger"/"Pants"/"Shorts", "Skirt", "Dress", "Jumpsuit", "Set") helps tell variants apart and
+choose photos of that variant. Printed underwear, legs or body
 on a top are part of the top's print, not a separate bottom garment. If a flat product image shows this
 variant's front (and back), use it for front (and back) — mode "combined" with crop on that variant's
 front+back region, or mode "two" with crop/back_crop — rather than a lifestyle photo. Pick EACH group's
@@ -250,9 +250,12 @@ OWN inputs for a flat sewing-pattern generator:
  - "color": the garment colour this group's rows ask for. Read colour words in SKU Design / Color;
    personal names, sizes and design numbers are NOT colours; a row without a colour uses "photo".
  - "matches_photo": true if that colour is the one shown in the photos, else false.
- - "garment": "top" | "bottom" | "top_bottom" | "dress" — what this variant's product actually IS,
-   decided mainly from the product type in SKU Design (T-shirt/Sweatshirt/Hoodie = top; Jogger/Pants/
-   Shorts/Skirt = bottom; Jumpsuit/Set/pajamas = top_bottom; Dress = dress).
+ - "garment": "top" | "bottom" | "top_bottom" | "dress" — decided by LOOKING at this variant's photos:
+   which garments carry THIS listing's printed design. A matching printed set (top AND bottom both carry
+   the design, e.g. a printed hoodie + printed jogger) = "top_bottom" even if SKU Design names only one
+   piece ("Jogger", "Hoodie"). Only the top carries the design and the bottom is plain/unrelated everyday
+   clothing (jeans, plain khaki shorts) = "top"; only the bottom carries it = "bottom". One-piece jumpsuit
+   / onesie / pajama set = "top_bottom"; dress = "dress". Use the SKU product type only as a tie-breaker.
  - "front": label of the clearest photo of the FRONT of THAT variant. PREFER a clean flat /
    ghost-mannequin product image over a lifestyle photo of a person wearing it; fall back to a lifestyle
    photo only if no flat/ghost-mannequin shot exists for that variant. NEVER choose a BLANK template /
