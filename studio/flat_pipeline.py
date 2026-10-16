@@ -387,6 +387,19 @@ _BLEED_LABEL = {
     "tay_phai_truoc": "front-facing panel of the RIGHT sleeve", "tay_phai_sau": "back-facing panel of the RIGHT sleeve",
 }
 
+# slug mảnh -> key box trong pieces.json + nhãn mô tả vùng (batch: lần gen thứ 3 nhờ Claude khoanh lại box).
+# Tay áo không có: box tay áo không đáng tin, tay luôn gen từ ảnh nguyên.
+PIECE_BOX = {
+    "ao_truoc": ("top_front", "the FRONT torso/body of the top (no sleeves, no hood)"),
+    "ao_sau": ("top_back", "the BACK torso/body of the top (no sleeves, no hood)"),
+    "quan_truoc": ("pants_front", "the FRONT of the pants/bottom"),
+    "quan_sau": ("pants_back", "the BACK of the pants/bottom"),
+    "than_truoc": ("bodice_front", "the FRONT bodice of the dress (neckline down to the waist seam only)"),
+    "than_sau": ("bodice_back", "the BACK bodice of the dress (neckline down to the waist seam only)"),
+    "ta_truoc": ("skirt_front", "the FRONT skirt of the dress (waist seam down to the hem only)"),
+    "ta_sau": ("skirt_back", "the BACK skirt of the dress (waist seam down to the hem only)"),
+}
+
 def _filter_by_garment(items, garment):
     """Lọc theo garment thật (--garment, từ judge.pick): top -> bỏ quan_*; bottom -> bỏ ao_*/tay_*.
     `items` = plan (list dict có 'slug') HOẶC tập/list slug string (batch.py dùng lại để lọc tên mảnh

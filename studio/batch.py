@@ -21,7 +21,7 @@ import judge
 import lark_base as lb
 import nonclothing
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
-from flat_pipeline import _pieces_plan, _filter_by_garment
+from flat_pipeline import _pieces_plan, _filter_by_garment, PIECE_BOX
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expanduser()
@@ -520,6 +520,29 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         log("qa", " ".join(f"{k}:{'✓' if v['ok'] else '✗'}{v['score']:.0f}" for k, v in res.items()))
         return res
 
+    def claude_boxes(slugs):
+        """Claude khoanh box mảnh trên ảnh đầu vào hiện tại (lưới pixel) -> ghi đè boxes trong pieces.json.
+        Mặt sau tự suy (không ảnh lưng) bỏ qua: không có vùng thật để cắt."""
+        if not pj.exists():
+            return
+        js = json.loads(pj.read_text(encoding="utf-8"))
+        if not isinstance(js.get("boxes"), dict):
+            js["boxes"] = {}
+        for slug in slugs:
+            if slug not in PIECE_BOX or (slug.endswith("_sau") and group["mode"] == "infer"):
+                continue
+            key, label = PIECE_BOX[slug]
+            back = slug.endswith("_sau")
+            img = ctx["back"] if back and ctx["back"] else ctx["front"]
+            try:
+                box = judge.locate_piece(judge.grid_overlay(img, sdir / f"grid_{slug}.jpg"), label, back)
+            except StepError as e:
+                log("regen", f"Claude khoanh {slug} lỗi: {e}"); continue
+            log("regen", f"Claude khoanh {slug}: {box}")
+            if box:
+                js["boxes"][key] = box
+        pj.write_text(json.dumps(js, ensure_ascii=False), encoding="utf-8")
+
     def regen_fn(todo, attempt, hint):
         log("regen", f"lần {attempt}: {', '.join(todo)}" + (" (hint)" if hint else ""))
         for x in todo:
@@ -543,13 +566,16 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     for p in sdir.glob("final_*.png"):
                         if p.stem[len("final_"):] not in old:
                             p.unlink(missing_ok=True)
+                    # mô tả v0 + box MỚI: box v0 tính trên ảnh CŨ, vision lần 2 vừa khoanh lại trên ảnh mới
                     js0 = json.loads(v0.read_text(encoding="utf-8"))
-                    js0.pop("boxes", None)       # box v0 tính trên ảnh CŨ, ảnh đầu vào đã đổi -> gen từ ảnh nguyên
+                    js0["boxes"] = (json.loads(pj.read_text(encoding="utf-8")).get("boxes") or {})
                     pj.write_text(json.dumps(js0, ensure_ascii=False), encoding="utf-8")
                     missing = [x for x in slugs if not piece_path(x).exists()]
                     if missing:
                         gen_pieces(only=missing, cache=True)
             else:
+                if attempt == MAX_ATTEMPTS:
+                    claude_boxes(slugs)                # lần cuối: Claude nhìn ảnh, khoanh lại vùng mảnh lỗi
                 gen_pieces(only=slugs, cache=True)     # lần 1: y nguyên; lần sau hint: dùng pieces.json hiện tại
 
         if slugs and need_art:
@@ -669,6 +695,9 @@ def _variant_label(group, sub_rows):
     return "; ".join(sorted({r["custom"] for r in sub_rows if r.get("custom")})) or group["variant"]
 
 
+LOCATE_TRIES = 3
+
+
 def _locate_groups(groups, rows, srcs, gdir):
     """Với mỗi nhóm cần định vị (`_needs_locate`): dựng gdir/grid_<front>.jpg (ảnh gốc + lưới 0-1000,
     dùng chung cho các nhóm cùng front) rồi hỏi Claude khoanh CHÍNH XÁC vùng của biến thể đó -> cập
@@ -687,11 +716,14 @@ def _locate_groups(groups, rows, srcs, gdir):
             grids[front] = judge.grid_overlay(srcs[front - 1], gdir / f"grid_{front}.jpg")
         skus = "; ".join(sorted({r["sku"] for r in sub_rows}))
         kid = any(_is_kid(r["sku"]) for r in sub_rows)
-        try:
-            box = judge.locate(grids[front], _variant_label(group, sub_rows), skus, kid)
-        except StepError as e:
-            log("locate", f"{group['variant']}/{group['color']}: lỗi, giữ crop cũ: {e}")
-            box = None
+        box = None
+        for k in range(1, LOCATE_TRIES + 1):        # Claude nhìn ảnh lớn định vị, tối đa LOCATE_TRIES lần
+            try:
+                box = judge.locate(grids[front], _variant_label(group, sub_rows), skus, kid)
+            except StepError as e:
+                log("locate", f"{group['variant']}/{group['color']} lần {k}: lỗi {e}")
+            if box:
+                break
         if box:
             group["crop"] = box
             log("locate", f"{group['variant']}/{group['color']}: crop={box}")
@@ -1379,8 +1411,9 @@ def _selfcheck():
         kind2 = process_group(g_pg2, Path(tempfile.mkdtemp()), "2026-10-16", False, stats_pg2)
         assert kind2 is None
         assert calls_pg2["overlay"] == [calls_pg2["overlay"][0]] * 1       # ảnh front chung -> dựng grid 1 LẦN
-        assert sorted(calls_pg2["locate"]) == [("Design 2", "S-a-Tee-L-G1", False),
-                                               ("Design 3", "S-b-Tee-4T-G1", True)]
+        # Design 2 định vị được ngay; Design 3 không được -> Claude thử đủ LOCATE_TRIES lần
+        assert sorted(calls_pg2["locate"]) == [("Design 2", "S-a-Tee-L-G1", False)] + \
+            [("Design 3", "S-b-Tee-4T-G1", True)] * LOCATE_TRIES
         assert calls_pg2["subgroup_crop"]["Design 2"] == [100, 100, 600, 600]  # định vị được -> cập nhật crop
         # ảnh chung nhiều biến thể mà không định vị được -> KHÔNG gen (gen cả ảnh sẽ tả nhầm design khác)
         assert "Design 3" not in calls_pg2["subgroup_crop"]

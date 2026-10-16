@@ -327,6 +327,20 @@ whole garment: its front, and its back too if shown side by side with the front.
 Return {{"box": null}} if this variant can't be found in the photo."""
 
 
+LOCATE_PIECE = """The image is {w}x{h} pixels; red grid lines are drawn every 100 px, labelled in pixels
+along the top and left edges. It shows a garment (if a FRONT and a BACK view are side by side, use the
+{view} view). Return ONLY {{"box": [x0,y0,x1,y1]}} as integer PIXEL coordinates tightly covering ONLY
+{label} — nothing of the other garment parts, the person's skin/head or the background.
+Return {{"box": null}} if it is not visible."""
+
+
+def locate_piece(photo_with_grid, label, back=False):
+    """Ảnh + lưới pixel -> bbox 0-1000 của 1 mảnh (vd thân trước) hoặc None (batch: lần gen thứ 3)."""
+    w, h = Image.open(photo_with_grid).size
+    js = ask(LOCATE_PIECE.format(w=w, h=h, label=label, view="BACK" if back else "FRONT"), [photo_with_grid])
+    return _box_small(px_to_box(js.get("box"), w, h))
+
+
 def pick(sheet, rows, n):
     lines = "\n".join(f"{r['record_id']} | {r['sku']} | {r['color'] or '-'} | {_opts(r.get('custom'))}"
                       for r in rows)
@@ -528,6 +542,16 @@ def _selfcheck():
     q = norm_qa({"pieces": {"a": {"ok": True, "score": 7, "errors": []},
                             "b": {"ok": True, "score": 8, "errors": []}}}, ["a", "b"])
     assert q["a"]["ok"] is False and q["b"]["ok"] is True
+    # locate_piece: px trên ảnh lưới -> 0-1000 (+3% lề); prompt đúng mặt trước/sau + nhãn mảnh
+    def fake_ask_piece(prompt, images, timeout=300):
+        captured["piece"] = prompt
+        return {"box": [80, 80, 480, 320]}
+    globals()["ask"] = fake_ask_piece
+    try:
+        bp = locate_piece(gout, "the BACK bodice", back=True)
+    finally:
+        globals()["ask"] = orig_ask
+    assert bp == [70, 170, 630, 830] and "BACK view" in captured["piece"] and "the BACK bodice" in captured["piece"]
     print("judge selfcheck OK")
 
 
