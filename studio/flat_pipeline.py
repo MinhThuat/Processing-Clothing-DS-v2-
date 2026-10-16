@@ -126,6 +126,15 @@ DRESS_FLAT = (
 SHAPE_BODICE = " Shape: a sleeveless bodice tank panel like the second reference (shape guide)."
 SHAPE_FAN = (" Shape: a wide quarter-circle CIRCLE-SKIRT fan panel spread flat like the second "
              "reference (shape guide). Every band follows the curved arc, parallel to the curved hem.")
+# tà váy: bỏ dây/nơ/sash thắt lủng lẳng (USER: mảnh tà không có dây thừa) — xoá khỏi desc + nhắc CUỐI prompt
+NO_TIES = (" IMPORTANT: draw ONLY the flat skirt fabric panel. NO tie, sash, knot, bow, ribbon, string, "
+           "cord or strap anywhere — not hanging, not draped, not tied at the hip — even though the photo "
+           "shows one. The fan outline must be clean and unbroken.")
+_TIE_RE = re.compile(r"\b(sash|tie|ties|tied|knot|bow|ribbon|string|cord|drape)", re.I)
+
+def _strip_ties(desc):
+    """Bỏ các cụm (ngăn bởi ';') nhắc tới dây/nơ/sash khỏi mô tả tà váy."""
+    return "; ".join(p.strip() for p in desc.split(";") if not _TIE_RE.search(p))
 
 # --- gen prompt: MẢNH ÁO/QUẦN/TAY (full-bleed) -> mỗi mảnh in tràn kín khung, không viền ---
 # TRUNG THỰC: tái hiện y họa tiết in kể cả bóng/nổi/giả-3D, chỉ tách 1 panel & tràn mép.
@@ -327,6 +336,7 @@ _PIECES_SCHEMA = (
     "bottom garment. "
     "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
     "PRINT: describe them as artwork on the panel, never as bare skin or an opening. "
+    "For skirt_* do NOT describe loose ties/sashes/knots/strings hanging off the skirt (they are left out). "
     'ALSO add "boxes": {"<panel key>": [x0,y0,x1,y1], ...} with one TIGHT bounding box per panel key '
     "above, integers normalized 0-1000 (x from left, y from top) on the image where that panel is seen "
     "(front panels on the front image/view, back panels on the back image/view). Each box covers ONLY "
@@ -495,7 +505,9 @@ def _make_piece(spec, refs, work, out, flat=False):
     if spec["kind"] == "dress":
         tmp = work / f"gen_{spec['slug']}.png"
         base = DRESS_FLAT if flat else DRESS_FAITHFUL
-        gen_panel(base + spec["shape"] + note + " " + spec["desc"],
+        fan = spec["shape"] is SHAPE_FAN
+        desc = _strip_ties(spec["desc"]) if fan else spec["desc"]
+        gen_panel(base + spec["shape"] + note + " " + desc + (NO_TIES if fan else ""),
                   [crop or ref, ASSETS / spec["guide"], *ctx], tmp)
         cutout(tmp).save(dst)                               # cắt theo silhouette, nền trong suốt
     else:
@@ -945,6 +957,8 @@ def _selfcheck():
         assert seen[-1][1] == [src] and CROP_NOTE not in seen[-1][0]
     finally:
         gen_panel = orig_gen
+    assert _strip_ties("base purple; torn openings, lower left; dark green tied sash motif, right hip") \
+        == "base purple; torn openings, lower left"
     print("selfcheck OK")
 
 
