@@ -59,29 +59,39 @@ def _grid_label(d, xy, text, font):
 
 
 def grid_overlay(src, out, max_side=MAX_SIDE):
-    """1 ảnh gốc (cạnh dài <= max_side) + lưới toạ độ 0-1000 đè lên (vạch mảnh bán trong suốt mỗi
-    100 đơn vị, nhãn số ở mép trên/trái) -> cho judge.locate đọc toạ độ bbox chính xác hơn so với
-    tile ~384px của contact sheet, khi 1 ảnh gốc chứa nhiều biến thể (vd lưới 2x4 có số thứ tự)."""
+    """1 ảnh gốc (cạnh dài <= max_side) + lưới toạ độ PIXEL đè lên (vạch bán trong suốt mỗi 100px,
+    nhãn số px ở mép trên/trái) -> cho judge.locate đọc bbox chính xác hơn tile ~384px của contact
+    sheet. Dùng pixel chứ không 0-1000: thử thật, Claude luôn trả toạ độ pixel dù nhãn ghi 0-1000."""
     im = Image.open(src).convert("RGB")
     if max(im.size) > max_side:
         im.thumbnail((max_side, max_side))
     w, h = im.size
     overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay)
-    for g in range(0, 1001, 100):
-        x, y = g * w // 1000, g * h // 1000
-        d.line([(x, 0), (x, h)], fill=(255, 60, 0, 120), width=1)
-        d.line([(0, y), (w, y)], fill=(255, 60, 0, 120), width=1)
+    for g in range(0, max(w, h) + 1, 100):
+        d.line([(g, 0), (g, h)], fill=(255, 60, 0, 120), width=1)
+        d.line([(0, g), (w, g)], fill=(255, 60, 0, 120), width=1)
     im = Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
     d2 = ImageDraw.Draw(im)
     font = ImageFont.load_default(size=16)
-    for g in range(0, 1001, 100):
-        x, y = g * w // 1000, g * h // 1000
-        _grid_label(d2, (x + 2, 2), str(g), font)
-        _grid_label(d2, (2, y + 2), str(g), font)
+    for g in range(0, max(w, h) + 1, 100):
+        if g < w:
+            _grid_label(d2, (g + 2, 2), str(g), font)
+        if g < h:
+            _grid_label(d2, (2, g + 2), str(g), font)
     out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
     im.save(out, quality=90)
     return out
+
+
+def px_to_box(box, w, h, pad=0.03):
+    """bbox pixel [x0,y0,x1,y1] trên ảnh w x h -> 0-1000, nới mỗi phía `pad` (đỡ cụt tay áo), kẹp biên."""
+    if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)):
+        return None
+    x0, y0, x1, y1 = box
+    px, py = pad * w, pad * h
+    return [int(max(0, min(1000, v))) for v in ((x0 - px) * 1000 / w, (y0 - py) * 1000 / h,
+                                                (x1 + px) * 1000 / w, (y1 + py) * 1000 / h)]
 
 
 # ---------- claude -p ----------
@@ -299,12 +309,12 @@ Re-pick ONLY among photos of THIS variant/product type: {variant} / {garment} / 
 Return ONLY: {{"hint": "...", "front": 1, "crop": null}}"""
 
 LOCATE = """This photo may show SEVERAL design variants laid out together (numbered/labelled designs,
-men's/women's, different colours...). A 0-1000 coordinate grid is drawn on top of the image, with
-labels (0,100,...,1000) along the top and left edges, so you can read precise coordinates.
-Return ONLY {{"box": [x0,y0,x1,y1]}} with integers on this drawn 0-1000 grid, tightly covering THIS
-variant's garment ({variant}; order rows: {skus}). If each variant shows both an adult garment and a
-kid garment side by side, take the {kind} one. Include the whole garment: its front, and its back too
-if shown side by side with the front.
+men's/women's, different colours...). The image is {w}x{h} pixels; red grid lines are drawn every
+100 px, labelled in pixels along the top and left edges.
+Return ONLY {{"box": [x0,y0,x1,y1]}} as integer PIXEL coordinates of this image, tightly covering
+THIS variant's garment ({variant}; order rows: {skus}) — not a neighbouring number/variant. If each
+variant shows both an adult garment and a kid garment side by side, take the {kind} one. Include the
+whole garment: its front, and its back too if shown side by side with the front.
 Return {{"box": null}} if this variant can't be found in the photo."""
 
 
@@ -326,11 +336,12 @@ def rehint(sheet, fails, n_src, variant="default", garment="top_bottom", skus=""
 
 
 def locate(photo_with_grid, variant, skus, kid):
-    """Ảnh gốc + lưới toạ độ (grid_overlay) -> bbox 0-1000 của ĐÚNG biến thể `variant` (SKU: `skus`)
+    """Ảnh gốc + lưới pixel (grid_overlay) -> bbox 0-1000 của ĐÚNG biến thể `variant` (SKU: `skus`)
     trong ảnh, chọn áo người lớn/trẻ em theo `kid`. None nếu Claude không định vị được / toạ độ hỏng."""
     kind = "KID" if kid else "ADULT"
-    js = ask(LOCATE.format(variant=variant, skus=skus or "-", kind=kind), [photo_with_grid])
-    return _box_small(js.get("box"))
+    w, h = Image.open(photo_with_grid).size
+    js = ask(LOCATE.format(w=w, h=h, variant=variant, skus=skus or "-", kind=kind), [photo_with_grid])
+    return _box_small(px_to_box(js.get("box"), w, h))
 
 
 def _selfcheck():
@@ -482,13 +493,16 @@ def _selfcheck():
     # #13 locate: truyền đúng variant/SKU/KID-ADULT vào prompt; box hợp lệ/qua _box_small, None khi không thấy
     def fake_ask_locate(prompt, images, timeout=300):
         captured["locate_prompt"] = prompt
-        return {"box": [100, 200, 600, 900]}
+        return {"box": [80, 80, 480, 320]}          # pixel trên ảnh lưới 800x400
     globals()["ask"] = fake_ask_locate
     try:
         b = locate(gout, "Design 2", "SKU-A; SKU-B", True)
     finally:
         globals()["ask"] = orig_ask
-    assert b == [100, 200, 600, 900]
+    assert gim.size == (800, 400) and "800x400 pixels" in captured["locate_prompt"]
+    assert b == [70, 170, 630, 830]               # px -> 0-1000, nới 3% mỗi phía
+    assert px_to_box([0, 0, 800, 400], 800, 400) == [0, 0, 1000, 1000]   # kẹp biên
+    assert px_to_box(None, 800, 400) is None and px_to_box([1, 2, 3], 800, 400) is None
     assert "Design 2" in captured["locate_prompt"] and "SKU-A; SKU-B" in captured["locate_prompt"]
     assert "KID" in captured["locate_prompt"]
 
