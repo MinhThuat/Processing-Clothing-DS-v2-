@@ -300,8 +300,12 @@ score 1-10, errors = codes from:
  hood on a torso piece, a person, hanger, mockup; a bodice (than) piece that includes a real area of
  skirt or pants below the waist (a thin waistband/trim strip at its bottom edge is FINE, not an
  error); a skirt (ta) piece showing bodice/torso above it, drawn as pants or
- shorts with separate legs, or with a loose tie/sash/bow/knot hanging off it), khong_tran (torso/pants/sleeve piece not full-bleed:
- margins, border or garment outline visible), vung_den (plain areas filled black/void/glow; a glow,
+ shorts with separate legs, or with a loose tie/sash/bow/knot hanging off it; a SLEEVE (tay) piece whose
+ print differs from the sleeve in the reference — e.g. pants stripes/chevrons or torso graphics on a plain
+ sleeve: compare each tay piece ONLY with the reference's sleeve), khong_tran (torso/pants/sleeve piece not full-bleed:
+ margins, border or garment outline visible; the piece shows the garment's SHAPE — a 3D-looking pair of
+ pants with legs/crotch/cuffs, a hoodie silhouette — or a black/white/grey background around it,
+ instead of the flat print filling the whole frame), vung_den (plain areas filled black/void/glow; a glow,
  halo, dark fringe or shadow around a cut-out dress piece),
  cat_loi (dress cut-out broken / missing corners), art_thieu (art misses front details or wrong
  top/bottom layout).
