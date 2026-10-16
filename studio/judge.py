@@ -5,7 +5,7 @@ Luôn ghép nhiều ảnh thành 1 contact sheet trước khi gửi (tiết ki�
 import json, math, os, re, subprocess, tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 
 from batch_errors import StepError, raise_for
 
@@ -50,6 +50,40 @@ def contact_sheet(rows, out, tile=TILE, max_side=MAX_SIDE):
     return out
 
 
+def _grid_label(d, xy, text, font):
+    """Chữ trắng viền đen -> đọc được trên nền sáng lẫn tối."""
+    x, y = xy
+    for dx, dy in ((-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)):
+        d.text((x + dx, y + dy), text, fill="black", font=font)
+    d.text((x, y), text, fill="white", font=font)
+
+
+def grid_overlay(src, out, max_side=MAX_SIDE):
+    """1 ảnh gốc (cạnh dài <= max_side) + lưới toạ độ 0-1000 đè lên (vạch mảnh bán trong suốt mỗi
+    100 đơn vị, nhãn số ở mép trên/trái) -> cho judge.locate đọc toạ độ bbox chính xác hơn so với
+    tile ~384px của contact sheet, khi 1 ảnh gốc chứa nhiều biến thể (vd lưới 2x4 có số thứ tự)."""
+    im = Image.open(src).convert("RGB")
+    if max(im.size) > max_side:
+        im.thumbnail((max_side, max_side))
+    w, h = im.size
+    overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    for g in range(0, 1001, 100):
+        x, y = g * w // 1000, g * h // 1000
+        d.line([(x, 0), (x, h)], fill=(255, 60, 0, 120), width=1)
+        d.line([(0, y), (w, y)], fill=(255, 60, 0, 120), width=1)
+    im = Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
+    d2 = ImageDraw.Draw(im)
+    font = ImageFont.load_default(size=16)
+    for g in range(0, 1001, 100):
+        x, y = g * w // 1000, g * h // 1000
+        _grid_label(d2, (x + 2, 2), str(g), font)
+        _grid_label(d2, (2, y + 2), str(g), font)
+    out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+    im.save(out, quality=90)
+    return out
+
+
 # ---------- claude -p ----------
 def _extract_json(text):
     m = re.search(r"\{.*\}", text or "", re.S)
@@ -88,12 +122,22 @@ def ask(prompt, images, timeout=300):
 
 
 # ---------- chuẩn hoá JSON trả về ----------
-def _box(b):
+def _box_min(b, min_area):
     ok = (isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)
           and all(0 <= v <= 1000 for v in b) and b[2] > b[0] and b[3] > b[1])
     if ok:
-        ok = (b[2] - b[0]) * (b[3] - b[1]) >= 200_000   # < 20% diện tích 1000x1000 -> bbox không đáng tin -> bỏ
+        ok = (b[2] - b[0]) * (b[3] - b[1]) >= min_area
     return [int(v) for v in b] if ok else None
+
+
+def _box(b):
+    return _box_min(b, 200_000)   # < 20% diện tích 1000x1000 -> bbox không đáng tin -> bỏ
+
+
+def _box_small(b):
+    # judge.locate: ô 1 biến thể trong ảnh ghép nhiều biến thể (vd lưới 2x4) có thể chỉ ~2-12% diện
+    # tích -> ngưỡng thấp hơn _box; vẫn lọc toạ độ hỏng/quá nhỏ do Claude đoán bừa
+    return _box_min(b, 20_000)
 
 
 _BULLET = re.compile(r"^[•\-\*]\s*")
@@ -254,6 +298,15 @@ Also re-pick the input: "front" = label of the best FRONT photo (may differ from
 Re-pick ONLY among photos of THIS variant/product type: {variant} / {garment} / {skus}.
 Return ONLY: {{"hint": "...", "front": 1, "crop": null}}"""
 
+LOCATE = """This photo may show SEVERAL design variants laid out together (numbered/labelled designs,
+men's/women's, different colours...). A 0-1000 coordinate grid is drawn on top of the image, with
+labels (0,100,...,1000) along the top and left edges, so you can read precise coordinates.
+Return ONLY {{"box": [x0,y0,x1,y1]}} with integers on this drawn 0-1000 grid, tightly covering THIS
+variant's garment ({variant}; order rows: {skus}). If each variant shows both an adult garment and a
+kid garment side by side, take the {kind} one. Include the whole garment: its front, and its back too
+if shown side by side with the front.
+Return {{"box": null}} if this variant can't be found in the photo."""
+
 
 def pick(sheet, rows, n):
     lines = "\n".join(f"{r['record_id']} | {r['sku']} | {r['color'] or '-'} | {_opts(r.get('custom'))}"
@@ -270,6 +323,14 @@ def rehint(sheet, fails, n_src, variant="default", garment="top_bottom", skus=""
     js = ask(REHINT.format(fails=txt, n=n_src, variant=variant, garment=garment, skus=skus or "-"), [sheet])
     front = js.get("front") if isinstance(js.get("front"), int) and 1 <= js["front"] <= n_src else None
     return {"hint": str(js.get("hint") or "")[:400], "front": front, "crop": _box(js.get("crop"))}
+
+
+def locate(photo_with_grid, variant, skus, kid):
+    """Ảnh gốc + lưới toạ độ (grid_overlay) -> bbox 0-1000 của ĐÚNG biến thể `variant` (SKU: `skus`)
+    trong ảnh, chọn áo người lớn/trẻ em theo `kid`. None nếu Claude không định vị được / toạ độ hỏng."""
+    kind = "KID" if kid else "ADULT"
+    js = ask(LOCATE.format(variant=variant, skus=skus or "-", kind=kind), [photo_with_grid])
+    return _box_small(js.get("box"))
 
 
 def _selfcheck():
@@ -407,6 +468,39 @@ def _selfcheck():
         globals()["ask"] = orig_ask
     assert r == {"hint": "FIX X", "front": 2, "crop": [10, 10, 500, 500]}
     assert "Men" in captured["prompt"] and "/ top /" in captured["prompt"] and "SKU-A; SKU-B" in captured["prompt"]
+    # #11 _box_small (locate): ngưỡng 2% diện tích (thấp hơn _box 20%) -> nhận ô biến thể ~12%, bỏ ~1%
+    assert _box_small([0, 0, 400, 300]) == [0, 0, 400, 300]     # area 120,000 = 12% -> giữ
+    assert _box_small([0, 0, 100, 100]) is None                 # area 10,000 = 1% -> bỏ
+    assert _box([0, 0, 400, 300]) is None                       # cùng box nhưng dưới ngưỡng 20% của _box
+    # #12 grid_overlay: cạnh dài <= max_side, có vẽ lưới/nhãn đè lên góc trên-trái (khác ảnh gốc)
+    gsrc = td / "g.png"; Image.new("RGB", (2000, 1000), "white").save(gsrc)
+    gout = grid_overlay(gsrc, td / "g_grid.jpg", max_side=800)
+    gim = Image.open(gout)
+    assert max(gim.size) <= 800
+    corner = ImageStat.Stat(gim.convert("L").crop((0, 0, 20, 20))).mean[0]
+    assert corner < 250                        # nhãn "0" vẽ đè góc trên-trái -> không còn trắng tinh
+    # #13 locate: truyền đúng variant/SKU/KID-ADULT vào prompt; box hợp lệ/qua _box_small, None khi không thấy
+    def fake_ask_locate(prompt, images, timeout=300):
+        captured["locate_prompt"] = prompt
+        return {"box": [100, 200, 600, 900]}
+    globals()["ask"] = fake_ask_locate
+    try:
+        b = locate(gout, "Design 2", "SKU-A; SKU-B", True)
+    finally:
+        globals()["ask"] = orig_ask
+    assert b == [100, 200, 600, 900]
+    assert "Design 2" in captured["locate_prompt"] and "SKU-A; SKU-B" in captured["locate_prompt"]
+    assert "KID" in captured["locate_prompt"]
+
+    def fake_ask_locate2(prompt, images, timeout=300):
+        captured["locate_prompt2"] = prompt
+        return {"box": None}
+    globals()["ask"] = fake_ask_locate2
+    try:
+        b2 = locate(gout, "Design 3", "SKU-C", False)
+    finally:
+        globals()["ask"] = orig_ask
+    assert b2 is None and "ADULT" in captured["locate_prompt2"]
     print("judge selfcheck OK")
 
 

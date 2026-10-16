@@ -38,6 +38,13 @@ HINT_FROM = 2            # lần bắt đầu dùng hint (lần y nguyên thứ 
 SAME_ERR_STOP = 5        # 5 nhóm liên tiếp lỗi cùng kiểu -> dừng đợt
 _SIZE = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|\d{1,2}XL|\d{1,2}T|\d{1,2}Y|\d{1,2}-\d{1,2}Y?"
                    r"|one ?size|free ?size|\d+(\.\d+)?\s*(x\s*\d+(\.\d+)?)?\s*(in|inch|cm)?)$", re.I)
+_KID_RE = re.compile(r"\b(\d{1,2}T|Youth|Kids?|Toddler)\b", re.I)
+
+
+def _is_kid(sku):
+    """SKU Design có size/từ khoá trẻ em (4T, Youth M, Kid Tennis, Toddler...) -> True. Dùng để
+    judge.locate biết chọn áo người lớn hay trẻ em khi 1 ô thiết kế có cả 2 (vd polo + áo trẻ em)."""
+    return bool(_KID_RE.search(sku or ""))
 
 
 # ---------- tên ----------
@@ -621,6 +628,41 @@ def upload_rows(rows, files, notes, dry, done_ids):
                 log("up", f"ghi note up thất bại: {e}")
 
 
+def _needs_locate(group, front_counts):
+    """Nhóm cần định vị lại bằng ảnh lớn + lưới toạ độ: front dùng chung với nhóm khác (nhiều biến
+    thể trên 1 ảnh, contact sheet ~384px/tile quá nhỏ để Claude thấy rõ từng ô), hoặc nhóm đã có crop
+    (toạ độ đoán từ tile nhỏ -> đáng nghi, định vị lại cho chính xác hơn)."""
+    return front_counts[group["front"]] > 1 or group["crop"] is not None
+
+
+def _locate_groups(groups, rows, srcs, gdir):
+    """Với mỗi nhóm cần định vị (`_needs_locate`): dựng gdir/grid_<front>.jpg (ảnh gốc + lưới 0-1000,
+    dùng chung cho các nhóm cùng front) rồi hỏi Claude khoanh CHÍNH XÁC vùng của biến thể đó -> cập
+    nhật group['crop']. Không tìm thấy / judge lỗi -> giữ crop cũ, không phá nhóm/đợt."""
+    front_counts = Counter(g["front"] for g in groups)
+    grids = {}
+    for group in groups:
+        if not _needs_locate(group, front_counts):
+            continue
+        front = group["front"]
+        if front not in grids:
+            grids[front] = judge.grid_overlay(srcs[front - 1], gdir / f"grid_{front}.jpg")
+        sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
+        skus = "; ".join(sorted({r["sku"] for r in sub_rows}))
+        kid = any(_is_kid(r["sku"]) for r in sub_rows)
+        try:
+            box = judge.locate(grids[front], group["variant"], skus, kid)
+        except StepError as e:
+            log("locate", f"{group['variant']}/{group['color']}: lỗi, giữ crop cũ: {e}")
+            continue
+        if box:
+            group["crop"] = box
+            log("locate", f"{group['variant']}/{group['color']}: crop={box}")
+        else:
+            log("locate", f"{group['variant']}/{group['color']}: không định vị được, giữ crop cũ "
+                          f"{group['crop']}")
+
+
 # ---------- 1 nhóm ----------
 def cleanup(gdir):
     """Sau khi up xong: xoá ảnh tải về + bản trung gian; giữ out/, contact sheet, json, log."""
@@ -664,6 +706,8 @@ def process_group(g, rundir, day, dry, stats):
             log("lỗi", f"unassigned (judge không xác định được): {unassigned}")
             if not dry:
                 lb.write_notes({rid: note for rid in unassigned})
+        _locate_groups(pick["groups"], rows, srcs, gdir)
+        (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
         log("pick", "; ".join(f"{g['variant']}/{g['color']}: front={g['front']} back={g['back']} "
                               f"mode={g['mode']}" for g in pick["groups"]))
         any_fail = False
@@ -792,6 +836,12 @@ def _selfcheck():
     assert sku_stem("X") == "X"
     assert piece_filename("A/B-Black-Tee-M-G1", "tay_sau", failed=True) == "A_B-Black-Tee_tay_sau_QAFAIL.png"
     assert piece_filename("A-Tee-S-G1", "art") == "A-Tee_art.png"
+    # _is_kid: size/từ khoá trẻ em trong SKU Design -> True (để judge.locate chọn áo người lớn/trẻ em)
+    assert _is_kid("HKH032604A21-Black-Kid Tennis Shirt-M-G130426")
+    assert _is_kid("HKH032604A21-Black-2D Hoodie-4T-G130426")
+    assert _is_kid("HKH032604A21-Black-2D Hoodie-Youth M-G130426")
+    assert not _is_kid("HKH032604A21-Black-2D Hoodie-L-G130426")
+    assert not _is_kid("HKH032604A21-Black-2D Hoodie-2XL-G130426")
     # hàng đợi: lọc, chỉ đúng ngày `day`, gom theo bộ link, mới nhất trước
     def row(rid, links, created, **kw):
         return {"record_id": rid, "sku": f"S-{rid}-Tee-M-G1", "color": "", "created": created,
@@ -1207,6 +1257,56 @@ def _selfcheck():
     finally:
         globals()["download"] = orig_download
         judge.pick, judge.contact_sheet = orig_pick, orig_sheet
+        globals()["process_subgroup"] = orig_subgroup
+        lb.write_notes = orig_write_notes
+    # #2 process_group: 2 nhóm chung 1 ảnh (front=1, vd lưới 8 thiết kế trên 1 tấm) -> phải gọi
+    # judge.locate (ảnh lớn + lưới toạ độ, dựng 1 LẦN cho cả 2 nhóm) để định vị chính xác từng biến
+    # thể; crop định vị được thì cập nhật vào group (và tới process_subgroup), không định vị được
+    # thì giữ crop cũ; kid=True/False truyền đúng theo SKU Design của từng nhóm
+    orig_grid_overlay, orig_locate = judge.grid_overlay, judge.locate
+    calls_pg2 = {"overlay": [], "locate": [], "subgroup_crop": {}}
+
+    def fake_grid_overlay2(src, out, max_side=1600):
+        calls_pg2["overlay"].append(str(src))
+        out = Path(out); out.parent.mkdir(parents=True, exist_ok=True); out.write_bytes(b"g"); return out
+
+    def fake_locate2(photo, variant, skus, kid):
+        calls_pg2["locate"].append((variant, skus, kid))
+        return [100, 100, 600, 600] if variant == "Design 2" else None
+
+    def fake_subgroup3(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+        calls_pg2["subgroup_crop"][group["variant"]] = group["crop"]; return False
+
+    judge.grid_overlay, judge.locate = fake_grid_overlay2, fake_locate2
+    globals()["download"], judge.pick, judge.contact_sheet = fake_download2, None, fake_sheet2
+    globals()["process_subgroup"] = fake_subgroup3
+    lb.write_notes = fake_write_notes2
+    calls_pg["write"].clear()
+
+    def fake_pick3(sheet, rows, n):
+        return {"skip": None, "manual": {}, "unassigned": [],
+                "groups": [{"variant": "Design 2", "color": "photo", "matches_photo": True, "front": 1,
+                           "back": None, "mode": "infer", "crop": None, "garment": "top_bottom",
+                           "record_ids": ["a"]},
+                          {"variant": "Design 3", "color": "photo", "matches_photo": True, "front": 1,
+                           "back": None, "mode": "infer", "crop": None, "garment": "top_bottom",
+                           "record_ids": ["b"]}]}
+    judge.pick = fake_pick3
+    try:
+        rows_pg2 = [{"record_id": "a", "sku": "S-a-Tee-L-G1"}, {"record_id": "b", "sku": "S-b-Tee-4T-G1"}]
+        g_pg2 = {"links": ["u1"], "rows": rows_pg2, "newest": "2026-10-16T00:00:00"}
+        stats_pg2 = Counter()
+        kind2 = process_group(g_pg2, Path(tempfile.mkdtemp()), "2026-10-16", False, stats_pg2)
+        assert kind2 is None
+        assert calls_pg2["overlay"] == [calls_pg2["overlay"][0]] * 1       # ảnh front chung -> dựng grid 1 LẦN
+        assert sorted(calls_pg2["locate"]) == [("Design 2", "S-a-Tee-L-G1", False),
+                                               ("Design 3", "S-b-Tee-4T-G1", True)]
+        assert calls_pg2["subgroup_crop"]["Design 2"] == [100, 100, 600, 600]  # định vị được -> cập nhật crop
+        assert calls_pg2["subgroup_crop"]["Design 3"] is None                 # không định vị được -> giữ cũ
+    finally:
+        globals()["download"] = orig_download
+        judge.pick, judge.contact_sheet = orig_pick, orig_sheet
+        judge.grid_overlay, judge.locate = orig_grid_overlay, orig_locate
         globals()["process_subgroup"] = orig_subgroup
         lb.write_notes = orig_write_notes
     print("batch selfcheck OK")
