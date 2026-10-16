@@ -114,7 +114,8 @@ DRESS_FAITHFUL = (
     "NOTHING else (so the panel can be cut out cleanly). REPRODUCE the panel's printed artwork FAITHFULLY "
     "exactly as in the reference photo — keep every colour, detail, shading, soft highlight and any raised "
     "faux-3D / moulded look; do NOT flatten or simplify it into plain vector. No human body, no head, no "
-    "arms, no legs, no hanger, no mockup.")
+    "arms, no legs, no hanger, no mockup. The grey background is flat and even right up to the panel edge: "
+    "NO glow, halo, aura, vignette, drop shadow or dark outline around the panel.")
 # PHẲNG: vẽ vector phẳng như bản gốc (bỏ hết bóng/nổi/3D) — dùng khi user chọn "Art phẳng" cho mảnh.
 DRESS_FLAT = (
     "A 2D FLAT VECTOR sewing-pattern PANEL, absolutely flat and symmetric, front view, on a plain flat "
@@ -123,7 +124,8 @@ DRESS_FLAT = (
     "CAD flat: NO fabric texture, NO shading, NO soft highlight, NO gradient, NO drop shadow, NO 3D, NO "
     "moulded look, NO photo-realism, completely matte. Clean geometric shapes + clean solid/dashed stitch "
     "lines. No human body, no head, no arms, no legs, no hanger, no mockup.")
-SHAPE_BODICE = " Shape: a sleeveless bodice tank panel like the second reference (shape guide)."
+SHAPE_BODICE = (" Shape: a sleeveless bodice tank panel like the second reference (shape guide). It ENDS at the "
+                "waist seam: NO waistband, belt, skirt or pants fabric below it.")
 SHAPE_FAN = (" Shape: a wide quarter-circle CIRCLE-SKIRT fan panel spread flat like the second "
              "reference (shape guide). Every band follows the curved arc, parallel to the curved hem.")
 # tà váy: bỏ dây/nơ/sash thắt lủng lẳng (USER: mảnh tà không có dây thừa) — xoá khỏi desc + nhắc CUỐI prompt

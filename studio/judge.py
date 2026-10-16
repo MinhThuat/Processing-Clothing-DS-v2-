@@ -211,6 +211,8 @@ def norm_pick(js, rows, n):
     return {"skip": None, "groups": groups, "manual": manual, "unassigned": unassigned}
 
 
+QA_MIN = 8      # điểm sàn: dưới 8 là trượt dù Claude ghi ok (QA từng cho qua mảnh lỗi rõ ở 7-8 điểm)
+
 def norm_qa(js, names):
     got = js.get("pieces") if isinstance(js, dict) and isinstance(js.get("pieces"), dict) else {}
     out = {}
@@ -218,7 +220,8 @@ def norm_qa(js, names):
         r = got.get(n) if isinstance(got.get(n), dict) else {}
         errs = [e for e in (r.get("errors") or []) if e in QA_CODES]
         score = r.get("score") if isinstance(r.get("score"), (int, float)) else 0
-        out[n] = {"ok": bool(r.get("ok")) and not errs, "score": float(score), "errors": errs}
+        out[n] = {"ok": bool(r.get("ok")) and not errs and score >= QA_MIN, "score": float(score),
+                  "errors": errs}
     return out
 
 
@@ -291,10 +294,16 @@ score 1-10, errors = codes from:
  sai_hoa_tiet (artwork missing/extra/misplaced vs reference; a plain blank/white piece when the
  garment has a printed design is sai_hoa_tiet; a piece that replaces a printed
  body/skin illusion with a pattern is sai_hoa_tiet), sai_manh (contains other parts: sleeves or
- hood on a torso piece, a person, hanger, mockup), khong_tran (torso/pants/sleeve piece not full-bleed:
- margins, border or garment outline visible), vung_den (plain areas filled black/void/glow),
+ hood on a torso piece, a person, hanger, mockup; a bodice (than) piece that includes a real area of
+ skirt or pants below the waist (a thin waistband/trim strip at its bottom edge is FINE, not an
+ error); a skirt (ta) piece showing bodice/torso above it, drawn as pants or
+ shorts with separate legs, or with a loose tie/sash/bow/knot hanging off it), khong_tran (torso/pants/sleeve piece not full-bleed:
+ margins, border or garment outline visible), vung_den (plain areas filled black/void/glow; a glow,
+ halo, dark fringe or shadow around a cut-out dress piece),
  cat_loi (dress cut-out broken / missing corners), art_thieu (art misses front details or wrong
  top/bottom layout).
+Be STRICT — these go straight to production. Inspect every tile closely, especially its EDGES and
+borders. score 8 = no visible defect at all; any defect -> ok=false with its code. When in doubt, fail.
 If REF photo shows front and back side by side, use the front view for _truoc pieces and the back
 view for _sau pieces.
 Return ONLY: {{"pieces": {{"<name>": {{"ok": true, "score": 9, "errors": []}}, ...}}}} covering every name."""
@@ -515,6 +524,10 @@ def _selfcheck():
     finally:
         globals()["ask"] = orig_ask
     assert b2 is None and "ADULT" in captured["locate_prompt2"]
+    # điểm sàn QA_MIN: Claude ghi ok nhưng điểm 7 -> vẫn trượt; 8 không lỗi -> đạt
+    q = norm_qa({"pieces": {"a": {"ok": True, "score": 7, "errors": []},
+                            "b": {"ok": True, "score": 8, "errors": []}}}, ["a", "b"])
+    assert q["a"]["ok"] is False and q["b"]["ok"] is True
     print("judge selfcheck OK")
 
 

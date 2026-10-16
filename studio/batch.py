@@ -415,8 +415,10 @@ def _slugs_match(pieces_json_path, names, garment=None):
 def _rehint_target(group, r):
     """Chọn front/crop dùng SAU rehint. mode "combined": ảnh ghép nhiều biến thể/SP trên 1 tấm ->
     front mới rehint trả về có thể LẠC sang biến thể khác -> GIỮ NGUYÊN front+crop của nhóm. Mode
-    khác: dùng front/crop rehint trả về (rơi về front/None cũ nếu rehint không chọn)."""
-    if group["mode"] == "combined":
+    khác: dùng front/crop rehint trả về (rơi về front/None cũ nếu rehint không chọn). Rehint chọn
+    đúng ẢNH SAU của nhóm làm front (hay gặp khi mảnh lỗi là mảnh lưng) -> giữ front cũ, vì vision lại
+    với front = ảnh lưng sẽ tả sai mọi mảnh trước (lỗi thật: Tennis Hulk 16/10)."""
+    if group["mode"] == "combined" or (r["front"] and r["front"] == group.get("back")):
         return group["front"], group["crop"]
     return r["front"] or group["front"], r["crop"]
 
@@ -1166,6 +1168,9 @@ def _selfcheck():
     g_two = {"front": 1, "crop": [0, 0, 500, 1000], "mode": "two"}
     assert _rehint_target(g_two, {"front": 2, "crop": [10, 10, 20, 20]}) == (2, [10, 10, 20, 20])
     assert _rehint_target(g_two, {"front": None, "crop": None}) == (1, None)
+    g_two_b = {**g_two, "back": 2}       # rehint chọn ảnh SAU làm front -> giữ front+crop cũ
+    assert _rehint_target(g_two_b, {"front": 2, "crop": None}) == (1, [0, 0, 500, 1000])
+    assert _rehint_target(g_two_b, {"front": 3, "crop": None}) == (3, None)
     # #5 _parse_args: validate --date/--until TRƯỚC acquire_lock; sai -> SystemExit (ap.error)
     import contextlib
     with contextlib.redirect_stderr(io.StringIO()):
