@@ -453,6 +453,11 @@ FLAT_FROM_3D = (
     "glow, NO fabric texture, NO folds. Do NOT add any graphic that is not in the reference. ")
 FLAT_BLEED = "Fill the whole frame edge to edge like the reference: NO margin, NO border, NO garment outline."
 FLAT_DRESS = "Keep the panel's exact cut shape, on a plain flat light grey background and NOTHING else."
+FLAT_ART = (
+    "The reference image is a technical drawing of a whole outfit. Redraw EXACTLY the same drawing — same "
+    "garments, layout, proportions, every graphic and colour, on the same plain light grey background — as "
+    "clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean outlines, NO 3D, NO shading, NO gradient, "
+    "NO highlights, NO fabric texture, NO folds. Do NOT add anything that is not in the reference. ")
 
 
 def fp_cutout(path):
@@ -648,7 +653,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     # ---- bản PHẲNG: vẽ lại TỪ mảnh 3D đã chốt (ref = đúng mảnh đó) -> không lấn họa tiết mảnh khác (vẽ từ
     # ảnh gốc thì tay phẳng dính sọc thân/quần, Jogger 19/10); art dùng chung ----
     fdir = sdir / "flat"; fdir.mkdir(exist_ok=True)
-    flat_names = [f"{x}_phang" for x in names if x != "art"]
+    flat_names = [f"{x}_phang" for x in names]          # gồm cả art_phang (USER: bộ phẳng đủ như Jogger D5)
 
     def flat_path(name):
         return fdir / f"final_{name[:-len('_phang')]}.png"
@@ -659,7 +664,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         if not ref.exists():
             return
         dress = base.startswith(("than_", "ta_"))       # mảnh đầm cắt cong: vẽ trên nền xám rồi cutout
-        prompt = FLAT_FROM_3D + (FLAT_DRESS if dress else FLAT_BLEED) + (
+        prompt = (FLAT_ART if base == "art" else FLAT_FROM_3D + (FLAT_DRESS if dress else FLAT_BLEED)) + (
             f" FIX: {ctx['hint']}" if ctx["hint"] else "")
         try:
             nonclothing._gen(prompt, ref, flat_path(name))
@@ -697,7 +702,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     if not files:
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
-    note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen) + " · + bản phẳng"
+    note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen) + " · + bản phẳng (mảnh + art)"
     manual = pick.get("manual") or {}
     notes = {r["record_id"]: note + (f" · CẦN CHỈNH: {manual[r['record_id']]}"
                                      if r["record_id"] in manual else "") for r in rows}
