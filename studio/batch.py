@@ -28,7 +28,7 @@ DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expandus
 BATCH = DATA / "batch"
 LOCK = DATA / "batch.lock"
 PIPELINE = ROOT / "flat_pipeline.py"
-GROUP_TIMEOUT = 45 * 60
+GROUP_TIMEOUT = 60 * 60     # 3D + bản phẳng
 QUOTA_WAIT, QUOTA_TRIES = 30 * 60, 3
 UA = {"User-Agent": "Mozilla/5.0"}
 _LOGF = None
@@ -445,8 +445,23 @@ def _rehint_target(group, r):
 
 
 # ---------- 1 nhóm con (biến thể thiết kế + màu) ----------
+FLAT_FROM_3D = (
+    "The reference image is ONE finished garment print panel whose graphics have faux-3D shading. Redraw "
+    "EXACTLY the same panel — same layout, shapes, proportions, every graphic and colour — as clean 2D FLAT "
+    "vector art: SOLID FLAT COLOR FILL, crisp clean edges, NO 3D, NO shading, NO gradient, NO highlights, NO "
+    "glow, NO fabric texture, NO folds. Do NOT add any graphic that is not in the reference. ")
+FLAT_BLEED = "Fill the whole frame edge to edge like the reference: NO margin, NO border, NO garment outline."
+FLAT_DRESS = "Keep the panel's exact cut shape, on a plain flat light grey background and NOTHING else."
+
+
+def fp_cutout(path):
+    from flat_pipeline import cutout
+    return cutout(path)
+
+
 def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
-    """Gen pieces 3D + art cho 1 nhóm con (biến thể + màu) -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
+    """Gen pieces 3D + art, rồi bản PHẲNG của từng mảnh (USER: clothing xuất cả 2 bản, mỗi bản QA riêng) cho
+    1 nhóm con (biến thể + màu) -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
     shutil.rmtree(sdir, ignore_errors=True)    # thử lại cùng ngày: bỏ log/mảnh/pieces.json của lần trước
     sdir.mkdir(parents=True)
     color = None if group["matches_photo"] else group["color"]
@@ -501,7 +516,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         raise StepError("gen", "không ra mảnh nào")
     names.append("art")                     # art lỗi lần 0 -> QA chấm 0 -> được gen lại
 
-    def qa_fn(todo):
+    def make_qa(piece_path, flat=False):
+      def qa_fn(todo):
         n["qa"] += 1
         have = [x for x in todo if piece_path(x).exists()]
         # mảnh chưa ra file (gen lỗi) -> -1, không phải 0, để bản đã từng ra file (dù điểm 0) vẫn thắng
@@ -515,10 +531,11 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     + ([(ctx["back"], "REF back")] if ctx["back"] else []))
             sheet = judge.contact_sheet([refs] + judge.grid([(piece_path(x), x) for x in have], cols=4),
                                         sdir / f"sheet_qa_{n['qa']}.jpg")
-            res.update(judge.qa(sheet, have, colour_desc, len(refs)))
+            res.update(judge.qa(sheet, have, colour_desc, len(refs), flat=flat))
         (sdir / f"qa_{n['qa']}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
         log("qa", " ".join(f"{k}:{'✓' if v['ok'] else '✗'}{v['score']:.0f}" for k, v in res.items()))
         return res
+      return qa_fn
 
     def claude_boxes(slugs):
         """Claude khoanh box mảnh trên ảnh đầu vào hiện tại (lưới pixel) -> ghi đè boxes trong pieces.json.
@@ -609,16 +626,61 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         log("regen", f"hint: {ctx['hint']}")
         return ctx["hint"]
 
-    def keep_fn(name, attempt):
-        src = piece_path(name)
-        if src.exists():
-            (sdir / "attempts").mkdir(exist_ok=True)
-            shutil.copyfile(src, sdir / "attempts" / f"{name}_{attempt}.png")
+    def make_keep(path):
+        def keep_fn(name, attempt):
+            src = path(name)
+            if src.exists():
+                (sdir / "attempts").mkdir(exist_ok=True)
+                shutil.copyfile(src, sdir / "attempts" / f"{name}_{attempt}.png")
+        return keep_fn
 
-    best, fails, regen = improve(names, qa_fn, regen_fn, rehint_fn, keep_fn)
+    best, fails, regen = improve(names, make_qa(piece_path), regen_fn, rehint_fn, make_keep(piece_path))
+
+    # ---- bản PHẲNG: vẽ lại TỪ mảnh 3D đã chốt (ref = đúng mảnh đó) -> không lấn họa tiết mảnh khác (vẽ từ
+    # ảnh gốc thì tay phẳng dính sọc thân/quần, Jogger 19/10); art dùng chung ----
+    fdir = sdir / "flat"; fdir.mkdir(exist_ok=True)
+    flat_names = [f"{x}_phang" for x in names if x != "art"]
+
+    def flat_path(name):
+        return fdir / f"final_{name[:-len('_phang')]}.png"
+
+    def gen_flat_one(name):
+        base = name[:-len("_phang")]
+        ref = sdir / "attempts" / f"{base}_{best[base][0]}.png"
+        if not ref.exists():
+            return
+        dress = base.startswith(("than_", "ta_"))       # mảnh đầm cắt cong: vẽ trên nền xám rồi cutout
+        prompt = FLAT_FROM_3D + (FLAT_DRESS if dress else FLAT_BLEED) + (
+            f" FIX: {ctx['hint']}" if ctx["hint"] else "")
+        try:
+            nonclothing._gen(prompt, ref, flat_path(name))
+            if dress:
+                fp_cutout(flat_path(name)).save(flat_path(name))
+        except StepError as e:
+            if e.kind != "gen":
+                raise
+            log("gen", f"{name}: lỗi gen (tính 1 lần hỏng): {e}")
+
+    def gen_flat(todo):
+        if time.monotonic() > deadline:
+            raise StepError("quá thời gian", "nhóm > 60 phút")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            list(ex.map(gen_flat_one, todo))
+
+    def regen_flat(todo, attempt, hint):
+        log("regen", f"phẳng lần {attempt}: {', '.join(todo)}")
+        for x in todo:
+            flat_path(x).unlink(missing_ok=True)
+        gen_flat(todo)
+
+    gen_flat(flat_names)
+    fbest, ffails, fregen = improve(flat_names, make_qa(flat_path, flat=True), regen_flat,
+                                    lambda fails_: None, make_keep(flat_path))
+    best.update(fbest); regen.update(fregen); fails = {**fails, **ffails}
+
     out = sdir / "out"; out.mkdir(exist_ok=True)
     files = []
-    for name in names:
+    for name in names + flat_names:
         src = sdir / "attempts" / f"{name}_{best[name][0]}.png"
         if src.exists():                    # mảnh chưa từng ra file thì không có gì để up
             dst = out / piece_filename(rows[0]["sku"], name, failed=name in fails)
@@ -626,7 +688,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     if not files:
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
-    note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen)
+    note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen) + " · + bản phẳng"
     manual = pick.get("manual") or {}
     notes = {r["record_id"]: note + (f" · CẦN CHỈNH: {manual[r['record_id']]}"
                                      if r["record_id"] in manual else "") for r in rows}

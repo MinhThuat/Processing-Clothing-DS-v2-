@@ -15,7 +15,7 @@ TILE, MAX_SIDE, LABEL_H = 384, 1600, 28
 SYS = ("You are a meticulous garment-print QA assistant. Use the Read tool to view the image "
        "file(s) you are given, then answer with ONE JSON object only — no prose.")
 QA_CODES = ["mo_nhoe", "sai_mau", "sau_giong_truoc", "sai_hoa_tiet", "sai_manh",
-            "khong_tran", "vung_den", "cat_loi", "art_thieu"]
+            "khong_tran", "vung_den", "cat_loi", "art_thieu", "sai_kieu"]
 
 
 # ---------- contact sheet ----------
@@ -379,8 +379,14 @@ def pick(sheet, rows, n):
     return norm_pick(ask(PICK.format(n=n, rows=lines), [sheet]), rows, n)
 
 
-def qa(sheet, names, colour, n_refs):
-    return norm_qa(ask(QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)), [sheet]), names)
+QA_FLAT = ("\nThese pieces are the FLAT VECTOR version of the print: solid flat colours, crisp clean edges. Any "
+           "3D shading, gradient, highlight, glow, bevel or fabric texture imitating depth is sai_kieu "
+           "(colour bands/stripes that are part of the design itself are fine).")
+
+
+def qa(sheet, names, colour, n_refs, flat=False):
+    prompt = QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)) + (QA_FLAT if flat else "")
+    return norm_qa(ask(prompt, [sheet]), names)
 
 
 def rehint(sheet, fails, n_src, variant="default", garment="top_bottom", skus=""):
