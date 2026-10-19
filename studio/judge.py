@@ -384,9 +384,41 @@ QA_FLAT = ("\nThese pieces are the FLAT VECTOR version of the print: solid flat 
            "(colour bands/stripes that are part of the design itself are fine).")
 
 
-def qa(sheet, names, colour, n_refs, flat=False):
-    prompt = QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)) + (QA_FLAT if flat else "")
+QA_PIECE_TILE, QA_PIECE_MAX = 768, 2400
+
+
+def qa(sheet, names, colour, n_refs, flat=False, extra=""):
+    prompt = QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)) + (QA_FLAT if flat else "") + extra
     return norm_qa(ask(prompt, [sheet]), names)
+
+
+# tiêu chí RIÊNG từng loại mảnh (QA chấm 1 mảnh/lần, ảnh lớn) — tiền tố tên mảnh -> yêu cầu
+PIECE_RULES = [
+    ("ta_", "Dress SKIRT panel: a SYMMETRIC fan (circle-skirt) shape — both straight side edges at the SAME "
+            "angle, a smooth curved waist edge and a smooth curved hem, nothing cut off diagonally; only the "
+            "skirt's print; no tie/sash/bow; no bodice."),
+    ("than_", "Dress BODICE panel: a symmetric sleeveless tank shape from neckline/straps down to the waist "
+              "seam only; only the bodice's print; no skirt fabric below the waist (a thin trim strip is fine)."),
+    ("ao_", "TORSO panel of the top: only the torso print (no sleeves, hood or cuffs), flat, filling the frame."),
+    ("quan_", "PANTS panel: only the pants print, flat, filling the frame — not a 3D pair of pants."),
+    ("tay", "SLEEVE panel: its print must match ONLY the sleeve in the reference (compare with the sleeve "
+            "itself); flat, filling the frame."),
+    ("art", "ART: one flat technical drawing of the whole product front with every front detail."),
+]
+
+
+def piece_rule(name):
+    rule = next((r for p, r in PIECE_RULES if name.startswith(p)), "")
+    if "_sau" in name:
+        rule += (" This is a BACK piece: match the reference BACK view if given; if no back photo, it must be "
+                 "a plausible plainer back WITHOUT front-only graphics.")
+    return f"\nCriteria for {name}: {rule}" if rule else ""
+
+
+def qa_piece(refs, piece, name, colour, flat, out):
+    """Chấm 1 mảnh: hàng 1 = ảnh tham chiếu, hàng 2 = mảnh (ô lớn) + tiêu chí riêng loại mảnh."""
+    sheet = contact_sheet([refs, [(piece, name)]], out, tile=QA_PIECE_TILE, max_side=QA_PIECE_MAX)
+    return qa(sheet, [name], colour, len(refs), flat, piece_rule(name))[name]
 
 
 def rehint(sheet, fails, n_src, variant="default", garment="top_bottom", skus=""):
@@ -600,6 +632,8 @@ def _selfcheck():
         assert find_legend(td / "s.jpg", 11) == 8
     finally:
         globals()["ask"] = orig_ask
+    assert "SYMMETRIC fan" in piece_rule("ta_truoc") and "BACK piece" in piece_rule("ta_sau")
+    assert "SLEEVE" in piece_rule("tay_trai_sau_phang") and piece_rule("xyz") == ""
     print("judge selfcheck OK")
 
 

@@ -29,6 +29,7 @@ BATCH = DATA / "batch"
 LOCK = DATA / "batch.lock"
 PIPELINE = ROOT / "flat_pipeline.py"
 GROUP_TIMEOUT = 60 * 60     # 3D + bản phẳng
+QA_WORKERS = 3              # QA từng mảnh: số lệnh claude -p chạy song song
 QUOTA_WAIT, QUOTA_TRIES = 30 * 60, 3
 UA = {"User-Agent": "Mozilla/5.0"}
 _LOGF = None
@@ -529,9 +530,17 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     + ([(ctx["front"], "REF crop")] if ctx["cropped"] else [])
                     + ([(srcs[group["back"] - 1], "REF back photo")] if ctx["back_cropped"] else [])
                     + ([(ctx["back"], "REF back")] if ctx["back"] else []))
-            sheet = judge.contact_sheet([refs] + judge.grid([(piece_path(x), x) for x in have], cols=4),
-                                        sdir / f"sheet_qa_{n['qa']}.jpg")
-            res.update(judge.qa(sheet, have, colour_desc, len(refs), flat=flat))
+            k = n["qa"]
+
+            def one(x):   # chấm TỪNG mảnh, ảnh lớn + tiêu chí riêng (ảnh ghép chung nhỏ -> QA lọt lỗi dáng)
+                try:
+                    return x, judge.qa_piece(refs, piece_path(x), x, colour_desc, flat,
+                                             sdir / f"sheet_qa_{k}_{x}.jpg")
+                except StepError as e:
+                    log("qa", f"{x}: QA lỗi {e}")
+                    return x, {"ok": False, "score": 0.0, "errors": []}
+            with ThreadPoolExecutor(max_workers=QA_WORKERS) as ex:
+                res.update(dict(ex.map(one, have)))
         (sdir / f"qa_{n['qa']}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
         log("qa", " ".join(f"{k}:{'✓' if v['ok'] else '✗'}{v['score']:.0f}" for k, v in res.items()))
         return res
