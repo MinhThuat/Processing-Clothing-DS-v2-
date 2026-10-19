@@ -664,6 +664,8 @@ def _post_for_image(
     last_revised_prompt: str = ""
     last_phase = "connecting"
     failure_detail: str | None = None
+    model_text = ""          # chữ model trả thay ảnh (thường là câu từ chối kiểm duyệt)
+    image_status = ""        # trạng thái item image_generation_call khi không có result
 
     def emit(msg: str) -> None:
         if progress:
@@ -700,9 +702,12 @@ def _post_for_image(
                     detail = evt["error"].get("message") or detail
                 if detail:
                     failure_detail = str(detail)
+            if t == "response.output_text.done" and isinstance(evt.get("text"), str):
+                model_text = evt["text"]
             if t == "response.output_item.done":
                 item = evt.get("item")
                 if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    image_status = str(item.get("status") or "")
                     if isinstance(item.get("result"), str):
                         image_b64 = item["result"]
                         item_meta = {k: v for k, v in item.items() if k != "result"}
@@ -738,7 +743,9 @@ def _post_for_image(
                 f"backend failed mid-generation: {failure_detail} "
                 f"(events seen: {types_seen})"
             )
-        raise GatewayError(f"no image returned. events seen: {types_seen}")
+        raise GatewayError(
+            f"no image returned (image_status={image_status or '-'}; model_text={model_text[:500]!r}). "
+            f"events seen: {types_seen}")
 
     if last_revised_prompt:
         emit(f"revised prompt: {last_revised_prompt[:120]}")

@@ -21,7 +21,7 @@ import judge
 import lark_base as lb
 import nonclothing
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
-from flat_pipeline import _pieces_plan, _filter_by_garment, PIECE_BOX
+from flat_pipeline import _pieces_plan, _filter_by_garment, PIECE_BOX, CODEX_WORKERS
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expanduser()
@@ -510,7 +510,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         _gen_soft(lambda: pipe(["--art", "--front", ctx["front"], "-o", sdir / "art.png",
                                 "--emit", sdir / "art_work"]))
 
-    # lần 0: pieces (3 mảnh/luồng) + art chạy SONG SONG -> tổng 4 luồng codex (đúng mức cho phép)
+    # lần 0: pieces (GEN_WORKERS mảnh/luồng) + art chạy SONG SONG -> tổng CODEX_WORKERS luồng codex
     _run_both([gen_pieces, gen_art])
     pj = sdir / "pieces.json"
     if not pj.exists():
@@ -610,7 +610,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 gen_pieces(only=slugs, cache=True)     # lần 1: y nguyên; lần sau hint: dùng pieces.json hiện tại
 
         if slugs and need_art:
-            _run_both([do_pieces, gen_art])            # song song: mảnh (3 luồng) + art = 4 luồng codex
+            _run_both([do_pieces, gen_art])            # song song: mảnh + art = CODEX_WORKERS luồng codex
         elif slugs:
             do_pieces()
         elif need_art:
@@ -678,7 +678,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     def gen_flat(todo):
         if time.monotonic() > deadline:
             raise StepError("quá thời gian", "nhóm > 60 phút")
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        with ThreadPoolExecutor(max_workers=CODEX_WORKERS) as ex:
             list(ex.map(gen_flat_one, todo))
 
     def regen_flat(todo, attempt, hint):
@@ -801,11 +801,17 @@ def _check_design_photos(groups, rows, srcs, sheet, log_=None):
             log("design", f"Design {num}: đọc legend lỗi, giữ front={g['front']}: {e}"); continue
         photos = [p for p in m["photos"] if p != legend]
         log("design", f"Design {num} = {m['desc']} -> ảnh {photos} (legend {legend}, pick front={g['front']})")
-        if photos and g["front"] not in photos:
-            log("design", f"Design {num}: pick chọn nhầm ảnh {g['front']} -> đổi sang {photos[0]}")
-            g["front"], g["crop"], g["back"], g["back_crop"] = photos[0], None, None, None
+        # không ảnh riêng nào khớp -> dùng chính ảnh legend (có đủ các design, locate cắt đúng Design N); giữ
+        # front của pick thì locate tìm 'Design N' trên ảnh 1 design khác -> không thấy (Athletic Set D1 19/10)
+        new = photos[0] if photos else legend
+        if g["front"] not in photos:
+            log("design", f"Design {num}: pick chọn {g['front']} không khớp -> đổi sang {new}"
+                          + ("" if photos else " (ảnh legend)"))
+            g["front"], g["crop"], g["back"], g["back_crop"] = new, None, None, None
             if g["mode"] == "two":
                 g["mode"] = "combined"     # ảnh mới thường có cả trước + sau; locate/vision tự tách
+        # ponytail: tin thứ tự judge (ảnh CHỈ có bộ đó xếp đầu); nếu photos[0] lại là ảnh nhóm thì gen cả ảnh
+        g["design_photo"] = bool(photos) and g["front"] == photos[0]
 
 
 def _locate_groups(groups, rows, srcs, gdir):
@@ -842,7 +848,11 @@ def _locate_groups(groups, rows, srcs, gdir):
                           f"{group['crop']}")
             # ảnh dùng chung nhiều nhóm, HOẶC dòng có Name Custom (vd 'Design 3': có thể chỉ 1 dòng của ảnh
             # nhiều design được gắn GEN, hoặc dòng anh em đã up ở lượt trước) -> gen cả ảnh sẽ lấy nhầm design
-            if group["crop"] is None and (front_counts[front] > 1 or custom):
+            # ngoại lệ: front là ảnh khớp ĐẦU của design (legend, `design_photo`) và không chung nhóm khác ->
+            # thường là ảnh chỉ có 1 bộ, locate tìm nhãn 'Design N' không thấy -> gen cả ảnh thay vì loại nhầm
+            # (Athletic Set D1 19/10). Vẫn locate trước: nếu đó lại là ảnh nhóm thì locate cắt được đúng design.
+            sole = group.get("design_photo") and front_counts[front] == 1
+            if group["crop"] is None and (front_counts[front] > 1 or custom) and not sole:
                 failed.append(group)
     return failed
 
@@ -1580,6 +1590,9 @@ def _selfcheck():
         rws1 = [{"record_id": "a", "sku": "S-Tee-M", "custom": "Design: Design 3"}]
         gA1 = {**gA, "crop": None}
         assert _locate_groups([gA1], rws1, [Path("1.jpg")], Path(tempfile.mkdtemp())) == [gA1]
+        # ảnh khớp đầu của Design N (design_photo), không chung nhóm: locate không thấy -> KHÔNG loại (gen cả ảnh)
+        gS = {**gA1, "design_photo": True}
+        assert _locate_groups([gS], rws1, [Path("1.jpg")], Path(tempfile.mkdtemp())) == []
     finally:
         judge.grid_overlay, judge.locate = orig_go, orig_loc
     # Design N: pick chọn nhầm ảnh -> đổi sang ảnh legend nói đúng; đúng sẵn -> giữ; không legend -> giữ
@@ -1592,6 +1605,13 @@ def _selfcheck():
           {"record_id": "e", "sku": "X-Design 1-Jumpsuit", "custom": "Design: Design 1"}]
     _check_design_photos([gD, gOK], rD, [Path(f"{i}.jpg") for i in range(1, 12)], Path("s.jpg"))
     assert gD["front"] == 2 and gD["crop"] is None and gOK["front"] == 2 and gOK["crop"] == [1, 1, 500, 500]
+    # ảnh riêng của đúng design (photos[0]) -> không locate nhãn 'Design N' trên đó; chung ảnh nhóm khác -> vẫn locate
+    assert gD["design_photo"] and _needs_locate(gD, Counter([2]), "Design: Design 1")   # vẫn locate
+    # legend có nhưng không ảnh riêng nào khớp -> dùng ảnh legend (không giữ front sai của pick)
+    judge.match_design = lambda sheet, leg, num, n, garment="outfit": {"desc": "Elsa", "photos": []}
+    gL = {**gD, "front": 3, "mode": "two"}
+    _check_design_photos([gL], rD[:1], [Path(f"{i}.jpg") for i in range(1, 12)], Path("s.jpg"))
+    assert gL["front"] == 8 and gL["crop"] is None and gL["mode"] == "combined" and not gL["design_photo"]
     judge.find_legend = lambda sheet, n: None
     gN = {**gD, "front": 4}
     _check_design_photos([gN], rD[:1], [Path("1.jpg")] * 11, Path("s.jpg"))

@@ -21,7 +21,14 @@ RUNS = DATA / "runs"
 UPLOADS = DATA / "uploads"
 RUNS.mkdir(parents=True, exist_ok=True); UPLOADS.mkdir(parents=True, exist_ok=True)
 PIPELINE = ROOT / "flat_pipeline.py"
-CODEX_AUTH = HOME / ".codex" / "auth.json"
+# = flat_pipeline.CODEX_HOMES (các tài khoản codex của project)
+CODEX_HOMES = [Path(p).expanduser() for p in
+               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
+
+
+def _codex_missing():
+    """Tài khoản codex chưa đăng nhập (chưa có auth.json)."""
+    return [h for h in CODEX_HOMES if not (h / ".codex" / "auth.json").is_file()]
 CODEX_LOGIN_LOG = DATA / "codex_login.log"
 SRC = [ROOT / "server.py", ROOT / "index.html", PIPELINE]
 
@@ -238,8 +245,8 @@ async def state(request):
 
 
 async def codex_status(request):
-    ok = CODEX_AUTH.is_file()
-    return web.json_response({"ok": ok, "reason": "" if ok else "chưa đăng nhập codex",
+    miss = _codex_missing()
+    return web.json_response({"ok": not miss, "reason": "chưa đăng nhập codex: " + ", ".join(map(str, miss)) if miss else "",
                              "src_changed": _src_mtime() > request.app["boot_mtime"]})
 
 
@@ -248,8 +255,8 @@ async def codex_login(request):
     CODEX_LOGIN_LOG.write_text("Đang khởi động codex login...\n", encoding="utf-8")
     with open(CODEX_LOGIN_LOG, "a", encoding="utf-8") as lf:
         try:
-            subprocess.Popen(["codex", "login"], stdout=lf, stderr=lf,
-                             cwd=str(ROOT), shell=(sys.platform == "win32"))
+            subprocess.Popen(["codex", "login"], stdout=lf, stderr=lf, cwd=str(ROOT),
+                             env={**os.environ, "HOME": str((_codex_missing() or CODEX_HOMES)[0])}, shell=(sys.platform == "win32"))
         except Exception as e:
             lf.write(f"Lỗi chạy codex login: {e}\n")
     return web.json_response({"ok": True})
@@ -257,7 +264,7 @@ async def codex_login(request):
 
 async def codex_login_log(request):
     txt = CODEX_LOGIN_LOG.read_text(encoding="utf-8", errors="replace") if CODEX_LOGIN_LOG.exists() else ""
-    return web.json_response({"log": txt, "ok": CODEX_AUTH.is_file()})
+    return web.json_response({"log": txt, "ok": not _codex_missing()})
 
 
 async def restart(request):

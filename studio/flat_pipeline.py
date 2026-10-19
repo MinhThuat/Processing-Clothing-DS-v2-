@@ -20,7 +20,7 @@ Chạy:
 
 Yêu cầu: codex đã đăng nhập + `openart login`; ARK_API_KEY (env hoặc .env cạnh script).
 """
-import argparse, base64, io, json, os, re, subprocess, sys, tempfile, threading, time
+import argparse, base64, io, itertools, json, os, random, re, subprocess, sys, tempfile, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -104,7 +104,15 @@ ENV_FILE = Path(os.getenv("ARK_ENV_FILE", _DEF_ENV))
 ARK_BASE = "https://ark.ap-southeast.bytepluses.com/api/v3"
 VMODELS = ["seed-2-0-lite-260428",   # model chính (dola-seed lite)
            "seed-2-0-mini-260428"]   # backup (dola-seed mini)
-OA_MODEL = "byte-plus-seedream-4-5"
+OA_MODEL = "byte-plus-seedream-4-5"       # fallback mặc định (codex chặn vì IP / lỗi khác)
+# codex chặn vì ảnh 18+ -> nano-banana-2 (USER 19/10): Seedream gen được nhưng khung 4:3 cắt mất gấu/dải trên
+# mảnh (test 9 model mẫu "Christmas balls", nano-banana-2 giống gốc nhất). Lỗi codex IP/18+ y hệt nhau
+# (image_status=failed, không text) -> Claude nhìn ảnh ref để phân loại.
+OA_MODEL_ADULT = "nano-banana-2"
+ADULT_Q = ("Garment print safety check for an image generator. Does the printed graphic on this garment show SEXUAL "
+           "or SUGGESTIVE body imagery: nudity, bare breasts or buttocks, genitals, or a genital/testicle-shaped "
+           "novelty joke (e.g. hairy 'Christmas balls')? Licensed/cartoon characters, muscles or abs prints alone "
+           'are NOT adult. Return ONLY JSON {"adult": true|false, "why": "<5 words>"}')
 
 # --- gen prompt: MẢNH VÁY (cắt cong) -> vẽ trên nền xám rồi cutout() theo silhouette ---
 # TRUNG THỰC: giữ nguyên chi tiết/bóng/hiệu ứng nổi giả-3D của họa tiết in, chỉ tách mảnh
@@ -249,27 +257,30 @@ def _codex_vision(content, timeout=240):
         mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
         ld.exec_module(mod)
         _CIG = mod                          # gán SAU khi nạp xong: luồng song song không thấy module dở
-    try:
-        auth = _CIG._load_auth()
-    except SystemExit as e:                 # chatgpt-imagegen sys.exit khi chưa login -> để _vision fallback dola
-        raise RuntimeError(f"codex chưa đăng nhập: {e}")
-    access, account, _ = _CIG._extract_access_token(auth)
-    if not access:
-        raise RuntimeError("codex chưa đăng nhập")
-    # ponytail: không tự refresh token hết hạn; bước gen (chatgpt-imagegen) tự refresh rồi lần sau chạy được
     parts = [{"type": "input_image", "image_url": c["image_url"]["url"]} if c["type"] == "image_url"
              else {"type": "input_text", "text": c["text"]} for c in content]
     body = {"model": os.getenv("CHATGPT_IMAGEGEN_MODEL", "gpt-5.6-sol"), "stream": True,
             "instructions": "You are an image generation assistant.",   # endpoint chỉ nhận instructions allowlist
             "input": [{"type": "message", "role": "user", "content": parts}],
             "store": False, "reasoning": {"effort": "low"}, "text": {"verbosity": "low"}}
-    headers = _CIG._build_headers(access, account, _CIG._detect_codex_version())
-    for ev in _CIG._stream(_CIG.CODEX_BACKEND, headers, body, time.monotonic() + timeout, 120):
-        if ev.get("type") == "response.output_text.done":
-            return ev.get("text", "")
-        if ev.get("type") in ("response.failed", "response.incomplete", "error"):
-            raise RuntimeError(f"codex: {str(ev)[:120]}")
-    return ""
+
+    def one(home):                          # đọc auth.json của TỪNG tài khoản (không đụng AUTH_PATH chung của module)
+        try:
+            auth = json.loads((home / ".codex" / "auth.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"codex chưa đăng nhập: {e}")
+        access, account, _ = _CIG._extract_access_token(auth)
+        if not access:
+            raise RuntimeError("codex chưa đăng nhập")
+        # ponytail: không tự refresh token hết hạn; bước gen (chatgpt-imagegen) tự refresh rồi lần sau chạy được
+        headers = _CIG._build_headers(access, account, _CIG._detect_codex_version())
+        for ev in _CIG._stream(_CIG.CODEX_BACKEND, headers, body, time.monotonic() + timeout, 120):
+            if ev.get("type") == "response.output_text.done":
+                return ev.get("text", "")
+            if ev.get("type") in ("response.failed", "response.incomplete", "error"):
+                raise RuntimeError(f"codex: {str(ev)[:300]}")
+        return ""
+    return _with_accounts(one)
 
 def _vision(client, img, prompt, need=()):
     """Gọi vision với fallback qua VMODELS, log từng lần thử. `need` = key bắt buộc trong JSON.
@@ -325,19 +336,22 @@ _PIECES_SCHEMA = (
     "words or hex; no prose). If a detail looks raised/embossed/moulded/3D-shaded, note that. Return ONLY JSON. "
     "If it is a DRESS (one-piece: sleeveless bodice + skirt): "
     '{"type":"dress","bodice_front":"..","bodice_back":"..","skirt_front":"..","skirt_back":".."}. '
-    "If it is a TOP + BOTTOM (a separate upper garment + pants/shorts): "
+    "If it is a TOP + BOTTOM (a separate upper garment + pants/shorts/skirt): "
     '{"type":"top_bottom","top_front":"..","top_back":"..","pants_front":"..","pants_back":"..",'
     '"sleeves_same":true,"sl_front":"..","sl_back":"..","sr_front":"..","sr_back":".."}. '
     "top_*/pants_* = the TORSO/BODY resp. LEGS panel (top EXCLUDES sleeves, hood, collar). "
     "sl_front/sl_back = the LEFT sleeve's front-facing / back-facing print; sr_front/sr_back = the RIGHT "
     "sleeve's. sleeves_same = true if both sleeves carry the SAME print (then sr_* may repeat sl_*), "
-    "false if the two sleeves clearly differ. "
+    "false if the two sleeves clearly differ. If the top has NO sleeves (tank/sleeveless), set sl_*/sr_* to "
+    '"none". '
     "If it is a TOP ONLY (no separate bottom garment — e.g. a T-shirt/sweatshirt/hoodie, even if its print "
     "depicts fake pants/shorts/underwear/legs below the waist): "
     '{"type":"top","top_front":"..","top_back":"..","sleeves_same":true,"sl_front":"..","sl_back":"..",'
     '"sr_front":"..","sr_back":".."}. '
     "If it is a BOTTOM ONLY (pants/jogger/shorts, or a skirt — describe the skirt in pants_* too): "
     '{"type":"bottom","pants_front":"..","pants_back":".."}. '
+    'For top_bottom/bottom ALSO add "bottom_is_skirt": true if the bottom garment is a SKIRT or skort '
+    "(skirt with built-in shorts), false for pants/shorts/joggers. "
     "Printed underwear/legs/body on the LOWER part of a top are PART OF THE TOP's print, not a separate "
     "bottom garment. "
     "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
@@ -407,7 +421,7 @@ def _filter_by_garment(items, garment):
     def slug(x):
         return x["slug"] if isinstance(x, dict) else x
     if garment == "top":
-        keep = lambda x: not slug(x).startswith("quan_")
+        keep = lambda x: not slug(x).startswith(("quan_", "ta_"))
     elif garment == "bottom":
         keep = lambda x: not (slug(x).startswith("ao_") or slug(x).startswith("tay"))
     else:
@@ -421,6 +435,18 @@ def _desc(js, key):
     """Mô tả panel theo `key`; vision bỏ sót *_back -> suy từ mặt trước tương ứng (USER DECISION:
     SP có phần nào thì luôn đủ 2 mặt của phần đó, không được thiếu mảnh sản xuất)."""
     return js.get(key) or js.get(_BACK_FALLBACK.get(key, ""))
+
+# áo không tay: vision vẫn trả sl_* kiểu "base none; garment is sleeveless, no sleeve panel present" -> không
+# gen mảnh tay (gen ra mảnh vô nghĩa, QA trượt cả 3 lần: Athletic Set tank 19/10)
+_NO_SLEEVE = re.compile(r"^\W*(base\s+)?(none|n/?a)\b|^\W*sleeveless|\b(garment|top|shirt) is sleeveless"
+                        r"|\bno sleeves?\b|\bwithout sleeves", re.I)
+
+def _is_skirt(js):
+    """Phần dưới là váy/skort (USER 19/10: Athletic Set -> mảnh quạt như Tennis Skirt, không phải mảnh quần).
+    Vision quên cờ bottom_is_skirt -> nhận theo chữ trong mô tả."""
+    if isinstance(js.get("bottom_is_skirt"), bool):
+        return js["bottom_is_skirt"]
+    return bool(re.search(r"\bsk(irt|ort)", f"{js.get('pants_front') or ''} {js.get('pants_back') or ''}", re.I))
 
 def _box(js, key):
     """Box 0-1000 của panel `key` (vision 'boxes'); hỏng/nhỏ (<15% mỗi chiều) -> None (dùng ảnh nguyên).
@@ -462,7 +488,14 @@ def _pieces_plan(js):
             if desc:
                 plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug],
                                  box=_box(js, key)))
-    if typ != "top":      # bottom / top_bottom: quần
+    if typ != "top" and _is_skirt(js):   # bottom / top_bottom là VÁY -> mảnh quạt như tà Tennis Skirt
+        for slug, key, side in [("ta_truoc", "pants_front", "front"), ("ta_sau", "pants_back", "back")]:
+            desc = _desc(js, key)
+            if desc:   # box: Claude khoanh lại (lần 3) ghi vào skirt_*, vision ban đầu ghi pants_*
+                plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=SHAPE_FAN,
+                                 guide="shape_fan.png",
+                                 box=_box(js, key.replace("pants_", "skirt_")) or _box(js, key)))
+    elif typ != "top":    # bottom / top_bottom: quần
         for slug, key, side in [("quan_truoc", "pants_front", "front"), ("quan_sau", "pants_back", "back")]:
             desc = _desc(js, key)
             if desc:
@@ -476,7 +509,7 @@ def _pieces_plan(js):
                        ("tay_phai_truoc", "sr_front", "front"), ("tay_phai_sau", "sr_back", "back")]
         for slug, key, side in sleeves:
             desc = js.get(key) or js.get(key.replace("sr_", "sl_"))   # thiếu tay phải -> mượn trái
-            if desc:
+            if desc and not _NO_SLEEVE.search(desc):
                 plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug],
                                  box=_box(js, key)))
     if GARMENT and GARMENT != typ:
@@ -579,6 +612,80 @@ def _bin(name):
             return str(b)
     return name
 CHATGPT_BIN = _bin("chatgpt-imagegen")
+# tài khoản codex của project (USER 19/10: dùng CẢ 2): mỗi cái là 1 thư mục HOME chứa .codex/auth.json
+# (chatgpt-imagegen đọc auth theo $HOME). Đổi bằng env FLAT_CODEX_HOMES (các đường dẫn nối bằng os.pathsep).
+CODEX_HOMES = [Path(p).expanduser() for p in
+               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
+_ACC_NEXT = itertools.count(os.getpid())   # xoay vòng; lệch theo pid -> các tiến trình con không cùng dồn 1 tài khoản
+# lỗi do TÀI KHOẢN (quá tải / hạn mức / đăng nhập / treo) -> thử tài khoản kia. Lỗi do NỘI DUNG (ảnh bị chặn:
+# "no image returned") -> không đổi: tài khoản nào cũng chặn, chỉ mất thêm ~1 phút.
+ACC_RETRY_RE = re.compile(r"overloaded|HTTP 429|usage[_ ]limit|rate[_ ]limit|quota|HTTP 401|unauthori"
+                          r"|token refresh failed|not found|no such file|chưa đăng nhập|timed out|stalled", re.I)
+
+def _accounts():
+    """Thứ tự tài khoản cho 1 lần gọi (xoay vòng)."""
+    k = next(_ACC_NEXT) % len(CODEX_HOMES)
+    return CODEX_HOMES[k:] + CODEX_HOMES[:k]
+
+def _acc_env(home):
+    """Env cho chatgpt-imagegen: HOME của tài khoản. Tài khoản phụ có TMPDIR riêng -> hàng đợi 4 luồng codex riêng
+    (khoá flock của chatgpt-imagegen nằm trong TMPDIR); tài khoản chính giữ /tmp chung với tool khác cùng tài khoản."""
+    env = {"HOME": str(home)}
+    if home != Path.home():
+        (home / ".cig_tmp").mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(home / ".cig_tmp")
+    return env
+
+# mọi tài khoản đều "overloaded" -> chờ 30-60s (ngẫu nhiên: 8 luồng không cùng dội lại 1 lúc), báo Lark, gen
+# tiếp bằng codex; tối đa OVERLOAD_ROUNDS vòng rồi mới xuống OpenArt (USER 19/10; quá tải chỉ thoáng qua:
+# 4202338676 13:05-13:26 rơi xuống Seedream 12/13 mảnh vì không chờ)
+OVERLOAD_WAIT, OVERLOAD_ROUNDS = (30, 60), 3
+NOTIFY_EVERY = 600          # báo Lark quá tải tối đa 1 tin / 10 phút cho CẢ máy (nhiều luồng + tiến trình con)
+_NOTIFY_DIR = Path(tempfile.gettempdir()) / "flat_codex_overload"
+
+def _notify_overload(text):
+    """Tin Lark (LARK_WEBHOOK, batch nạp từ .env rồi truyền xuống tiến trình con). Chống spam cho mọi luồng/tiến
+    trình: mỗi khung NOTIFY_EVERY giây 1 file đánh dấu, tạo bằng O_EXCL (nguyên tử) -> chỉ 1 bên gửi. Lỗi file /
+    lỗi gửi chỉ log, không được làm hỏng vòng chờ-thử-lại."""
+    try:
+        _NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(_NOTIFY_DIR / str(int(time.time() // NOTIFY_EVERY)), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return
+    except OSError as e:
+        log("notify", f"file đánh dấu lỗi ({e}) -> vẫn gửi")
+    url = os.getenv("LARK_WEBHOOK")
+    if not url:
+        log("notify", "(chưa có LARK_WEBHOOK) " + text); return
+    body = json.dumps({"msg_type": "text", "content": {"text": "🧵 Flat batch\n" + text}}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, body, {"Content-Type": "application/json"}), timeout=15)
+    except Exception as e:
+        log("notify", f"gửi Lark lỗi: {e}")
+
+def _with_accounts(fn, wait=OVERLOAD_WAIT, sleep=time.sleep, notify=None):
+    """fn(home) lần lượt qua các tài khoản: lỗi tài khoản -> thử cái sau; lỗi khác ném ngay. Mọi tài khoản đều
+    quá tải -> báo Lark, chờ ngẫu nhiên `wait` giây rồi thử lại cả vòng (tối đa OVERLOAD_ROUNDS). Hết -> ném lỗi
+    gộp (giữ đủ text để raise_for nhận ra quota/hết đăng nhập)."""
+    notify = notify or _notify_overload
+    for rnd in range(OVERLOAD_ROUNDS + 1):
+        errs = []
+        for home in _accounts():
+            try:
+                return fn(home)
+            except Exception as e:
+                errs.append(f"[{home}] {e}")
+                if not ACC_RETRY_RE.search(str(e)):
+                    raise RuntimeError("\n".join(errs))
+                log("gen", f"  codex {home} lỗi tài khoản ({str(e).splitlines()[-1][:80]}) -> thử tài khoản khác")
+        if rnd == OVERLOAD_ROUNDS or not all("overloaded" in x for x in errs):
+            break
+        sec = round(random.uniform(*wait))
+        log("gen", f"  mọi tài khoản codex quá tải -> chờ {sec}s thử lại (vòng {rnd + 1}/{OVERLOAD_ROUNDS})")
+        notify(f"⏸ Codex quá tải ({len(errs)} tài khoản) — chờ {sec}s rồi gen tiếp bằng codex "
+               f"(vòng {rnd + 1}/{OVERLOAD_ROUNDS}, hết vòng mới chuyển OpenArt)")
+        sleep(sec)
+    raise RuntimeError("\n".join(errs))
 OPENART_BIN = _bin("openart")
 
 def _launcher(path):
@@ -604,9 +711,9 @@ def _win_native_ok(path):
     except Exception:
         return True
 
-def _run(cmd, timeout):
+def _run(cmd, timeout, **extra_env):
     # Ép child in UTF-8 + đọc UTF-8 -> tránh UnicodeError khi đường dẫn có dấu tiếng Việt.
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", **extra_env}
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                        env=env, encoding="utf-8", errors="replace")
     if p.returncode != 0:
@@ -621,18 +728,29 @@ def _chatgpt_gen(prompt, refs, out, timeout=420):
            "--backend", "codex", "--quiet", "--format", "jpeg"]
     for r in refs:
         cmd += ["-i", str(r)]
-    _run(cmd, timeout)
+    _with_accounts(lambda home: _run(cmd, timeout, **_acc_env(home)))
     if not tmp.exists():
         raise RuntimeError("chatgpt-imagegen không tạo file")
     Image.open(tmp).convert("RGB").save(out)
     tmp.unlink(missing_ok=True)
     return out
 
-def _openart_gen(prompt, refs, out, timeout=300):
+def _is_adult(img):
+    """Claude: ảnh ref có hình 18+ không. Lỗi -> False (giữ fallback mặc định)."""
+    try:
+        import judge
+        r = judge.ask(ADULT_Q, [img], timeout=120)
+        log("gen", f"  phân loại ref: adult={r.get('adult')} ({r.get('why')})")
+        return r.get("adult") is True
+    except Exception as e:
+        log("gen", f"  phân loại 18+ lỗi ({str(e)[:120]}) -> fallback mặc định")
+        return False
+
+def _openart_gen(prompt, refs, out, timeout=300, model=OA_MODEL):
     if not _win_native_ok(OPENART_BIN):
         raise RuntimeError("OpenArt chỉ có bản Linux, không chạy được trên Windows "
                            "(chỉ dùng chatgpt-imagegen làm gen chính)")
-    cmd = _launcher(OPENART_BIN) + [OPENART_BIN, "generate", "image", prompt, "--model", OA_MODEL,
+    cmd = _launcher(OPENART_BIN) + [OPENART_BIN, "generate", "image", prompt, "--model", model,
            "-o", str(out), "--yes", "--compact"]
     for r in refs:
         cmd += ["--image", str(r)]
@@ -642,7 +760,7 @@ def _openart_gen(prompt, refs, out, timeout=300):
     return out
 
 def gen_panel(prompt, refs, out):
-    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt Seedream 4.5."""
+    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Seedream 4.5, ảnh 18+ -> nano-banana-2."""
     prompt = prompt + _prompt_extra()
     Path(out).unlink(missing_ok=True)       # tool trả rc=0 mà không ghi file -> không nhận nhầm file lần trước
     try:
@@ -651,10 +769,16 @@ def gen_panel(prompt, refs, out):
         log("gen", "  ✓ xong bằng chatgpt-imagegen")
         return r
     except Exception as e:
+        err = str(e)
         log("gen", "  ✗ chatgpt-imagegen lỗi -> fallback OpenArt. Lỗi đầy đủ:")
-        log("gen", "  " + str(e)[:1500].replace("\n", "\n  "))
-    r = _openart_gen(prompt, refs, out)
-    log("gen", "  ✓ xong bằng OpenArt Seedream 4.5")
+        log("gen", "  " + err[:1500].replace("\n", "\n  "))
+    model = OA_MODEL_ADULT if refs and _is_adult(refs[0]) else OA_MODEL
+    try:
+        r = _openart_gen(prompt, refs, out, model=model)
+    except Exception as e:
+        # giữ cả lỗi codex: raise_for cần thấy 429/hết đăng nhập codex, không chỉ "openart không tạo file"
+        raise RuntimeError(f"codex: {err}\nopenart: {e}") from e   # đủ lỗi mọi tài khoản: 429/401 không bị cắt
+    log("gen", f"  ✓ xong bằng OpenArt {model}")
     return r
 
 
@@ -678,7 +802,10 @@ def cutout(path, T=12):
 
 
 # ---------- 4. workers từng người ----------
-GEN_WORKERS = int(os.getenv("FLAT_GEN_WORKERS", "3"))   # gen song song mấy mảnh cùng lúc (codex tự xếp hàng tối đa 4)
+# tổng lệnh codex chạy cùng lúc của project (USER 19/10: 8): mỗi tài khoản tối đa 4 (chatgpt-imagegen tự xếp hàng)
+CODEX_WORKERS = int(os.getenv("FLAT_CODEX_WORKERS") or 4 * len(CODEX_HOMES))
+# gen song song mấy mảnh cùng lúc: chừa 1 luồng cho art (batch chạy pieces + art song song)
+GEN_WORKERS = int(os.getenv("FLAT_GEN_WORKERS") or max(1, CODEX_WORKERS - 1))
 
 MIN_SIDE = 1024
 
@@ -847,6 +974,20 @@ def _selfcheck():
     top_only = _pieces_plan({"type": "top", "top_front": "base white; x", "top_back": "b",
                              "sleeves_same": True, "sl_front": "e", "sl_back": "f"})
     assert {s["slug"] for s in top_only} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
+    tank = _pieces_plan({"type": "top", "top_front": "a", "top_back": "b", "sleeves_same": True,
+                         "sl_front": "base none; garment is sleeveless, no sleeve panel present", "sl_back": "none"})
+    assert {s["slug"] for s in tank} == {"ao_truoc", "ao_sau"}
+    assert not _NO_SLEEVE.search("base blue; short sleeve, not sleeveless") and _NO_SLEEVE.search("sleeveless top")
+    # set áo + VÁY (cờ hoặc chữ 'skirt' trong mô tả) -> mảnh quạt ta_*, không phải quan_*
+    sk = {"type": "top_bottom", "top_front": "a", "top_back": "b", "pants_front": "base blue; ice spikes",
+          "pants_back": "c", "sl_front": "none", "sl_back": "none"}
+    assert {s["slug"] for s in _pieces_plan({**sk, "bottom_is_skirt": True})} == {"ao_truoc", "ao_sau", "ta_truoc", "ta_sau"}
+    assert {s["slug"] for s in _pieces_plan({**sk, "pants_front": "speckle print across entire skirt"})} == \
+        {"ao_truoc", "ao_sau", "ta_truoc", "ta_sau"}
+    assert all(s["kind"] == "dress" and s["shape"] is SHAPE_FAN for s in _pieces_plan({**sk, "bottom_is_skirt": True})
+               if s["slug"].startswith("ta_"))
+    assert {s["slug"] for s in _pieces_plan(sk)} == {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau"}
+    assert _filter_by_garment({"ao_truoc", "ta_truoc"}, "top") == {"ao_truoc"}
     bottom_only = _pieces_plan({"type": "bottom", "pants_front": "c", "pants_back": "d"})
     assert {s["slug"] for s in bottom_only} == {"quan_truoc", "quan_sau"}
     # #9 vision bỏ sót mô tả lưng (*_back) -> suy từ mặt trước tương ứng, KHÔNG được thiếu mảnh sản
@@ -912,8 +1053,73 @@ def _selfcheck():
     ex = _prompt_extra()
     assert "heliconia pink" in ex and "FIX: NO chest graphic on back" in ex
     globals()["COLOR"], globals()["HINT"] = None, None
-    # GEN_WORKERS: đọc FLAT_GEN_WORKERS (mặc định 3)
-    assert GEN_WORKERS == int(os.getenv("FLAT_GEN_WORKERS", "3"))
+    # 2 tài khoản codex: xoay vòng; lỗi tài khoản -> thử cái kia; ảnh bị chặn -> không thử lại
+    orig_homes = globals()["CODEX_HOMES"]
+    globals()["CODEX_HOMES"] = [Path("/a"), Path("/b")]
+    assert {_accounts()[0] for _ in range(4)} == {Path("/a"), Path("/b")}
+    tried = []
+    def busy_then_ok(home):
+        tried.append(home)
+        if len(tried) == 1:
+            raise RuntimeError("backend failed mid-generation: Our servers are currently overloaded.")
+        return home
+    assert _with_accounts(busy_then_ok) == tried[1] != tried[0]
+    tried.clear()
+    def blocked(home):
+        tried.append(home); raise RuntimeError("no image returned (image_status=failed; model_text='')")
+    try:
+        _with_accounts(blocked); raise AssertionError("phải raise")
+    except RuntimeError as e:
+        assert len(tried) == 1 and "no image returned" in str(e)
+    # mọi tài khoản quá tải -> chờ rồi thử lại cả vòng; vẫn quá tải sau OVERLOAD_ROUNDS -> ném
+    tried.clear(); slept = []
+    def busy_round1(home):
+        tried.append(home)
+        if len(tried) <= 2:
+            raise RuntimeError("Our servers are currently overloaded.")
+        return "ok"
+    sent = []
+    assert _with_accounts(busy_round1, sleep=slept.append, notify=sent.append) == "ok" and len(tried) == 3
+    assert len(slept) == 1 and OVERLOAD_WAIT[0] <= slept[0] <= OVERLOAD_WAIT[1] and len(sent) == 1 and "quá tải" in sent[0]
+    tried.clear(); slept.clear()
+    def always_busy(home):
+        tried.append(home); raise RuntimeError("overloaded")
+    try:
+        _with_accounts(always_busy, sleep=slept.append, notify=sent.append); raise AssertionError("phải raise")
+    except RuntimeError:
+        assert len(tried) == 2 * (OVERLOAD_ROUNDS + 1) and len(slept) == OVERLOAD_ROUNDS
+    globals()["CODEX_HOMES"] = orig_homes
+    assert "TMPDIR" not in _acc_env(Path.home())
+    # Lark quá tải: nhiều luồng cùng gọi trong 1 khung 10 phút -> chỉ 1 tin
+    orig_dir, logged = globals()["_NOTIFY_DIR"], []
+    globals()["_NOTIFY_DIR"] = Path(tempfile.mkdtemp()) / "mark"
+    old_hook, old_log = os.environ.pop("LARK_WEBHOOK", None), globals()["log"]
+    globals()["log"] = lambda st, m="": logged.append(m)
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(lambda i: _notify_overload("x"), range(8)))
+    assert len(logged) == 1, logged
+    globals()["_NOTIFY_DIR"], globals()["log"] = orig_dir, old_log
+    if old_hook:
+        os.environ["LARK_WEBHOOK"] = old_hook
+    # gen_panel: codex + OpenArt cùng lỗi -> exception mang cả lỗi codex (để phân loại quota/auth)
+    orig_cg, orig_oa = globals()["_chatgpt_gen"], globals()["_openart_gen"]
+    globals()["_chatgpt_gen"] = lambda *a: (_ for _ in ()).throw(RuntimeError("HTTP 429 usage_limit_reached"))
+    globals()["_openart_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("openart không tạo file"))
+    try:
+        globals()["gen_panel"]("p", [], Path(tempfile.mkdtemp()) / "x.png")
+        raise AssertionError("gen_panel phải raise")
+    except RuntimeError as e:
+        assert "HTTP 429" in str(e) and "openart không tạo file" in str(e)
+    # codex lỗi -> ảnh 18+ dùng OA_MODEL_ADULT, còn lại OA_MODEL
+    orig_ad, used = globals()["_is_adult"], []
+    globals()["_openart_gen"] = lambda prompt, refs, out, model=OA_MODEL: used.append(model)
+    for adult in (True, False):
+        globals()["_is_adult"] = lambda img, a=adult: a
+        globals()["gen_panel"]("p", ["ref.png"], Path(tempfile.mkdtemp()) / "x.png")
+    assert used == [OA_MODEL_ADULT, OA_MODEL]
+    globals()["_chatgpt_gen"], globals()["_openart_gen"], globals()["_is_adult"] = orig_cg, orig_oa, orig_ad
+    # GEN_WORKERS: FLAT_GEN_WORKERS, mặc định CODEX_WORKERS - 1 (= 7 với 2 tài khoản)
+    assert GEN_WORKERS == int(os.getenv("FLAT_GEN_WORKERS") or max(1, CODEX_WORKERS - 1))
     # run_pieces_one chạy song song (ThreadPoolExecutor): giữ thứ tự theo plan, 1 mảnh lỗi
     # không chặn mảnh khác, tất cả lỗi -> raise lỗi cuối cùng (theo thứ tự plan)
     cache_dir = Path(tempfile.mkdtemp())
