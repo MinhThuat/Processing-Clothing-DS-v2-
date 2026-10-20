@@ -356,7 +356,7 @@ Return {{"box": null}} if this variant can't be found in the photo."""
 
 FIND_LEGEND = """The contact sheet shows {n} product photos labelled 1..{n}. Is there a photo where the different
 designs are each marked with a number — a NUMBER badge (1, 2, 3...) or a text label like "Design 1",
-"Design 2", "#1", "No. 1" — on, above or next to each outfit (a "numbered legend")?
+"Design 2", "D1", "D2", "#1", "No. 1" — on, above or next to each outfit (a "numbered legend")?
 Return ONLY {{"legend": <label of that photo, or null>}}"""
 
 MATCH_DESIGN = """Image 1 is the numbered legend photo: each outfit is marked with a number badge or a label like
@@ -374,6 +374,18 @@ def match_design(sheet, legend_src, num, n, garment="outfit"):
     js = ask(MATCH_DESIGN.format(num=num, n=n, garment=garment), [legend_src, sheet])
     photos = [p for p in map(lambda x: _label(x, n), js.get("photos") or []) if p]
     return {"desc": str(js.get("desc") or "")[:200], "photos": photos}
+
+
+# 'Design 4' / 'Design #4' / 'Choose design: D4' (bảng DESIGN OPTIONS D1..D10, mặt nạ Jo chapman 20/10)
+# 'D4' trơn chỉ tin ở Name Custom (SKU có thể có đoạn -D4- không phải design — codex review 20/10)
+DESIGN_NUM = re.compile(r"\bdesign\s*#?\s*(\d+)\b", re.I)
+_D_NUM = re.compile(r"\bD(\d{1,2})\b", re.I)
+
+
+def design_num(custom="", other=""):
+    """Số design khách chọn: 'Design N' trong custom/other (SKU, variant), hoặc 'DN' trong custom -> int | None."""
+    m = DESIGN_NUM.search(f"{custom} {other}") or _D_NUM.search(custom or "")
+    return int(m.group(1)) if m else None
 
 
 def find_legend(sheet, n):
@@ -462,6 +474,10 @@ def locate(photo_with_grid, variant, skus, kid):
 
 def _selfcheck():
     assert _label("4", 12) == 4 and _label(4, 12) == 4 and _label(" 2 ", 3) == 2
+    assert design_num("• Choose design: D4") == 4 and design_num("", "MLT012610A14-Design 2-Jogger") == 2
+    assert design_num("Design #100") == 100 and design_num("• Design: Design Wolverine") is None
+    assert design_num("", "NMN062610A10-Jo chapman1 191026-3D Funny Face Ski Mask") is None
+    assert design_num("", "ABC-D4-Mask") is None          # 'D4' trong SKU không tính
     assert _label("13", 12) is None and _label(0, 12) is None and _label(True, 12) is None and _label("x", 9) is None
     td = Path(tempfile.mkdtemp())
     items = []

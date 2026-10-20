@@ -1009,7 +1009,6 @@ def _variant_label(group, sub_rows):
 
 
 LOCATE_TRIES = 3
-_DESIGN_NUM = re.compile(r"design\s*#?\s*(\d+)", re.I)
 
 
 def _check_design_photos(groups, rows, srcs, sheet, log_=None):
@@ -1019,10 +1018,10 @@ def _check_design_photos(groups, rows, srcs, sheet, log_=None):
     want = []
     for g in groups:
         sub = [r for r in rows if r["record_id"] in g["record_ids"]]
-        m = _DESIGN_NUM.search(" ".join([g["variant"] or ""] + [r.get("custom") or "" for r in sub]
-                                        + [r["sku"] for r in sub]))
-        if m:
-            want.append((g, int(m.group(1))))
+        num = judge.design_num(" ".join(r.get("custom") or "" for r in sub),
+                               " ".join([g["variant"] or ""] + [r["sku"] for r in sub]))
+        if num:
+            want.append((g, num))
     if not want:
         return
     try:

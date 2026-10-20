@@ -8,7 +8,7 @@ khi judge.pick trả 'skip'. Luồng:
 USER RULE: output là FILE IN y hình in trong ảnh nguồn (+ Name Custom), KHÔNG phải ảnh render SP;
 không gồm đồ bên trong SP (vd squishy trong giỏ) và phụ kiện rời (quai, dây, thanh treo).
 """
-import json, shutil
+import functools, json, shutil
 from pathlib import Path
 
 from PIL import Image
@@ -123,11 +123,40 @@ def _gen(prompt, ref, out):
     fp._flatten_white(out)      # codex đôi khi trả PNG nền trong suốt -> nền trắng đục (như mảnh clothing)
 
 
+@functools.lru_cache(maxsize=32)
+def _legend_cached(sheet, n):
+    return judge.find_legend(Path(sheet), n)
+
+
+def _legend(sheet, n, log):
+    """Ảnh bảng design đánh số (D1..Dn) trong bộ ảnh hoặc None; hỏi 1 lần cho cả nhóm (cùng contact sheet)."""
+    try:
+        return _legend_cached(sheet, n)
+    except StepError as e:
+        log("nc", f"tìm bảng design lỗi: {e}"); return None
+
+
 def _input(r, srcs, sheet, d, log):
     """Cho 1 DÒNG: Claude chọn ảnh có hình in đúng biến thể/màu của dòng; ảnh nhiều SP -> định vị (lưới
     pixel) 1 SP -> ảnh đầu vào đã phóng. Theo từng dòng vì 1 nhóm (chung bộ link) có thể gồm nhiều
     biến thể/màu (vd giỏ Green + Purple) — dùng chung 1 ảnh thì dòng kia gen/QA theo sai mẫu."""
     rows = [r]
+    num = judge.design_num(r.get("custom") or "", r["sku"])
+    legend = num and _legend(str(sheet), len(srcs), log)
+    if legend:      # dòng chọn 'D4' / 'Design 4' + có bảng design đánh số -> cắt ĐÚNG ô đó trên bảng (pick
+        # tự chọn thì lấy ảnh người đeo bất kỳ -> sai design, mặt nạ Jo chapman 20/10: 4/5 dòng sai)
+        src = srcs[legend - 1]
+        try:
+            box = judge.locate(judge.grid_overlay(src, d / "nc_grid.jpg"),
+                               f"the ONE design labelled D{num} / Design {num} / #{num}", r["sku"], False)
+        except StepError as e:
+            log("nc", f"D{num}: định vị trên bảng design lỗi {e}"); box = None
+        if box:
+            log("nc", f"D{num}: ảnh {legend} (bảng design), box={box}")
+            inp = d / "nc_in.png"
+            fp.crop_norm(src, box, Image.open(src).size, inp)
+            return fp._upscaled(inp, d / "nc_in_up.png"), {"front": legend, "several": True, "product": ""}
+        log("nc", f"D{num}: không thấy ô trên bảng design {legend} -> để Claude chọn ảnh")
     lines = f"{r['sku']} | colour {r['color'] or '-'} | {judge._opts(r.get('custom'))}"
     pk = judge.ask(PICK.format(n=len(srcs), rows=lines), [sheet])
     front = pk.get("front") if isinstance(pk.get("front"), int) and 1 <= pk["front"] <= len(srcs) else 1
