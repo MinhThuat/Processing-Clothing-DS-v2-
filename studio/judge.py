@@ -131,6 +131,18 @@ def ask(prompt, images, timeout=300):
     raise StepError("judge", last)
 
 
+def ask_codex(prompt, images, timeout=300):
+    """Như ask() nhưng hỏi GPT qua endpoint Codex (flat_pipeline._codex_vision) — giám khảo thứ 2."""
+    import flat_pipeline as fp
+    content = [{"type": "text", "text": prompt}] + [
+        {"type": "image_url", "image_url": {"url": fp._vision_uri(p, QA_PIECE_MAX)}} for p in images]
+    try:
+        return _extract_json(fp._codex_vision(content, timeout))
+    except Exception as e:
+        raise_for(str(e), "judge")
+        raise StepError("judge", f"codex: {e}"[:300])
+
+
 # ---------- chuẩn hoá JSON trả về ----------
 def _box_min(b, min_area):
     ok = (isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)
@@ -398,9 +410,9 @@ QA_FLAT = ("\nThese pieces are the FLAT VECTOR version of the print: solid flat 
 QA_PIECE_TILE, QA_PIECE_MAX = 768, 2400
 
 
-def qa(sheet, names, colour, n_refs, flat=False, extra=""):
+def qa(sheet, names, colour, n_refs, flat=False, extra="", asker=None):
     prompt = QA.format(n_refs=n_refs, colour=colour, names=", ".join(names)) + (QA_FLAT if flat else "") + extra
-    return norm_qa(ask(prompt, [sheet]), names)
+    return norm_qa((asker or ask)(prompt, [sheet]), names)
 
 
 # tiêu chí RIÊNG từng loại mảnh (QA chấm 1 mảnh/lần, ảnh lớn) — tiền tố tên mảnh -> yêu cầu

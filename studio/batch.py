@@ -846,21 +846,46 @@ def _find_prev(rid):
 
 
 def _best_scores(sdir):
-    """Điểm QA cao nhất của từng mảnh qua mọi lần chấm trong 1 thư mục nhóm con (qa_*.json)."""
+    """Điểm QA cao nhất của từng mảnh qua mọi lần chấm trong 1 thư mục nhóm con -> {mảnh: (điểm, k)},
+    k = số lần QA (qa_<k>.json, contact sheet sheet_qa_<k>_<mảnh>.jpg của đúng bản đó)."""
     best = {}
     for f in sdir.glob("qa_*.json"):
         try:
-            res = json.loads(f.read_text(encoding="utf-8"))
+            res, k = json.loads(f.read_text(encoding="utf-8")), int(f.stem[3:])
         except (OSError, ValueError):
             continue
         for name, r in res.items():
-            best[name] = max(best.get(name, -1), r.get("score", -1))
+            sc = r.get("score", -1)
+            if name not in best or sc > best[name][0]:
+                best[name] = (sc, k)
     return best
+
+
+def _judge_scores(sdir, group, names):
+    """Claude (điểm QA đã lưu của bản đã up) + Codex chấm lại đúng contact sheet đó -> điểm TRUNG BÌNH
+    (USER 20/10: cả 2 cùng đánh giá rồi tổng hợp). Codex lỗi -> chỉ điểm Claude; không rõ điểm -> bỏ."""
+    best = _best_scores(sdir)
+    colour = "same as the reference photo" if group.get("matches_photo", True) else group.get("color")
+    out = {}
+    for x in names:
+        if x not in best:
+            continue
+        cl, k = best[x]
+        sheet, cx = sdir / f"sheet_qa_{k}_{x}.jpg", None
+        if sheet.exists():
+            try:
+                cx = judge.qa(sheet, [x], colour, "the", x.endswith("_phang"), judge.piece_rule(x),
+                              asker=judge.ask_codex)[x]["score"]
+            except StepError as e:
+                log("fix", f"{x}: codex chấm lỗi {e}")
+        out[x] = cl if cx is None else (cl + cx) / 2
+        log("fix", f"{x}: claude {cl:g} · codex {'-' if cx is None else f'{cx:g}'} -> {out[x]:g}")
+    return out
 
 
 def fix_bad(only_day, day, dry):
     """--fix-bad (cron tối, sau batch): dòng của ngày `only_day` trên view -> gen lại các mảnh _QAFAIL QUÁ TỆ
-    (điểm QA tốt nhất <= BAD_SCORE); mảnh fail sát ngưỡng giữ nguyên."""
+    (trung bình điểm Claude + Codex <= BAD_SCORE); mảnh fail sát ngưỡng giữ nguyên."""
     keys = [r["record_id"] for r in lb.fetch_rows(only_day, day)
             if any(piece_slug(r["sku"], p.get("name", ""))[1] for p in r["pieces"])]
     log("fix", f"--fix-bad: {len(keys)} dòng có mảnh _QAFAIL (gen lại mảnh điểm <= {BAD_SCORE})")
@@ -881,7 +906,7 @@ def fix_fails(keys, day, dry, max_score=None):
                 log("fix", f"{key} {rid}: không thấy lần chạy trước (pick.json + pieces.json) -> bỏ qua"); continue
             pgdir, k, group, pick = found
             if max_score is not None:
-                sc = _best_scores(pgdir / f"c{k}")
+                sc = _judge_scores(pgdir / f"c{k}", group, failed)
                 failed = {x for x in failed if x in sc and sc[x] <= max_score}   # không rõ điểm -> giữ (codex review)
                 if not failed:
                     log("fix", f"{key} {rid}: mảnh _QAFAIL đều điểm > {max_score} -> giữ nguyên"); continue
@@ -1412,7 +1437,7 @@ def _selfcheck():
     # --fix-bad: điểm tốt nhất của mảnh qua mọi lần QA
     (td / "qa_1.json").write_text(json.dumps({"a": {"score": 2}, "b": {"score": 5}}))
     (td / "qa_2.json").write_text(json.dumps({"a": {"score": 3}}))
-    assert _best_scores(td) == {"a": 3, "b": 5}
+    assert _best_scores(td) == {"a": (3, 2), "b": (5, 1)}
     assert _I.open(make_input(src, [100, 200, 900, 800], td / "a.png")).size == (800, 300)
     assert _I.open(make_input(src, None, td / "b.png")).size == (1000, 500)
     assert _I.open(make_input(src, [100, 100, 101, 101], td / "c.png")).size == (1000, 500)
