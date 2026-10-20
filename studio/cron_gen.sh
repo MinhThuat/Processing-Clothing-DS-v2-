@@ -14,6 +14,8 @@ LOG=../flat_studio_data/cron_gen.log
 {
   echo "=== $(date '+%F %T') [${1:-cron}] ==="
   python3 batch.py; rc=$?
+  # cron tối: xong hết mẫu -> soát lại 1 lượt, gen lại riêng các mảnh QA FAIL quá tệ (batch.py BAD_SCORE)
+  [ "${1:-cron}" = cron ] && [ "$rc" = 0 ] && { python3 batch.py --fix-bad; rc=$?; }
   echo "--- xong $(date '+%T') (exit $rc)"
 } >> "$LOG" 2>&1
 exit "${rc:-0}"

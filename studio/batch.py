@@ -38,6 +38,7 @@ _LOGF = None
 
 MAX_ATTEMPTS = 3         # gen lại: lần 1 y nguyên, lần 2-3 có hint + chọn lại ảnh/crop
 FLAT_MAX_ATTEMPTS = 2    # bản phẳng: lần gen lại thứ 3 chỉ cứu 1/44 mảnh (log 15-20/10) -> bỏ
+BAD_SCORE = 3            # --fix-bad (cron tối, sau batch): mảnh _QAFAIL điểm QA tốt nhất <= mức này -> gen lại
 HINT_FROM = 2            # lần bắt đầu dùng hint (lần y nguyên thứ 2 gần như không cứu được mảnh nào)
 SAME_ERR_STOP = 5        # 5 nhóm liên tiếp lỗi cùng kiểu -> dừng đợt
 _SIZE = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|\d{1,2}XL|\d{1,2}T|\d{1,2}Y|\d{1,2}-\d{1,2}Y?"
@@ -844,8 +845,31 @@ def _find_prev(rid):
     return best and best[1:]
 
 
-def fix_fails(keys, day, dry):
-    """--fix-fails: với mỗi Order ID / record_id -> gen lại CHỈ các mảnh đang _QAFAIL trên Base."""
+def _best_scores(sdir):
+    """Điểm QA cao nhất của từng mảnh qua mọi lần chấm trong 1 thư mục nhóm con (qa_*.json)."""
+    best = {}
+    for f in sdir.glob("qa_*.json"):
+        try:
+            res = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for name, r in res.items():
+            best[name] = max(best.get(name, -1), r.get("score", -1))
+    return best
+
+
+def fix_bad(only_day, day, dry):
+    """--fix-bad (cron tối, sau batch): dòng của ngày `only_day` trên view -> gen lại các mảnh _QAFAIL QUÁ TỆ
+    (điểm QA tốt nhất <= BAD_SCORE); mảnh fail sát ngưỡng giữ nguyên."""
+    keys = [r["record_id"] for r in lb.fetch_rows(only_day, day)
+            if any(piece_slug(r["sku"], p.get("name", ""))[1] for p in r["pieces"])]
+    log("fix", f"--fix-bad: {len(keys)} dòng có mảnh _QAFAIL (gen lại mảnh điểm <= {BAD_SCORE})")
+    fix_fails(keys, day, dry, max_score=BAD_SCORE)
+
+
+def fix_fails(keys, day, dry, max_score=None):
+    """--fix-fails: với mỗi Order ID / record_id -> gen lại CHỈ các mảnh đang _QAFAIL trên Base
+    (max_score: chỉ mảnh có điểm QA tốt nhất lần trước <= mức này; không rõ điểm -> bỏ qua)."""
     for key in keys:
         for row in lb.find_rows(key):
             rid = row["record_id"]
@@ -856,6 +880,11 @@ def fix_fails(keys, day, dry):
             if not found:
                 log("fix", f"{key} {rid}: không thấy lần chạy trước (pick.json + pieces.json) -> bỏ qua"); continue
             pgdir, k, group, pick = found
+            if max_score is not None:
+                sc = _best_scores(pgdir / f"c{k}")
+                failed = {x for x in failed if x in sc and sc[x] <= max_score}   # không rõ điểm -> giữ (codex review)
+                if not failed:
+                    log("fix", f"{key} {rid}: mảnh _QAFAIL đều điểm > {max_score} -> giữ nguyên"); continue
             log("group", f"=== FIX {key} {rid} · {row['sku']} · mảnh lỗi: {', '.join(sorted(failed))} · từ {pgdir} ===")
             gdir = BATCH / day / f"{pgdir.name.split('_fix')[0]}_fix_{rid[-6:]}"; gdir.mkdir(parents=True, exist_ok=True)
             srcs = [download(u, gdir / f"src_{i:02d}.jpg") for i, u in enumerate(row["links"], 1)]
@@ -1160,6 +1189,8 @@ def _parse_args(argv=None):
                     help="chỉ gen lại các mảnh _QAFAIL của các Order ID / record_id này (mảnh đạt giữ nguyên)")
     ap.add_argument("--regen", nargs="+", metavar="ID",
                     help="gen lại TOÀN BỘ các Order ID / record_id này rồi thay hết file cũ (up trước, gỡ sau)")
+    ap.add_argument("--fix-bad", action="store_true",
+                    help=f"gen lại các mảnh _QAFAIL quá tệ (điểm QA <= {BAD_SCORE}) của mẫu ngày --date (cron tối)")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args(argv)
     if a.date:
@@ -1201,8 +1232,10 @@ def main():
     stats, stop, reason, queue = Counter(), Stopper(a.until, a.limit), "hết việc", []
     log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}"
                  + (f" fix-fails={a.fix_fails}" if a.fix_fails else "") + (f" regen={a.regen}" if a.regen else ""))
-    if a.fix_fails or a.regen:               # chế độ riêng: chỉ làm các mẫu chỉ định
+    if a.fix_fails or a.regen or a.fix_bad:   # chế độ riêng: chỉ làm các mẫu chỉ định
         try:
+            if a.fix_bad:
+                fix_bad(only_day, day, a.dry_run)
             if a.regen:
                 regen(a.regen, day, a.dry_run, stats)
             if a.fix_fails:
@@ -1376,6 +1409,10 @@ def _selfcheck():
     import tempfile
     from PIL import Image as _I
     td = Path(tempfile.mkdtemp()); src = td / "s.jpg"; _I.new("RGB", (1000, 500), "white").save(src)
+    # --fix-bad: điểm tốt nhất của mảnh qua mọi lần QA
+    (td / "qa_1.json").write_text(json.dumps({"a": {"score": 2}, "b": {"score": 5}}))
+    (td / "qa_2.json").write_text(json.dumps({"a": {"score": 3}}))
+    assert _best_scores(td) == {"a": 3, "b": 5}
     assert _I.open(make_input(src, [100, 200, 900, 800], td / "a.png")).size == (800, 300)
     assert _I.open(make_input(src, None, td / "b.png")).size == (1000, 500)
     assert _I.open(make_input(src, [100, 100, 101, 101], td / "c.png")).size == (1000, 500)
