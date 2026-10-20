@@ -404,7 +404,7 @@ _BLEED_LABEL = {
 }
 
 # slug mảnh -> key box trong pieces.json + nhãn mô tả vùng (batch: lần gen thứ 3 nhờ Claude khoanh lại box).
-# Tay áo không có: box tay áo không đáng tin, tay luôn gen từ ảnh nguyên.
+# Tay áo không có ở đây: box tay của vision không đáng tin -> _make_piece nhờ Claude khoanh (_sleeve_box).
 PIECE_BOX = {
     "ao_truoc": ("top_front", "the FRONT torso/body of the top (no sleeves, no hood)"),
     "ao_sau": ("top_back", "the BACK torso/body of the top (no sleeves, no hood)"),
@@ -452,16 +452,18 @@ def _is_skirt(js):
 
 def _box(js, key):
     """Box 0-1000 của panel `key` (vision 'boxes'); hỏng/nhỏ (<15% mỗi chiều) -> None (dùng ảnh nguyên).
-    Tay áo (sl_/sr_) luôn None: thử thật, box tay áo của vision hay lệch (trúng cổ/đầu người bên cạnh)."""
-    if key.startswith(("sl_", "sr_")):
-        return None
+    Tay áo (sl_/sr_) vốn hẹp: chỉ cần rộng >=4%, cao >=15% và DỌC (cao >= 1.5 rộng) — box tay lệch sang
+    cổ/người bên cạnh thường vuông/ngang -> None -> _make_piece nhờ Claude khoanh (USER 20/10: mảnh nào cũng cắt)."""
+    sleeve = key.startswith(("sl_", "sr_"))
     boxes = js.get("boxes") if isinstance(js.get("boxes"), dict) else {}
     b = boxes.get(key)
     if not (isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)):
         return None
     x0, x1 = sorted((max(0, b[0]), min(1000, b[2])))
     y0, y1 = sorted((max(0, b[1]), min(1000, b[3])))
-    return [int(x0), int(y0), int(x1), int(y1)] if x1 - x0 >= 150 and y1 - y0 >= 150 else None
+    w, h = x1 - x0, y1 - y0
+    ok = (w >= 40 and h >= 150 and h >= 1.5 * w) if sleeve else (w >= 150 and h >= 150)
+    return [int(x0), int(y0), int(x1), int(y1)] if ok else None
 
 def _pieces_plan(js):
     """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
@@ -540,11 +542,32 @@ CROP_NOTE = (" The FIRST reference image is a close crop of exactly this panel: 
              "that crop. The LAST reference shows the whole garment for context only — do NOT copy other "
              "parts of it (other panels, skirt, pants, sleeves) into this panel.")
 
+# fallback OpenArt: CHỈ gửi ảnh cắt (bỏ ảnh nguyên ngữ cảnh) — kèm ảnh nguyên thì Ideogram chép phần nổi nhất của
+# cả bộ (ngực áo) vào mảnh: tay Iron Man QA 1-2 -> chỉ ảnh cắt QA 8 (test 20/10). Codex vẫn nhận đủ ảnh + CROP_NOTE.
+OA_CROP_NOTE = (" The FIRST reference image is a close crop of exactly this panel: reproduce ONLY that panel's "
+                "print.")
+
 # mặt sau TỰ SUY (không có ảnh lưng): ref là ảnh TRƯỚC -> model hay chép hình in mặt trước (nơ, ngực,
 # logo) sang mảnh sau/tay sau (lỗi thật: Design 2 tay_sau có nơ). Chỉ theo mô tả, không chép mặt trước.
 INFER_NOTE = (" This is a BACK panel INFERRED from a front-only photo: the reference shows the FRONT. Use it "
               "only for fabric colour and style; do NOT copy any front graphic (bows, chest prints, logos, "
               "buttons, zips) onto this panel — follow ONLY the given panel description.")
+
+def _sleeve_box(spec, ref, work):
+    """Tay áo: Claude khoanh 1 tay trên lưới pixel (box tay của vision hay lệch sang cổ/người bên cạnh nên
+    _box bỏ) -> box 0-1000 hoặc None (gen từ ảnh nguyên như cũ). USER 20/10: mảnh nào cũng cắt riêng rồi mới
+    gen — ảnh nguyên thì model fallback (Ideogram) chép ngực áo vào mảnh tay (Iron Man 20/10)."""
+    arm = "RIGHT" if "phai" in spec["slug"] else "LEFT"
+    try:
+        import judge
+        box = judge.locate_piece(judge.grid_overlay(ref, work / f"grid_{spec['slug']}.jpg"),
+                                 f"ONE whole sleeve — the wearer's {arm} arm — from the shoulder seam down to "
+                                 "the cuff", back=spec["side"] == "back")
+    except Exception as e:
+        log("crop", f"Claude khoanh {spec['slug']} lỗi ({str(e)[:120]}) -> ảnh nguyên")
+        return None
+    log("crop", f"Claude khoanh {spec['slug']}: {box}")
+    return box
 
 def _make_piece(spec, refs, work, out, flat=False):
     """Gen 1 mảnh -> file <out.stem>_<slug><suffix>. Váy: cắt cong (cutout); áo/quần/tay: full-bleed.
@@ -554,24 +577,29 @@ def _make_piece(spec, refs, work, out, flat=False):
     # có box -> Python cắt riêng vùng mảnh làm ref CHÍNH (ảnh 1), ảnh nguyên để CUỐI chỉ làm ngữ cảnh
     # -> model không vẽ lấn sang phần đồ khác (vd lưng thân dính váy). Không box -> như cũ.
     crop, ctx = None, []
-    if spec.get("box"):
+    box = spec.get("box")
+    if not box and spec["slug"].startswith("tay") and not spec.get("inferred"):
+        box = _sleeve_box(spec, ref, work)
+    if box:
         crop = work / f"crop_{spec['slug']}.png"
-        crop_norm(ref, spec["box"], Image.open(ref).size, crop)
+        crop_norm(ref, box, Image.open(ref).size, crop)
         ctx = [ref]
-    note = (CROP_NOTE if crop else "") + (INFER_NOTE if spec.get("inferred") else "")
+    infer = INFER_NOTE if spec.get("inferred") else ""
+    note, oa_note = (CROP_NOTE + infer, OA_CROP_NOTE + infer) if crop else (infer, infer)
     if spec["kind"] == "dress":
         tmp = work / f"gen_{spec['slug']}.png"
         base = DRESS_FLAT if flat else DRESS_FAITHFUL
         fan = spec["shape"] is SHAPE_FAN
         desc = _strip_ties(spec["desc"]) if fan else spec["desc"]
-        gen_panel(base + spec["shape"] + note + " " + desc + (NO_TIES if fan else ""),
-                  [crop or ref, ASSETS / spec["guide"], *ctx], tmp)
+        head, tail = base + spec["shape"], " " + desc + (NO_TIES if fan else "")
+        gen_panel(head + note + tail, [crop or ref, ASSETS / spec["guide"], *ctx], tmp,
+                  oa=(head + oa_note + tail, [crop or ref, ASSETS / spec["guide"]]))
         cutout(tmp).save(dst)                               # cắt theo silhouette, nền trong suốt
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
         raw = work / f"raw_{spec['slug']}.png"            # giữ bản gốc model trả (soi lỗi vùng trong suốt)
-        gen_panel(tpl.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]), desc=spec["desc"])
-                  + note, [crop or ref, *ctx], raw)
+        head = tpl.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]), desc=spec["desc"])
+        gen_panel(head + note, [crop or ref, *ctx], raw, oa=(head + oa_note, [crop or ref]))
         Image.open(raw).save(dst)
         _flatten_white(dst)                                 # full-bleed: đục, nền vải trắng
     return dst
@@ -762,8 +790,11 @@ def _openart_gen(prompt, refs, out, timeout=300, model=OA_MODEL):
         raise RuntimeError("openart không tạo file")
     return out
 
-def gen_panel(prompt, refs, out):
-    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Ideogram 4.5, ảnh 18+ -> nano-banana-2."""
+def gen_panel(prompt, refs, out, oa=None):
+    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Ideogram 4.5, ảnh 18+ -> nano-banana-2.
+    oa = (prompt, refs) riêng cho OpenArt (mảnh có ảnh cắt: chỉ gửi ảnh cắt, xem OA_CROP_NOTE)."""
+    oa_prompt, oa_refs = oa or (prompt, refs)
+    oa_prompt += _prompt_extra()
     prompt = prompt + _prompt_extra()
     Path(out).unlink(missing_ok=True)       # tool trả rc=0 mà không ghi file -> không nhận nhầm file lần trước
     try:
@@ -777,7 +808,7 @@ def gen_panel(prompt, refs, out):
         log("gen", "  " + err[:1500].replace("\n", "\n  "))
     model = OA_MODEL_ADULT if refs and _is_adult(refs[0]) else OA_MODEL
     try:
-        r = _openart_gen(prompt, refs, out, model=model)
+        r = _openart_gen(oa_prompt, oa_refs, out, model=model)
     except Exception as e:
         # giữ cả lỗi codex: raise_for cần thấy 429/hết đăng nhập codex, không chỉ "openart không tạo file"
         raise RuntimeError(f"codex: {err}\nopenart: {e}") from e   # đủ lỗi mọi tài khoản: 429/401 không bị cắt
@@ -1167,11 +1198,13 @@ def _selfcheck():
         globals()["log"], globals()["_make_piece"] = orig_log, orig_make_piece
     # box từng mảnh: hợp lệ -> giữ (kẹp 0-1000); hỏng/quá nhỏ/thiếu -> None; tay phải mượn tay trái
     jb = {"boxes": {"bodice_back": [100, 50, 900, 480], "skirt_back": [0, 0, 100, 100],
-                    "top_front": [-5, 0, 300, 1200], "sl_front": [0, 0, 500, 500], "bodice_front": "x"}}
+                    "top_front": [-5, 0, 300, 1200], "sl_front": [0, 0, 500, 500], "bodice_front": "x",
+                    "sl_back": [429, 237, 504, 524]}}
     assert _box(jb, "bodice_back") == [100, 50, 900, 480]
     assert _box(jb, "skirt_back") is None and _box(jb, "bodice_front") is None   # quá nhỏ / hỏng
     assert _box(jb, "top_front") == [0, 0, 300, 1000] and _box({}, "top_front") is None   # kẹp biên
-    assert _box(jb, "sl_front") is None and _box(jb, "sr_front") is None          # tay áo: không cắt
+    assert _box(jb, "sl_front") is None and _box(jb, "sr_front") is None          # tay: box vuông / thiếu -> None
+    assert _box(jb, "sl_back") == [429, 237, 504, 524]                            # tay hẹp + dọc (Iron Man) -> cắt
     # ảnh nhỏ -> phóng lên MIN_SIDE; ảnh đủ lớn giữ nguyên
     tdu = Path(tempfile.mkdtemp()); Image.new("RGB", (290, 445)).save(tdu / "s.png")
     assert max(Image.open(_upscaled(tdu / "s.png", tdu / "u.png")).size) == MIN_SIDE
@@ -1183,20 +1216,34 @@ def _selfcheck():
     # _make_piece có box -> ref 1 = crop đúng vùng, ảnh nguyên ở CUỐI + CROP_NOTE; không box -> như cũ
     global gen_panel
     orig_gen, seen = gen_panel, []
-    def fake_gen(prompt, refs, out_):
-        seen.append((prompt, list(refs))); Image.new("RGB", (64, 64), "grey").save(out_)
+    def fake_gen(prompt, refs, out_, oa=None):
+        seen.append((prompt, list(refs), oa)); Image.new("RGB", (64, 64), "grey").save(out_)
     gen_panel = fake_gen
     try:
         td = Path(tempfile.mkdtemp()); src = td / "full.png"; Image.new("RGB", (1000, 800), "white").save(src)
         spec = dict(slug="ao_sau", kind="bleed", desc="base green", side="back",
                     label="x", box=[100, 100, 600, 500])
         _make_piece(spec, {"front": src, "back": src}, td, td / "o.png")
-        pr, rf = seen[-1]
+        pr, rf, oa = seen[-1]
         assert Image.open(rf[0]).size == (500, 320) and rf[-1] == src and CROP_NOTE in pr
+        assert oa[1] == [rf[0]] and OA_CROP_NOTE in oa[0] and CROP_NOTE not in oa[0]   # OpenArt: chỉ ảnh cắt
         _make_piece({**spec, "box": None}, {"front": src, "back": src}, td, td / "o.png")
         assert seen[-1][1] == [src] and CROP_NOTE not in seen[-1][0] and INFER_NOTE not in seen[-1][0]
         _make_piece({**spec, "box": None, "inferred": True}, {"front": src, "back": src}, td, td / "o.png")
         assert INFER_NOTE in seen[-1][0]
+        # tay áo không box -> Claude khoanh (_sleeve_box) rồi cắt; tay tự suy (inferred) -> không khoanh
+        global _sleeve_box
+        orig_sb, asked = _sleeve_box, []
+        _sleeve_box = lambda sp, ref, work: asked.append(sp["slug"]) or [200, 100, 400, 900]
+        try:
+            _make_piece({**spec, "slug": "tay_truoc", "side": "front", "box": None},
+                        {"front": src, "back": src}, td, td / "o.png")
+            assert asked == ["tay_truoc"] and Image.open(seen[-1][1][0]).size == (200, 640) and CROP_NOTE in seen[-1][0]
+            _make_piece({**spec, "slug": "tay_sau", "box": None, "inferred": True},
+                        {"front": src, "back": src}, td, td / "o.png")
+            assert asked == ["tay_truoc"] and seen[-1][1] == [src]
+        finally:
+            _sleeve_box = orig_sb
     finally:
         gen_panel = orig_gen
     assert _strip_ties("base purple; torn openings, lower left; dark green tied sash motif, right hip") \
