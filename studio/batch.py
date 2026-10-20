@@ -37,6 +37,7 @@ _LOGF = None
 
 
 MAX_ATTEMPTS = 3         # gen lại: lần 1 y nguyên, lần 2-3 có hint + chọn lại ảnh/crop
+FLAT_MAX_ATTEMPTS = 2    # bản phẳng: lần gen lại thứ 3 chỉ cứu 1/44 mảnh (log 15-20/10) -> bỏ
 HINT_FROM = 2            # lần bắt đầu dùng hint (lần y nguyên thứ 2 gần như không cứu được mảnh nào)
 SAME_ERR_STOP = 5        # 5 nhóm liên tiếp lỗi cùng kiểu -> dừng đợt
 _SIZE = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|\d{1,2}XL|\d{1,2}T|\d{1,2}Y|\d{1,2}-\d{1,2}Y?"
@@ -174,16 +175,17 @@ def _quota_wait(stop, seconds, sleep=time.sleep):
 
 
 # ---------- máy gen lại ----------
-def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn):
-    """QA + gen lại mảnh lỗi tối đa MAX_ATTEMPTS lần.
+def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn, on_final=None, max_attempts=MAX_ATTEMPTS):
+    """QA + gen lại mảnh lỗi tối đa max_attempts lần.
       qa_fn(todo) -> {name: {ok, score, errors}}   chấm bản hiện tại của các mảnh
       regen_fn(todo, attempt, hint)                gen lại (attempt 1..MAX_ATTEMPTS; hint từ lần HINT_FROM)
       rehint_fn({name: errors}) -> hint            gọi 1 lần trước lần HINT_FROM (viết hint + chọn lại ảnh/crop)
       keep_fn(name, attempt)                       lưu bản hiện tại để chọn bản tốt nhất
+      on_final(name, attempt)                      (tuỳ chọn) mảnh đã chốt (đạt / hết lượt), attempt = bản được chọn
     -> best {name: (attempt, score)}, fails {name: errors} (vẫn lỗi), regen {name: số lần gen lại}."""
     best, last, regen = {}, {}, {}
     todo, hint = list(names), None
-    for attempt in range(MAX_ATTEMPTS + 1):
+    for attempt in range(max_attempts + 1):
         if attempt:
             if attempt == HINT_FROM:
                 hint = rehint_fn({n: last[n]["errors"] for n in todo})
@@ -198,6 +200,8 @@ def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn):
             keep_fn(n, attempt)
             if r["ok"]:
                 best[n] = (attempt, r["score"])         # bản đạt luôn được chọn
+                if on_final:
+                    on_final(n, attempt)
             else:
                 if n not in best or r["score"] > best[n][1]:
                     best[n] = (attempt, r["score"])
@@ -205,6 +209,8 @@ def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn):
         todo = nxt
         if not todo:
             break
+    for n in todo if on_final else ():
+        on_final(n, best[n][0])
     return best, {n: last[n]["errors"] for n in todo}, regen
 
 
@@ -518,7 +524,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     if group["mode"] == "two" else None),
            "back_cropped": group["mode"] == "two" and back_crop is not None,
            "hint": old_hint}
-    n = Counter()
+    qa_no = count(1)     # QA 3D + chuỗi phẳng chạy SONG SONG -> đánh số thread-safe
     pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
 
     def pipe(args):
@@ -570,7 +576,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
 
     def make_qa(piece_path, flat=False):
       def qa_fn(todo):
-        n["qa"] += 1
+        k = next(qa_no)
         have = [x for x in todo if piece_path(x).exists()]
         # mảnh chưa ra file (gen lỗi) -> -1, không phải 0, để bản đã từng ra file (dù điểm 0) vẫn thắng
         res = {x: {"ok": False, "score": -1.0, "errors": ["gen_loi"]} for x in todo if x not in have}
@@ -581,8 +587,6 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     + ([(ctx["front"], "REF crop")] if ctx["cropped"] else [])
                     + ([(srcs[group["back"] - 1], "REF back photo")] if ctx["back_cropped"] else [])
                     + ([(ctx["back"], "REF back")] if ctx["back"] else []))
-            k = n["qa"]
-
             def one(x):   # chấm TỪNG mảnh, ảnh lớn + tiêu chí riêng (ảnh ghép chung nhỏ -> QA lọt lỗi dáng)
                 try:
                     return x, judge.qa_piece(refs, piece_path(x), x, colour_desc, flat,
@@ -592,7 +596,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     return x, {"ok": False, "score": 0.0, "errors": []}
             with ThreadPoolExecutor(max_workers=QA_WORKERS) as ex:
                 res.update(dict(ex.map(one, have)))
-        (sdir / f"qa_{n['qa']}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+        (sdir / f"qa_{k}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
         log("qa", " ".join(f"{k}:{'✓' if v['ok'] else '✗'}{v['score']:.0f}" for k, v in res.items()))
         return res
       return qa_fn
@@ -694,26 +698,19 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 shutil.copyfile(src, sdir / "attempts" / f"{name}_{attempt}.png")
         return keep_fn
 
-    best, fails, regen = (improve(names, make_qa(piece_path), regen_fn, rehint_fn, make_keep(piece_path))
-                          if names else ({}, {}, {}))
-
     # ---- bản PHẲNG: vẽ lại TỪ mảnh 3D đã chốt (ref = đúng mảnh đó) -> không lấn họa tiết mảnh khác (vẽ từ
-    # ảnh gốc thì tay phẳng dính sọc thân/quần, Jogger 19/10); art dùng chung ----
+    # ảnh gốc thì tay phẳng dính sọc thân/quần, Jogger 19/10); art dùng chung. Mảnh 3D nào chốt xong (đạt / hết
+    # lượt) là chạy luôn chuỗi phẳng của nó, SONG SONG với vòng gen lại 3D các mảnh khác (luồng codex đang rảnh) ----
     fdir = sdir / "flat"; fdir.mkdir(exist_ok=True)
     flat_names = ([x for x in sorted(only) if x.endswith("_phang")] if only
                   else [f"{x}_phang" for x in names])     # gồm cả art_phang (USER: bộ phẳng đủ như Jogger D5)
+    refs = {}                                             # mảnh phẳng -> file 3D làm ref
 
     def flat_path(name):
         return fdir / f"final_{name[:-len('_phang')]}.png"
 
     def gen_flat_one(name):
-        base = name[:-len("_phang")]
-        if base in best:
-            ref = sdir / "attempts" / f"{base}_{best[base][0]}.png"
-        else:                           # --fix-fails: mảnh 3D không gen lại -> vẽ từ file 3D đã up lần trước
-            ref = next((prev / "out" / piece_filename(rows[0]["sku"], base, failed=f) for f in (False, True)
-                        if prev and (prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)).exists()),
-                       sdir / "missing")
+        base, ref = name[:-len("_phang")], refs[name]
         if not ref.exists():
             return
         dress = base.startswith(("than_", "ta_"))       # mảnh đầm cắt cong: vẽ trên nền xám rồi cutout
@@ -731,8 +728,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     def gen_flat(todo):
         if time.monotonic() > deadline:
             raise StepError("quá thời gian", "nhóm > 60 phút")
-        with ThreadPoolExecutor(max_workers=CODEX_WORKERS) as ex:
-            list(ex.map(gen_flat_one, todo))
+        for x in todo:
+            gen_flat_one(x)
 
     def regen_flat(todo, attempt, hint):
         log("regen", f"phẳng lần {attempt}: {', '.join(todo)}")
@@ -740,10 +737,38 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
             flat_path(x).unlink(missing_ok=True)
         gen_flat(todo)
 
-    gen_flat(flat_names)
-    fbest, ffails, fregen = improve(flat_names, make_qa(flat_path, flat=True), regen_flat,
-                                    lambda fails_: None, make_keep(flat_path))
-    best.update(fbest); regen.update(fregen); fails = {**fails, **ffails}
+    def flat_chain(name):
+        gen_flat([name])
+        return improve([name], make_qa(flat_path, flat=True), regen_flat, lambda fails_: None,
+                       make_keep(flat_path), max_attempts=FLAT_MAX_ATTEMPTS)
+
+    fx = ThreadPoolExecutor(max_workers=CODEX_WORKERS)
+    chains = {}
+
+    def start_flat(name, ref):
+        refs[name] = ref
+        chains[name] = fx.submit(flat_chain, name)
+
+    try:
+        for name in flat_names:     # --fix-fails: mảnh 3D không gen lại -> vẽ ngay từ file 3D đã up lần trước
+            base = name[:-len("_phang")]
+            if base not in names:
+                start_flat(name, next((prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)
+                                       for f in (False, True) if prev and
+                                       (prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)).exists()),
+                                      sdir / "missing"))
+
+        def on_final(base, attempt):
+            if f"{base}_phang" in flat_names:
+                start_flat(f"{base}_phang", sdir / "attempts" / f"{base}_{attempt}.png")
+
+        best, fails, regen = (improve(names, make_qa(piece_path), regen_fn, rehint_fn, make_keep(piece_path),
+                                      on_final=on_final) if names else ({}, {}, {}))
+        for name in flat_names:
+            fbest, ffails, fregen = chains[name].result()
+            best.update(fbest); regen.update(fregen); fails.update(ffails)
+    finally:
+        fx.shutdown(wait=True, cancel_futures=True)
 
     out = sdir / "out"; out.mkdir(exist_ok=True)
     files = []
@@ -1339,6 +1364,14 @@ def _selfcheck():
     assert calls["hint"] == 1
     assert calls["regen"] == [(("B", "C"), 1, None), (("B", "C"), 2, "FIX IT"), (("B", "C"), 3, "FIX IT")]
     assert ("A", 0) in calls["keep"] and ("C", 3) in calls["keep"] and ("C", 4) not in calls["keep"]
+    # on_final: mảnh chốt ngay khi đạt (A lần 0, B lần 3), mảnh hết lượt chốt ở bản điểm cao nhất (C lần 1)
+    tries.clear(); fin = []
+    improve(["A", "B", "C"], qa_fn, regen_fn, rehint_fn, keep_fn, on_final=lambda n, a: fin.append((n, a)))
+    assert fin == [("A", 0), ("B", 3), ("C", 1)]
+    # max_attempts=2 (bản phẳng): chỉ gen lại 2 lần
+    tries.clear(); calls["regen"].clear()
+    _, fails2, regen2 = improve(["C"], qa_fn, regen_fn, lambda f: None, keep_fn, max_attempts=FLAT_MAX_ATTEMPTS)
+    assert regen2 == {"C": 2} and len(calls["regen"]) == 2 and fails2 == {"C": ["mo_nhoe"]}
     # crop theo bbox 0-1000; bbox quá nhỏ/None -> giữ nguyên ảnh
     import tempfile
     from PIL import Image as _I
