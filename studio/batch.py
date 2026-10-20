@@ -302,14 +302,28 @@ def _og_image(page, base):
     return None
 
 
+def _fetch(url):
+    """-> (bytes, url cuối sau redirect). urllib lỗi -> thử curl 1 lần (20/10: freeimage.host lúc đó timeout bắt
+    tay SSL với Python nhưng curl vẫn tải được -> Car Sunshade lỗi 'mọi link đều lỗi')."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40) as r:
+            return r.read(40 * 1024 * 1024), r.geturl()
+    except Exception as e:
+        p = subprocess.run(["curl", "-sSL", "--fail", "-m", "60", "--max-filesize", str(40 * 1024 * 1024), "-A", UA["User-Agent"], "-w", "\n%{url_effective}",
+                            url], capture_output=True, timeout=90)
+        if p.returncode:
+            raise e
+        data, _, final = p.stdout.rpartition(b"\n")
+        return data, final.decode() or url
+
+
 def download(url, dst, tries=3, hops=1):
     """Tải ảnh, thử lại `tries` lần. Link là TRANG xem ảnh (freeimage.host/i/..., imgur...) thay vì file ảnh ->
     tải ảnh thật ở og:image, tối đa `hops` bước (chặn vòng trang A->B->A) (34-NVH 3D Hoodie 20/10)."""
     last = nxt = None
     for i in range(tries):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40) as r:
-                data, final = r.read(40 * 1024 * 1024), r.geturl()
+            data, final = _fetch(url)
             try:
                 Image.open(io.BytesIO(data)).verify()
             except Exception:
