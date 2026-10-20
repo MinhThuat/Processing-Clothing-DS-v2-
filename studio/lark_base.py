@@ -128,6 +128,19 @@ def get_row(rid):
     return parse_row(raws[0])
 
 
+def find_rows(key):
+    """record_id ('rec...') hoặc Order ID -> các dòng khớp (Order ID có thể nhiều dòng/SKU)."""
+    if key.startswith("rec"):
+        return [get_row(key)]
+    filt = {"logic": "and", "conditions": [["Order ID", "==", key]]}
+    args = ["base", "+record-list", "--base-token", BASE, "--table-id", TABLE, "--view-id", VIEW,
+            "--filter-json", json.dumps(filt)]
+    for f in FIELDS:
+        args += ["--field-id", f]
+    _, raws = _read_ndjson(args)
+    return [parse_row(r) for r in raws]
+
+
 def _upload_args(rid, files):
     """lark-cli chỉ cho đọc file trong thư mục đang chạy / /tmp / ~/files -> chạy TẠI thư mục chứa
     các file (cùng 1 thư mục out/) và truyền tên file ngắn. -> (args, cwd)."""

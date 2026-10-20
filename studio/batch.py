@@ -8,7 +8,8 @@ Lark Base (view 1. DS Order) -> dòng No File chưa có Flat Pieces -> tải Lin
 -> flat_pipeline (pieces 3D + art) -> Claude QA, gen lại -> up Flat Pieces + ghi Flat Note.
 Spec: docs/superpowers/specs/2026-10-15-batch-lark-flat-design.md
 """
-import argparse, hashlib, io, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback, urllib.request
+import argparse, hashlib, html, io, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback
+import urllib.parse, urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -279,19 +280,44 @@ def release_lock(path=LOCK):
 
 
 # ---------- ảnh đầu vào ----------
-def download(url, dst, tries=3):
-    last = None
+_TAG = re.compile(r"<(?:meta|link)\b[^>]*>", re.I)
+_ATTR = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+
+
+def _og_image(page, base):
+    """URL ảnh thật trong trang xem ảnh (og:image / image_src), đã giải entity + nối URL tương đối; không có -> None."""
+    for tag in _TAG.findall(page[:500_000].decode("utf-8", "replace")):
+        a = {k.lower(): v1 or v2 for k, v1, v2 in _ATTR.findall(tag)}
+        real = (a.get("content") if a.get("property", "").lower() == "og:image"
+                else a.get("href") if a.get("rel", "").lower() == "image_src" else None)
+        if real:
+            return urllib.parse.urljoin(base, html.unescape(real))
+    return None
+
+
+def download(url, dst, tries=3, hops=1):
+    """Tải ảnh, thử lại `tries` lần. Link là TRANG xem ảnh (freeimage.host/i/..., imgur...) thay vì file ảnh ->
+    tải ảnh thật ở og:image, tối đa `hops` bước (chặn vòng trang A->B->A) (34-NVH 3D Hoodie 20/10)."""
+    last = nxt = None
     for i in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40) as r:
-                data = r.read(40 * 1024 * 1024)
-            Image.open(io.BytesIO(data)).verify()
+                data, final = r.read(40 * 1024 * 1024), r.geturl()
+            try:
+                Image.open(io.BytesIO(data)).verify()
+            except Exception:
+                nxt = _og_image(data, final) if hops > 0 else None
+                if not nxt:
+                    raise
+                break                       # trang HTML -> tải ảnh thật bên dưới, ngoài vòng thử lại
             dst.write_bytes(data)
             return dst
         except Exception as e:
             last = e
             time.sleep(2 * (i + 1))
-    raise StepError("tải ảnh", f"{url[:80]}: {last}")
+    else:
+        raise StepError("tải ảnh", f"{url[:80]}: {last}")
+    return download(nxt, dst, tries, hops - 1)
 
 
 def make_input(src, crop, dst):
@@ -465,11 +491,23 @@ def fp_cutout(path):
     return cutout(path)
 
 
-def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids, only=None, prev=None,
+                     replace=False):
     """Gen pieces 3D + art, rồi bản PHẲNG của từng mảnh (USER: clothing xuất cả 2 bản, mỗi bản QA riêng) cho
-    1 nhóm con (biến thể + màu) -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL."""
+    1 nhóm con (biến thể + màu) -> QA/gen lại -> up. Trả True nếu còn mảnh QA FAIL.
+    only + prev (--fix-fails): CHỈ gen lại các mảnh trong `only` (vd {'ao_sau', 'ta_truoc_phang'}) với mô tả /
+    hint của lần chạy trước ở thư mục `prev` (bỏ vision); bản phẳng của mảnh 3D không gen lại thì vẽ từ file
+    3D cũ trong prev/out; up xong chỉ thay đúng các file đó trên Base (mảnh đã đạt giữ nguyên)."""
     shutil.rmtree(sdir, ignore_errors=True)    # thử lại cùng ngày: bỏ log/mảnh/pieces.json của lần trước
     sdir.mkdir(parents=True)
+    old_hint = None
+    if prev:
+        shutil.copyfile(prev / "pieces.json", sdir / "pieces.json")
+        if (prev / "rehint.json").exists():   # lần trước đã đổi ảnh/crop + hint -> dùng lại đúng bối cảnh đó
+            r = json.loads((prev / "rehint.json").read_text(encoding="utf-8"))
+            group = {**group}
+            group["front"], group["crop"] = _rehint_target(group, r)
+            old_hint = r.get("hint") or None
     color = None if group["matches_photo"] else group["color"]
     colour_desc = color or "same as the reference photo"
     back_crop = group.get("back_crop")
@@ -479,7 +517,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
            "back": (make_input(srcs[group["back"] - 1], back_crop, sdir / "in_back.png")
                     if group["mode"] == "two" else None),
            "back_cropped": group["mode"] == "two" and back_crop is not None,
-           "hint": None}
+           "hint": old_hint}
     n = Counter()
     pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
 
@@ -510,17 +548,25 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         _gen_soft(lambda: pipe(["--art", "--front", ctx["front"], "-o", sdir / "art.png",
                                 "--emit", sdir / "art_work"]))
 
-    # lần 0: pieces (GEN_WORKERS mảnh/luồng) + art chạy SONG SONG -> tổng CODEX_WORKERS luồng codex
-    _run_both([gen_pieces, gen_art])
     pj = sdir / "pieces.json"
-    if not pj.exists():
-        raise StepError("gen", "vision không ra pieces.json")
-    want = _pieces_json_slugs(pj, group["garment"])
-    have = {p.stem[len("final_"):] for p in sdir.glob("final_*.png")}
-    names = sorted(want | have)              # mảnh lỗi lần 0 (thiếu file) vẫn vào danh sách -> QA chấm 0 -> gen lại
-    if not names:
-        raise StepError("gen", "không ra mảnh nào")
-    names.append("art")                     # art lỗi lần 0 -> QA chấm 0 -> được gen lại
+    if only:
+        # chỉ mảnh 3D lỗi (+ art nếu lỗi), mô tả lấy từ pieces.json cũ (--cache, bỏ vision)
+        names = sorted(x for x in only if not x.endswith("_phang"))
+        slugs = [x for x in names if x != "art"]
+        jobs = ([lambda: gen_pieces(only=slugs, cache=True)] if slugs else []) + ([gen_art] if "art" in names else [])
+        if jobs:
+            _run_both(jobs)
+    else:
+        # lần 0: pieces (GEN_WORKERS mảnh/luồng) + art chạy SONG SONG -> tổng CODEX_WORKERS luồng codex
+        _run_both([gen_pieces, gen_art])
+        if not pj.exists():
+            raise StepError("gen", "vision không ra pieces.json")
+        want = _pieces_json_slugs(pj, group["garment"])
+        have = {p.stem[len("final_"):] for p in sdir.glob("final_*.png")}
+        names = sorted(want | have)          # mảnh lỗi lần 0 (thiếu file) vẫn vào danh sách -> QA chấm 0 -> gen lại
+        if not names:
+            raise StepError("gen", "không ra mảnh nào")
+        names.append("art")                 # art lỗi lần 0 -> QA chấm 0 -> được gen lại
 
     def make_qa(piece_path, flat=False):
       def qa_fn(todo):
@@ -648,19 +694,26 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 shutil.copyfile(src, sdir / "attempts" / f"{name}_{attempt}.png")
         return keep_fn
 
-    best, fails, regen = improve(names, make_qa(piece_path), regen_fn, rehint_fn, make_keep(piece_path))
+    best, fails, regen = (improve(names, make_qa(piece_path), regen_fn, rehint_fn, make_keep(piece_path))
+                          if names else ({}, {}, {}))
 
     # ---- bản PHẲNG: vẽ lại TỪ mảnh 3D đã chốt (ref = đúng mảnh đó) -> không lấn họa tiết mảnh khác (vẽ từ
     # ảnh gốc thì tay phẳng dính sọc thân/quần, Jogger 19/10); art dùng chung ----
     fdir = sdir / "flat"; fdir.mkdir(exist_ok=True)
-    flat_names = [f"{x}_phang" for x in names]          # gồm cả art_phang (USER: bộ phẳng đủ như Jogger D5)
+    flat_names = ([x for x in sorted(only) if x.endswith("_phang")] if only
+                  else [f"{x}_phang" for x in names])     # gồm cả art_phang (USER: bộ phẳng đủ như Jogger D5)
 
     def flat_path(name):
         return fdir / f"final_{name[:-len('_phang')]}.png"
 
     def gen_flat_one(name):
         base = name[:-len("_phang")]
-        ref = sdir / "attempts" / f"{base}_{best[base][0]}.png"
+        if base in best:
+            ref = sdir / "attempts" / f"{base}_{best[base][0]}.png"
+        else:                           # --fix-fails: mảnh 3D không gen lại -> vẽ từ file 3D đã up lần trước
+            ref = next((prev / "out" / piece_filename(rows[0]["sku"], base, failed=f) for f in (False, True)
+                        if prev and (prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)).exists()),
+                       sdir / "missing")
         if not ref.exists():
             return
         dress = base.startswith(("than_", "ta_"))       # mảnh đầm cắt cong: vẽ trên nền xám rồi cutout
@@ -702,12 +755,117 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     if not files:
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
-    note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen) + " · + bản phẳng (mảnh + art)"
+    if only:
+        note = (note_fail(day, fails) if fails else f"OK {day}") + " · gen lại riêng mảnh lỗi: " + ", ".join(sorted(only))
+    else:
+        note = note_fail(day, fails) if fails else note_ok(day, n_pieces, regen) + " · + bản phẳng (mảnh + art)"
     manual = pick.get("manual") or {}
     notes = {r["record_id"]: note + (f" · CẦN CHỈNH: {manual[r['record_id']]}"
                                      if r["record_id"] in manual else "") for r in rows}
-    upload_rows(rows, files, notes, dry, done_ids)
+    if replace or only:   # --regen / --fix-fails: chỉ thay mảnh CÓ file mới (up trước, gỡ sau); mảnh gen hỏng hẳn
+        # giữ nguyên bản cũ trên Base, không gỡ mất (codex review 20/10)
+        replace_rows(rows, files, {piece_slug(rows[0]["sku"], f.name)[0] for f in files}, notes, dry)
+    else:
+        upload_rows(rows, files, notes, dry, done_ids)
+    if not dry:
+        (sdir / "uploaded.ok").write_text(datetime.now().isoformat(), encoding="utf-8")   # _find_prev: đã lên Base
     return bool(fails)
+
+
+def piece_slug(sku, filename):
+    """Tên file mảnh trên Base -> (slug, đã QAFAIL?) theo piece_filename; không phải file mảnh -> (None, False)."""
+    prefix, stem = f"{safe_name(sku_stem(sku))}_", Path(filename).stem
+    if not stem.startswith(prefix):
+        return None, False
+    slug = stem[len(prefix):]
+    failed = slug.endswith("_QAFAIL")
+    return (slug[:-len("_QAFAIL")] if failed else slug), failed
+
+
+def replace_rows(rows, files, names, notes, dry):
+    """--fix-fails / --regen: up file mới TRƯỚC, rồi mới gỡ file cũ của đúng các mảnh `names` (đạt hay QAFAIL;
+    None = gỡ TOÀN BỘ file cũ) — up lỗi thì Base vẫn còn bản cũ, không mất mảnh nào (lỗi thật 20/10: gỡ trước
+    up sau, mạng đứt giữa chừng -> 4205299353 còn 0 file)."""
+    if dry:
+        log("dry", f"[không ghi Base] thay {sorted(names) if names is not None else 'TOÀN BỘ'} · note: {notes}")
+        return
+    for r in rows:
+        rid = r["record_id"]
+        old = [p["file_token"] for p in lb.get_row(rid)["pieces"]
+               if names is None or piece_slug(r["sku"], p.get("name", ""))[0] in names]
+        lb.upload_files(rid, files)
+        if old:
+            lb.remove_files(rid, old)
+        lb.write_notes({rid: notes[rid]})
+        log("up", f"{rid} ✓ thay {len(files)} file (gỡ {len(old)} cũ)")
+
+
+def _find_prev(rid):
+    """Lần chạy gần nhất có dòng `rid`: (gdir, k, group, pick) — group thứ k (c<k>) có pieces.json; không có -> None."""
+    best = None
+    for pj in BATCH.glob("*/*/pick.json"):
+        try:
+            pick = json.loads(pj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for k, g in enumerate(pick.get("groups") or [], 1):
+            c = pj.parent / f"c{k}"
+            # lần chạy đã up xong (out/ có file) — bỏ qua lần dừng giữa chừng / chưa up
+            if rid in g.get("record_ids", []) and (c / "pieces.json").exists() and any(c.glob("out/*.png")):
+                # ưu tiên lần chạy ĐÃ up xong (uploaded.ok); lần chạy cũ (trước khi có dấu) xếp sau
+                key = ((c / "uploaded.ok").exists(), pj.stat().st_mtime)
+                if not best or key > best[0]:
+                    best = (key, pj.parent, k, g, pick)
+    return best and best[1:]
+
+
+def fix_fails(keys, day, dry):
+    """--fix-fails: với mỗi Order ID / record_id -> gen lại CHỈ các mảnh đang _QAFAIL trên Base."""
+    for key in keys:
+        for row in lb.find_rows(key):
+            rid = row["record_id"]
+            failed = {sl for sl, bad in (piece_slug(row["sku"], p.get("name", "")) for p in row["pieces"]) if bad}
+            if not failed:
+                log("fix", f"{key} {rid}: không có mảnh _QAFAIL -> bỏ qua"); continue
+            found = _find_prev(rid)
+            if not found:
+                log("fix", f"{key} {rid}: không thấy lần chạy trước (pick.json + pieces.json) -> bỏ qua"); continue
+            pgdir, k, group, pick = found
+            log("group", f"=== FIX {key} {rid} · {row['sku']} · mảnh lỗi: {', '.join(sorted(failed))} · từ {pgdir} ===")
+            gdir = BATCH / day / f"{pgdir.name.split('_fix')[0]}_fix_{rid[-6:]}"; gdir.mkdir(parents=True, exist_ok=True)
+            srcs = [download(u, gdir / f"src_{i:02d}.jpg") for i, u in enumerate(row["links"], 1)]
+            sdir, psdir = gdir / f"c{k}", pgdir / f"c{k}"
+            try:
+                process_subgroup(group, [row], pick, srcs, sdir, day, dry,
+                                 time.monotonic() + GROUP_TIMEOUT, set(), only=failed, prev=psdir)
+            except StepError as e:
+                log("lỗi", f"FIX {key}: {e}")
+                continue
+            if dry:
+                continue
+            # lần fix sau phải lấy ĐÚNG bản hiện có trên Base: out/ = file mới + file cũ không thay; ghi pick.json
+            # SAU khi up xong (_find_prev chỉ coi lần chạy này là nguồn khi đã hoàn tất)
+            done = {piece_slug(row["sku"], f.name)[0] for f in (sdir / "out").glob("*.png")}
+            for f in psdir.glob("out/*.png"):
+                if piece_slug(row["sku"], f.name)[0] not in done:
+                    shutil.copyfile(f, sdir / "out" / f.name)
+            for name in ("rehint.json",):
+                if (psdir / name).exists() and not (sdir / name).exists():
+                    shutil.copyfile(psdir / name, sdir / name)
+            (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
+            cleanup(gdir)
+
+
+def regen(keys, day, dry, stats):
+    """--regen: gen lại TOÀN BỘ các Order ID / record_id chỉ định (kể cả dòng đã có file / không tag GEN) qua
+    đúng luồng batch; up xong mới thay toàn bộ file cũ."""
+    for key in keys:
+        for row in lb.find_rows(key):
+            if not row["links"]:
+                log("regen", f"{key} {row['record_id']}: không có link ảnh -> bỏ qua"); continue
+            g = build_queue([dict(row, has_pieces=False, gen=True, note="")], day)[0]
+            log("regen", f"{key} {row['record_id']} · {row['sku']}")
+            process_group(g, BATCH / day, day, dry, stats, replace=True)
 
 
 def upload_rows(rows, files, notes, dry, done_ids):
@@ -866,7 +1024,7 @@ def cleanup(gdir):
         p.unlink(missing_ok=True)
 
 
-def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids):
+def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids, replace=False):
     """SP không phải quần áo (nonclothing.py): mỗi dòng 2 art (phẳng + giả 3D) -> up + note riêng từng dòng."""
     any_fail = False
     for r, arts in nonclothing.run(rows, srcs, sheet, gdir, log):
@@ -882,14 +1040,17 @@ def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids):
         note = (f"QA FAIL {day} · " + " · ".join(f"{k} ({','.join(e)})" for k, e in fails.items())
                 + f" sau {nonclothing.MAX_ATTEMPTS} lần" if fails
                 else f"OK {day} · art phẳng + giả 3D (không phải quần áo)")
-        upload_rows([r], files, {r["record_id"]: note}, dry, done_ids)
+        if replace:
+            replace_rows([r], files, {piece_slug(r["sku"], f.name)[0] for f in files}, {r["record_id"]: note}, dry)
+        else:
+            upload_rows([r], files, {r["record_id"]: note}, dry, done_ids)
     stats["qafail" if any_fail else "ok"] += 1
     if not dry:
         cleanup(gdir)
     return None
 
 
-def process_group(g, rundir, day, dry, stats):
+def process_group(g, rundir, day, dry, stats, replace=False):
     """-> None (gen xong), 'skip', hoặc kind của StepError. QuotaError/AuthError ném tiếp lên main."""
     gid = group_id(g)
     gdir = rundir / gid; gdir.mkdir(parents=True, exist_ok=True)
@@ -914,7 +1075,7 @@ def process_group(g, rundir, day, dry, stats):
         (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
         if pick["skip"]:                   # KHÔNG phải quần áo -> nhánh riêng, không đụng luồng clothing
             log("nc", f"không phải quần áo ({pick['skip']}) -> art phẳng")
-            return process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids)
+            return process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids, replace)
         unassigned = pick.get("unassigned") or []
         if unassigned:
             # Claude bỏ sót / nhóm front sai -> KHÔNG đoán dồn vào nhóm khác (sai biến thể/màu) ->
@@ -938,7 +1099,8 @@ def process_group(g, rundir, day, dry, stats):
         any_fail = False
         for k, group in enumerate(pick["groups"], 1):
             sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
-            any_fail |= process_subgroup(group, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline, done_ids)
+            any_fail |= process_subgroup(group, sub_rows, pick, srcs, gdir / f"c{k}", day, dry, deadline, done_ids,
+                                         replace=replace)
         stats["qafail" if any_fail else "ok"] += 1
         if not dry:
             cleanup(gdir)
@@ -969,6 +1131,10 @@ def _parse_args(argv=None):
     ap.add_argument("--limit", type=int, help="dừng sau N nhóm đã gen (SKIP không tính)")
     ap.add_argument("--dry-run", action="store_true", help="làm đủ trừ ghi Lark Base")
     ap.add_argument("--date", help="chỉ làm mẫu có Create Date = ngày này (YYYY-MM-DD); mặc định hôm nay")
+    ap.add_argument("--fix-fails", nargs="+", metavar="ID",
+                    help="chỉ gen lại các mảnh _QAFAIL của các Order ID / record_id này (mảnh đạt giữ nguyên)")
+    ap.add_argument("--regen", nargs="+", metavar="ID",
+                    help="gen lại TOÀN BỘ các Order ID / record_id này rồi thay hết file cũ (up trước, gỡ sau)")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args(argv)
     if a.date:
@@ -1008,7 +1174,19 @@ def main():
     rundir = BATCH / day; rundir.mkdir(parents=True, exist_ok=True)
     _LOGF = open(rundir / "batch.log", "a", encoding="utf-8")
     stats, stop, reason, queue = Counter(), Stopper(a.until, a.limit), "hết việc", []
-    log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}")
+    log("start", f"date={only_day} until={a.until} limit={a.limit} dry={a.dry_run}"
+                 + (f" fix-fails={a.fix_fails}" if a.fix_fails else "") + (f" regen={a.regen}" if a.regen else ""))
+    if a.fix_fails or a.regen:               # chế độ riêng: chỉ làm các mẫu chỉ định
+        try:
+            if a.regen:
+                regen(a.regen, day, a.dry_run, stats)
+            if a.fix_fails:
+                fix_fails(a.fix_fails, day, a.dry_run)
+        except (AuthError, QuotaError, KeyboardInterrupt) as e:
+            _kill_active(); log("done", f"dừng: {e!r}")
+        finally:
+            release_lock()
+        return
     try:
         queue = build_queue(lb.fetch_rows(only_day, day), only_day)
         log("queue", f"{len(queue)} nhóm cần làm (mẫu ngày {only_day})")
@@ -1473,7 +1651,7 @@ def _selfcheck():
                            "back": None, "mode": "infer", "crop": None, "garment": "top_bottom",
                            "record_ids": ["a", "b"]}]}
 
-    def fake_subgroup2(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+    def fake_subgroup2(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids, **kw):
         calls_pg["subgroup"].append(sorted(r["record_id"] for r in rows)); return False
 
     def fake_write_notes2(notes):
@@ -1511,7 +1689,7 @@ def _selfcheck():
         calls_pg2["locate"].append((variant, skus, kid))
         return [100, 100, 600, 600] if variant == "Design 2" else None
 
-    def fake_subgroup3(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids):
+    def fake_subgroup3(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids, **kw):
         calls_pg2["subgroup_crop"][group["variant"]] = group["crop"]; return False
 
     judge.grid_overlay, judge.locate = fake_grid_overlay2, fake_locate2
@@ -1616,6 +1794,31 @@ def _selfcheck():
     gN = {**gD, "front": 4}
     _check_design_photos([gN], rD[:1], [Path("1.jpg")] * 11, Path("s.jpg"))
     assert gN["front"] == 4
+    # --fix-fails: tên file Base -> slug; thay file: up TRƯỚC rồi mới gỡ đúng mảnh, mảnh khác giữ nguyên
+    sku = "VPC082610A09-Wendy 161026-Ugly Sweater-2XL-JO161026"
+    assert piece_slug(sku, piece_filename(sku, "ao_sau_phang", failed=True)) == ("ao_sau_phang", True)
+    assert piece_slug(sku, piece_filename(sku, "art")) == ("art", False)
+    assert piece_slug(sku, "khac.png") == (None, False)
+    calls = []
+    o_get, o_up, o_rm, o_wn = lb.get_row, lb.upload_files, lb.remove_files, lb.write_notes
+    lb.get_row = lambda rid: {"pieces": [{"name": piece_filename(sku, "ao_sau", True), "file_token": "t1"},
+                                         {"name": piece_filename(sku, "ao_truoc"), "file_token": "t2"}]}
+    lb.upload_files = lambda rid, files: calls.append(("up", len(files)))
+    lb.remove_files = lambda rid, toks: calls.append(("rm", toks))
+    lb.write_notes = lambda n: calls.append(("note",))
+    try:
+        replace_rows([{"record_id": "r", "sku": sku}], [Path("x.png")], {"ao_sau"}, {"r": "OK"}, False)
+        assert calls == [("up", 1), ("rm", ["t1"]), ("note",)], calls
+        calls.clear()
+        replace_rows([{"record_id": "r", "sku": sku}], [Path("x.png")], None, {"r": "OK"}, False)
+        assert calls == [("up", 1), ("rm", ["t1", "t2"]), ("note",)], calls   # --regen: up trước, gỡ hết sau
+    finally:
+        lb.get_row, lb.upload_files, lb.remove_files, lb.write_notes = o_get, o_up, o_rm, o_wn
+    assert _og_image(b'<meta property="og:image" content="/i/a.jpg?x=1&amp;y=2">', "https://h.io/p/1") == \
+        "https://h.io/i/a.jpg?x=1&y=2"
+    assert _og_image(b"<html>no image</html>", "https://h.io") is None
+    assert _og_image(b"<meta content='//c.io/x.png' property='og:image'>", "https://h.io") == "https://c.io/x.png"
+    assert _og_image(b'<link href="/y.jpg" rel="image_src">', "https://h.io/a") == "https://h.io/y.jpg"
     print("batch selfcheck OK")
 
 

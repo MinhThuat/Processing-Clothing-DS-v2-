@@ -11,7 +11,7 @@
   --art    : 1 bản vẽ CAD phẳng nguyên bộ, mặt trước. Tách từng người.
 
 Pipeline: dola-seed (BytePlus ARK) NHÌN ảnh -> phân loại + tả print từng mảnh ->
-gen (primary chatgpt-imagegen/codex, lỗi -> OpenArt Seedream 4.5).
+gen (primary chatgpt-imagegen/codex, lỗi -> OpenArt Ideogram 4.5; ảnh 18+ -> nano-banana-2).
 
 Chạy:
   python3 flat_pipeline.py --pieces --front f.png [--back b.png | --combined] -o out.png
@@ -104,7 +104,9 @@ ENV_FILE = Path(os.getenv("ARK_ENV_FILE", _DEF_ENV))
 ARK_BASE = "https://ark.ap-southeast.bytepluses.com/api/v3"
 VMODELS = ["seed-2-0-lite-260428",   # model chính (dola-seed lite)
            "seed-2-0-mini-260428"]   # backup (dola-seed mini)
-OA_MODEL = "byte-plus-seedream-4-5"       # fallback mặc định (codex chặn vì IP / lỗi khác)
+OA_MODEL = "ideogram-4-5"   # fallback mặc định (codex chặn vì IP / quá tải / lỗi khác). USER 20/10: thay Seedream 4.5
+# — CLI openart không truyền được aspectRatio; Ideogram mặc định "auto" = khổ theo ảnh ref (mảnh đứng giữ đứng),
+# Seedream mặc định 4:3 -> vẽ cả áo có tay/nền, cắt gấu (test 10 model mảnh Golden Girls 20/10). 44 vs 15 credit.
 # codex chặn vì ảnh 18+ -> nano-banana-2 (USER 19/10): Seedream gen được nhưng khung 4:3 cắt mất gấu/dải trên
 # mảnh (test 9 model mẫu "Christmas balls", nano-banana-2 giống gốc nhất). Lỗi codex IP/18+ y hệt nhau
 # (image_status=failed, không text) -> Claude nhìn ảnh ref để phân loại.
@@ -603,7 +605,7 @@ def crop_norm(img, box, wh, out):
     return (x0, y0, x1, y1)
 
 
-# ---------- 2. gen: chatgpt-imagegen (primary) -> OpenArt Seedream 4.5 (fallback) ----------
+# ---------- 2. gen: chatgpt-imagegen (primary) -> OpenArt Ideogram 4.5 (fallback) ----------
 def _bin(name):
     cands = [name + ".exe", name] if sys.platform == "win32" else [name]
     for c in cands:
@@ -612,10 +614,11 @@ def _bin(name):
             return str(b)
     return name
 CHATGPT_BIN = _bin("chatgpt-imagegen")
-# tài khoản codex của project (USER 19/10: dùng CẢ 2): mỗi cái là 1 thư mục HOME chứa .codex/auth.json
+# tài khoản codex của project (USER 20/10: chỉ tài khoản 1 ~; dùng thêm tk 2: FLAT_CODEX_HOMES="~:~/codex_acc2"):
+# mỗi cái là 1 thư mục HOME chứa .codex/auth.json
 # (chatgpt-imagegen đọc auth theo $HOME). Đổi bằng env FLAT_CODEX_HOMES (các đường dẫn nối bằng os.pathsep).
 CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
+               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
 _ACC_NEXT = itertools.count(os.getpid())   # xoay vòng; lệch theo pid -> các tiến trình con không cùng dồn 1 tài khoản
 # lỗi do TÀI KHOẢN (quá tải / hạn mức / đăng nhập / treo) -> thử tài khoản kia. Lỗi do NỘI DUNG (ảnh bị chặn:
 # "no image returned") -> không đổi: tài khoản nào cũng chặn, chỉ mất thêm ~1 phút.
@@ -760,7 +763,7 @@ def _openart_gen(prompt, refs, out, timeout=300, model=OA_MODEL):
     return out
 
 def gen_panel(prompt, refs, out):
-    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Seedream 4.5, ảnh 18+ -> nano-banana-2."""
+    """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Ideogram 4.5, ảnh 18+ -> nano-banana-2."""
     prompt = prompt + _prompt_extra()
     Path(out).unlink(missing_ok=True)       # tool trả rc=0 mà không ghi file -> không nhận nhầm file lần trước
     try:
