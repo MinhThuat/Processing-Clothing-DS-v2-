@@ -22,6 +22,7 @@ import judge
 import lark_base as lb
 import nonclothing
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
+import flat_pipeline as fp
 from flat_pipeline import _pieces_plan, _filter_by_garment, PIECE_BOX, CODEX_WORKERS
 
 ROOT = Path(__file__).resolve().parent
@@ -432,6 +433,9 @@ def _log_auth_error(logtxt, stderr=""):
     """Toàn log chỉ dừng trên câu CHẮC CHẮN hết đăng nhập (AUTH_HARD_RE) — codex vision log
     'HTTP 401' thoáng qua rồi tự refresh token không được tính; nhưng nếu chính dòng '✗ mảnh ...'
     (mảnh thật sự lỗi) khớp AUTH_RE đầy đủ thì vẫn coi là hết đăng nhập."""
+    # 1 tài khoản hết đăng nhập nhưng đã chuyển sang tài khoản kia gen được (dòng '-> thử tài khoản khác') -> không
+    # tính (20/10: tk 2 token refresh 401, batch dừng 'hết đăng nhập' dù tk 1 vẫn gen bình thường)
+    logtxt = "\n".join(l for l in logtxt.splitlines() if "thử tài khoản khác" not in l)
     return bool(AUTH_HARD_RE.search(logtxt + (stderr or ""))) or _piece_auth(logtxt)
 
 
@@ -499,17 +503,11 @@ FLAT_FROM_3D = (
     "vector art: SOLID FLAT COLOR FILL, crisp clean edges, NO 3D, NO shading, NO gradient, NO highlights, NO "
     "glow, NO fabric texture, NO folds. Do NOT add any graphic that is not in the reference. ")
 FLAT_BLEED = "Fill the whole frame edge to edge like the reference: NO margin, NO border, NO garment outline."
-FLAT_DRESS = "Keep the panel's exact cut shape, on a plain flat light grey background and NOTHING else."
 FLAT_ART = (
     "The reference image is a technical drawing of a whole outfit. Redraw EXACTLY the same drawing — same "
     "garments, layout, proportions, every graphic and colour, on the same plain light grey background — as "
     "clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean outlines, NO 3D, NO shading, NO gradient, "
     "NO highlights, NO fabric texture, NO folds. Do NOT add anything that is not in the reference. ")
-
-
-def fp_cutout(path):
-    from flat_pipeline import cutout
-    return cutout(path)
 
 
 def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids, only=None, prev=None,
@@ -728,13 +726,12 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         base, ref = name[:-len("_phang")], refs[name]
         if not ref.exists():
             return
-        dress = base.startswith(("than_", "ta_"))       # mảnh đầm cắt cong: vẽ trên nền xám rồi cutout
-        prompt = (FLAT_ART if base == "art" else FLAT_FROM_3D + (FLAT_DRESS if dress else FLAT_BLEED)) + (
+        # mảnh đầm kiểu mới (USER 21/10) cũng là khung chữ nhật phủ kín (tà trải thẳng / thân vuông) -> FLAT_BLEED;
+        # uốn theo khuôn ở bước xuất (fp.export_piece)
+        prompt = (FLAT_ART if base == "art" else FLAT_FROM_3D + FLAT_BLEED) + (
             f" FIX: {ctx['hint']}" if ctx["hint"] else "")
         try:
             nonclothing._gen(prompt, ref, flat_path(name))
-            if dress:
-                fp_cutout(flat_path(name)).save(flat_path(name))
         except StepError as e:
             if e.kind != "gen":
                 raise
@@ -768,9 +765,14 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         for name in flat_names:     # --fix-fails: mảnh 3D không gen lại -> vẽ ngay từ file 3D đã up lần trước
             base = name[:-len("_phang")]
             if base not in names:
-                start_flat(name, next((prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)
-                                       for f in (False, True) if prev and
-                                       (prev / "out" / piece_filename(rows[0]["sku"], base, failed=f)).exists()),
+                # raw/ = bản CHƯA xuất (xuất = uốn khuôn/khung rộng, không vẽ phẳng lại từ đó được); lần chạy
+                # cũ chưa có raw/ -> out/, TRỪ mảnh đầm: out/ cũ là hình đã cắt cong -> vẽ phẳng rồi uốn lần nữa
+                # thì sai (codex review 21/10) -> bỏ, chờ --regen
+                dirs = ((prev / "raw",) if base.startswith(("ta_", "than_")) else (prev / "raw", prev / "out")) \
+                    if prev else ()
+                start_flat(name, next((d / piece_filename(rows[0]["sku"], base, failed=f)
+                                       for d in dirs for f in (False, True)
+                                       if (d / piece_filename(rows[0]["sku"], base, failed=f)).exists()),
                                       sdir / "missing"))
 
         def on_final(base, attempt):
@@ -785,13 +787,20 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     finally:
         fx.shutdown(wait=True, cancel_futures=True)
 
-    out = sdir / "out"; out.mkdir(exist_ok=True)
-    files = []
-    for name in names + flat_names:
+    out, raw = sdir / "out", sdir / "raw"; out.mkdir(exist_ok=True); raw.mkdir(exist_ok=True)
+
+    def export(name):   # USER 21/10: file up = KHUNG LỚN phủ kín (tà uốn theo khuôn, thân theo khuôn, mảnh khác lề rộng)
         src = sdir / "attempts" / f"{name}_{best[name][0]}.png"
-        if src.exists():                    # mảnh chưa từng ra file thì không có gì để up
-            dst = out / piece_filename(rows[0]["sku"], name, failed=name in fails)
-            shutil.copyfile(src, dst); files.append(dst)
+        if not src.exists():                # mảnh chưa từng ra file thì không có gì để up
+            return None
+        fname = piece_filename(rows[0]["sku"], name, failed=name in fails)
+        shutil.copyfile(src, raw / fname)
+        how = fp.export_piece(name, src, out / fname, sdir)
+        log("xuất", f"{name}: {how} {Image.open(out / fname).size}")
+        return out / fname
+
+    with ThreadPoolExecutor(max_workers=CODEX_WORKERS) as ex:
+        files = [f for f in ex.map(export, names + flat_names) if f]
     if not files:
         raise StepError("gen", "không có mảnh nào để up")
     n_pieces = sum(1 for x in names if x != "art")
@@ -939,9 +948,11 @@ def fix_fails(keys, day, dry, max_score=None):
             # lần fix sau phải lấy ĐÚNG bản hiện có trên Base: out/ = file mới + file cũ không thay; ghi pick.json
             # SAU khi up xong (_find_prev chỉ coi lần chạy này là nguồn khi đã hoàn tất)
             done = {piece_slug(row["sku"], f.name)[0] for f in (sdir / "out").glob("*.png")}
-            for f in psdir.glob("out/*.png"):
-                if piece_slug(row["sku"], f.name)[0] not in done:
-                    shutil.copyfile(f, sdir / "out" / f.name)
+            for sub in ("out", "raw"):              # raw/ = bản chưa xuất, lần fix sau vẽ phẳng lại từ đây
+                (sdir / sub).mkdir(exist_ok=True)
+                for f in psdir.glob(f"{sub}/*.png"):
+                    if piece_slug(row["sku"], f.name)[0] not in done:
+                        shutil.copyfile(f, sdir / sub / f.name)
             for name in ("rehint.json",):
                 if (psdir / name).exists() and not (sdir / name).exists():
                     shutil.copyfile(psdir / name, sdir / name)
@@ -1497,6 +1508,9 @@ def _selfcheck():
     assert _log_auth_error("[vision   ] lỗi codex: HTTP 401 Unauthorized") is False
     assert _log_auth_error("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
     assert _log_auth_error("bình thường", stderr="codex chưa đăng nhập") is True   # AUTH_HARD_RE toàn log
+    # tk 2 hết đăng nhập nhưng đã chuyển tk 1 -> không dừng batch
+    assert _log_auth_error("  codex /home/u/codex_acc2 lỗi tài khoản (token refresh failed: HTTP 401) -> thử tài "
+                           "khoản khác\n  ✓ xong bằng chatgpt-imagegen") is False
     assert _piece_auth("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
     assert _piece_auth("[vision] lỗi codex: HTTP 401") is False       # không phải dòng "✗ mảnh"
     # #2 _slugs_match: lần 3 vision lại đổi tay giống<->khác -> tên mảnh lệch

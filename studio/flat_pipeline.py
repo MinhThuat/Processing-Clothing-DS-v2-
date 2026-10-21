@@ -20,7 +20,7 @@ Chạy:
 
 Yêu cầu: codex đã đăng nhập + `openart login`; ARK_API_KEY (env hoặc .env cạnh script).
 """
-import argparse, base64, io, itertools, json, os, random, re, subprocess, sys, tempfile, threading, time, urllib.request
+import argparse, base64, io, itertools, json, os, random, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -138,6 +138,29 @@ SHAPE_BODICE = (" Shape: a sleeveless bodice tank panel like the second referenc
                 "waist seam: NO waistband, belt, skirt or pants fabric below it.")
 SHAPE_FAN = (" Shape: a wide quarter-circle CIRCLE-SKIRT fan panel spread flat like the second "
              "reference (shape guide). Every band follows the curved arc, parallel to the curved hem.")
+# ĐẦM KIỂU MỚI (USER 21/10): tà = tấm hoạ tiết CHỮ NHẬT "trải thẳng" (trên = eo, dưới = gấu) — export_piece uốn
+# theo khuôn tpl_skirt ra NGUYÊN khung 9000x4700; thân = khung vuông phủ kín, đặt hoạ tiết khớp khuôn tpl_bodice.
+SKIRT_RECT = (
+    "Flat textile PRINT of the {label} as one wide RECTANGLE for printing: the TOP edge is the waistline, the "
+    "BOTTOM edge is the hem. Reproduce the skirt's printed artwork EXACTLY as in the reference crop (colours, "
+    "bands, motifs, their positions from waist to hem and left to right, relative sizes) but perfectly flat and "
+    "straight: horizontal bands run as straight stripes across the full width, borders along the hem become a "
+    "straight band along the bottom edge, vertical elements stay vertical, motifs upright. NO gathers, pleats, "
+    "folds, shadows or perspective; NO garment outline, NO bodice or waistband, NO person, NO background. Fill "
+    "the whole frame edge to edge.")
+BODICE_TPL = (
+    "Flat textile PRINT for the {label}, filling the ENTIRE square frame edge to edge. The SECOND reference is "
+    "the sewing pattern: the white outline shows where this panel will be cut (neckline scoop at top centre, "
+    "straps at the top corners, armholes at the sides, waist seam along the bottom). Place the bodice's printed "
+    "artwork from the FIRST reference (a crop of the real bodice) so it sits INSIDE that outline at the same "
+    "positions as on the real garment (neckline trim along the scoop, chest motifs on the chest, waist details "
+    "at the bottom), and continue the base fabric and its pattern beyond the outline out to all four edges. Do "
+    "NOT draw the outline, the word FRONT, the mauve background, a person, folds, shadows or perspective — only "
+    "the flat print.")
+_DRESS_LABEL = {"ta_truoc": "FRONT skirt panel", "ta_sau": "BACK skirt panel",
+                "than_truoc": "FRONT bodice panel of a dress", "than_sau": "BACK bodice panel of a dress"}
+SKIRT_SIZE, BODICE_SIZE, PIECE_LONG = (9000, 4700), (3500, 3500), 3500   # cỡ file xuất (USER 21/10)
+
 # tà váy: bỏ dây/nơ/sash thắt lủng lẳng (USER: mảnh tà không có dây thừa) — xoá khỏi desc + nhắc CUỐI prompt
 NO_TIES = (" IMPORTANT: draw ONLY the flat skirt fabric panel. NO tie, sash, knot, bow, ribbon, string, "
            "cord or strap anywhere — not hanging, not draped, not tied at the hip — even though the photo "
@@ -587,14 +610,17 @@ def _make_piece(spec, refs, work, out, flat=False):
     infer = INFER_NOTE if spec.get("inferred") else ""
     note, oa_note = (CROP_NOTE + infer, OA_CROP_NOTE + infer) if crop else (infer, infer)
     if spec["kind"] == "dress":
-        tmp = work / f"gen_{spec['slug']}.png"
-        base = DRESS_FLAT if flat else DRESS_FAITHFUL
-        fan = spec["shape"] is SHAPE_FAN
-        desc = _strip_ties(spec["desc"]) if fan else spec["desc"]
-        head, tail = base + spec["shape"], " " + desc + (NO_TIES if fan else "")
-        gen_panel(head + note + tail, [crop or ref, ASSETS / spec["guide"], *ctx], tmp,
-                  oa=(head + oa_note + tail, [crop or ref, ASSETS / spec["guide"]]))
-        cutout(tmp).save(dst)                               # cắt theo silhouette, nền trong suốt
+        label = _DRESS_LABEL.get(spec["slug"], spec["slug"])
+        if spec["slug"].startswith("ta_"):       # tà: chữ nhật trải thẳng, export_piece uốn theo khuôn
+            head, tail = SKIRT_RECT.format(label=label), " Print: " + _strip_ties(spec["desc"]) + NO_TIES
+            gen_panel(head + note + tail, [crop or ref, *ctx], dst, oa=(head + oa_note + tail, [crop or ref]),
+                      size="1536x1024")
+        else:                                    # thân: khung vuông phủ kín, hoạ tiết đặt theo khuôn thân
+            tpl = _tpl_small()
+            head, tail = BODICE_TPL.format(label=label), " Print: " + spec["desc"]
+            gen_panel(head + note + tail, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note + tail, [crop or ref, tpl]),
+                      size="2048x2048")
+        _flatten_white(dst)
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
         raw = work / f"raw_{spec['slug']}.png"            # giữ bản gốc model trả (soi lỗi vùng trong suốt)
@@ -642,11 +668,12 @@ def _bin(name):
             return str(b)
     return name
 CHATGPT_BIN = _bin("chatgpt-imagegen")
-# tài khoản codex của project (USER 20/10: chỉ tài khoản 1 ~; dùng thêm tk 2: FLAT_CODEX_HOMES="~:~/codex_acc2"):
+# tài khoản codex của project (USER 21/10: cả 2 tài khoản, tk 1 đứng đầu, 4 luồng/tk = 8 luồng; chỉ tk 1:
+# FLAT_CODEX_HOMES="~"):
 # mỗi cái là 1 thư mục HOME chứa .codex/auth.json
 # (chatgpt-imagegen đọc auth theo $HOME). Đổi bằng env FLAT_CODEX_HOMES (các đường dẫn nối bằng os.pathsep).
 CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
+               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
 _ACC_NEXT = itertools.count(os.getpid())   # xoay vòng; lệch theo pid -> các tiến trình con không cùng dồn 1 tài khoản
 # lỗi do TÀI KHOẢN (quá tải / hạn mức / đăng nhập / treo) -> thử tài khoản kia. Lỗi do NỘI DUNG (ảnh bị chặn:
 # "no image returned") -> không đổi: tài khoản nào cũng chặn, chỉ mất thêm ~1 phút.
@@ -750,12 +777,12 @@ def _run(cmd, timeout, **extra_env):
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"rc={p.returncode}")
 
-def _chatgpt_gen(prompt, refs, out, timeout=420):
+def _chatgpt_gen(prompt, refs, out, timeout=420, size="auto"):
     # xin JPEG (không có kênh trong suốt) rồi lưu PNG: PNG để model tự chọn nền trong suốt -> nó đánh dấu
     # nhầm vùng vải trơn là trong suốt + vẽ viền tối loang (vignette) ở đó (lỗi thật: Jogger tay_truoc 16/10)
     tmp = Path(out).with_name(Path(out).stem + "_gen.jpg")
     tmp.unlink(missing_ok=True)
-    cmd = _launcher(CHATGPT_BIN) + [CHATGPT_BIN, prompt, "-o", str(tmp), "--size", "auto",
+    cmd = _launcher(CHATGPT_BIN) + [CHATGPT_BIN, prompt, "-o", str(tmp), "--size", size,
            "--backend", "codex", "--quiet", "--format", "jpeg"]
     for r in refs:
         cmd += ["-i", str(r)]
@@ -790,7 +817,7 @@ def _openart_gen(prompt, refs, out, timeout=300, model=OA_MODEL):
         raise RuntimeError("openart không tạo file")
     return out
 
-def gen_panel(prompt, refs, out, oa=None):
+def gen_panel(prompt, refs, out, oa=None, size="auto"):
     """Primary chatgpt-imagegen (codex), lỗi -> fallback OpenArt: Ideogram 4.5, ảnh 18+ -> nano-banana-2.
     oa = (prompt, refs) riêng cho OpenArt (mảnh có ảnh cắt: chỉ gửi ảnh cắt, xem OA_CROP_NOTE)."""
     oa_prompt, oa_refs = oa or (prompt, refs)
@@ -799,7 +826,7 @@ def gen_panel(prompt, refs, out, oa=None):
     Path(out).unlink(missing_ok=True)       # tool trả rc=0 mà không ghi file -> không nhận nhầm file lần trước
     try:
         log("gen", "  → thử chatgpt-imagegen (codex) ...")
-        r = _chatgpt_gen(prompt, refs, out)
+        r = _chatgpt_gen(prompt, refs, out, size=size)
         log("gen", "  ✓ xong bằng chatgpt-imagegen")
         return r
     except Exception as e:
@@ -815,6 +842,149 @@ def gen_panel(prompt, refs, out, oa=None):
     log("gen", f"  ✓ xong bằng OpenArt {model}")
     return r
 
+
+# ---------- 2b. XUẤT FILE CUỐI (USER 21/10): khung lớn phủ kín ----------
+_TPL_LOCK = threading.Lock()
+_WARP_LOCK = threading.Lock()   # ponytail: 1 lần uốn 9000x4700 ~3GB RAM -> uốn tuần tự; tách theo dải hàng nếu cần song song
+
+def _tpl_small():
+    """Khuôn thân đầm thu nhỏ 1024 làm ref cho model (file gốc 3500px quá nặng để gửi)."""
+    out = ASSETS / "tpl_bodice_1024.png"
+    with _TPL_LOCK:
+        if not out.exists():
+            Image.open(ASSETS / "tpl_bodice.jpg").convert("RGB").resize((1024, 1024)).save(out)
+    return out
+
+def _skirt_mask():
+    """Mặt nạ trong khuôn tà (tpl_skirt.jpg, viền trắng trên nền đều màu) -> bool HxW, cache .npy."""
+    cache = ASSETS / "tpl_skirt_mask.npy"
+    with _TPL_LOCK:
+        if cache.exists():
+            return np.load(cache)
+        Image.MAX_IMAGE_PIXELS = None
+        im = np.array(Image.open(ASSETS / "tpl_skirt.jpg").convert("RGB")).astype(np.int16)
+        line = (np.abs(im - im[5, 5]).max(2) > 60).astype(np.uint8)        # viền + chữ của khuôn
+        _, lab = cv2.connectedComponents(1 - line, connectivity=4)
+        inside = cv2.morphologyEx((lab != lab[0, 0]).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+        np.save(cache, inside.astype(bool))
+        return inside.astype(bool)
+
+def warp_skirt(rect, mask, nb=1024):
+    """Tấm chữ nhật (trên = eo, dưới = gấu) -> NGUYÊN khung khuôn, hoạ tiết cong theo khuôn quạt: u theo góc
+    quanh đỉnh 2 cạnh bên, v theo r giữa cung eo/gấu ĐO TRÊN KHUÔN từng góc (khuôn không cần đồng tâm). Ngoài
+    khuôn: phản chiếu liền mạch (lề in tràn). rect HxWx3 uint8 -> ảnh cỡ mask."""
+    h, w = mask.shape
+    top = np.array([(x, np.argmax(mask[:, x])) for x in range(0, w, 5) if mask[:, x].any()])
+    xs_, span = top[:, 0], top[:, 0].max() - top[:, 0].min()
+    L = top[(xs_ > xs_.min() + .05 * span) & (xs_ < xs_.min() + .3 * span)]
+    R = top[(xs_ < xs_.max() - .05 * span) & (xs_ > xs_.max() - .3 * span)]
+    pl, pr = np.polyfit(L[:, 0], L[:, 1], 1), np.polyfit(R[:, 0], R[:, 1], 1)
+    ax = (pr[1] - pl[1]) / (pl[0] - pr[0]); ay = pl[0] * ax + pl[1]                 # đỉnh quạt
+    ys, xs = np.nonzero(mask)
+    th = np.arctan2(ys - ay, xs - ax); r = np.hypot(xs - ax, ys - ay)
+    t0, t1 = th.min(), th.max()
+    b = ((th - t0) / (t1 - t0) * (nb - 1)).astype(int)
+    rin = np.full(nb, np.inf); rout = np.zeros(nb)
+    np.minimum.at(rin, b, r); np.maximum.at(rout, b, r)
+    idx = np.arange(nb); ok = np.isfinite(rin)
+    rin, rout = np.interp(idx, idx[ok], rin[ok]), np.interp(idx, idx[ok], rout[ok])
+    # bin sát eo có thể không trúng pixel cung eo -> rin nhảy (vệt dọc giữa); làm mượt trung vị
+    rin, rout = ndimage.median_filter(rin, 9, mode="nearest"), ndimage.median_filter(rout, 9, mode="nearest")
+    k = nb // 50   # bin sát 2 cạnh bên chỉ vài pixel -> rin≈rout (vệt sọc dày ngoài khuôn): lấy bin cách mép 2%
+    rin[:k], rout[:k], rin[-k:], rout[-k:] = rin[k], rout[k], rin[-k - 1], rout[-k - 1]
+    rh, rw = rect.shape[:2]
+    mx = np.empty((h, w), np.float32); my = np.empty((h, w), np.float32)
+    for y0 in range(0, h, 512):                          # theo dải hàng: đỡ RAM
+        yy, xx = np.mgrid[y0:min(h, y0 + 512), 0:w]
+        t = np.arctan2(yy - ay, xx - ax); rr = np.hypot(xx - ax, yy - ay)
+        tb = np.clip((t - t0) / (t1 - t0), -1, 2) * (nb - 1)
+        ri, ro = np.interp(tb, idx, rin), np.interp(tb, idx, rout)
+        u = (1 - (t - t0) / (t1 - t0)) * (rw - 1)        # góc tăng = phải -> trái (y xuống, đỉnh ở trên)
+        v = (rr - ri) / np.maximum(ro - ri, 1) * (rh - 1)
+        mx[y0:y0 + 512] = (rw - 1) - np.abs(np.mod(u, 2 * (rw - 1)) - (rw - 1))   # phản chiếu tuần hoàn
+        my[y0:y0 + 512] = (rh - 1) - np.abs(np.mod(v, 2 * (rh - 1)) - (rh - 1))
+    return cv2.remap(rect, mx, my, cv2.INTER_LANCZOS4)
+
+WIDEN = ("The reference shows a garment print PANEL placed in the CENTRE of a larger white canvas. EXTEND the print "
+         "outward to fill ALL the white area: continue the base fabric colour and the surrounding pattern naturally "
+         "past every edge of the panel out to the canvas borders. Keep the central panel EXACTLY as it is (same "
+         "position, size and details); do NOT add new logos, text, sleeves, collars or big motifs in the extension "
+         "— just more of the same fabric/background pattern. No white left, no borders, no outlines, no person.")
+WIDEN_PAD = 0.3   # lề mỗi bên = 30% cạnh dài của mảnh
+WIDEN_MATCH = 18  # sai khác TB (0-255, ảnh thu 48px) giữa phần giữa bản vẽ lề và mảnh gốc: <= mới ghép gốc
+
+def _edge_extend(im, p):
+    """Lề dự phòng: kéo dài mép vải rồi mờ dần ra ngoài (sọc/dải đi tiếp, không lặp logo)."""
+    h, w = im.shape[:2]
+    ext = cv2.copyMakeBorder(im, p, p, p, p, cv2.BORDER_REPLICATE)
+    blur = cv2.GaussianBlur(ext, (0, 0), max(1, p / 6))
+    inner = np.zeros(ext.shape[:2], np.uint8); inner[p:p + h, p:p + w] = 1
+    a = np.clip(cv2.distanceTransform(1 - inner, cv2.DIST_L2, 5) / max(1, p * 0.6), 0, 1)[..., None]
+    return (ext * (1 - a) + blur * a).astype(np.uint8)
+
+def widen(src, dst, work):
+    """Mảnh full-bleed -> khung rộng hơn (lề WIDEN_PAD mỗi bên): Codex vẽ tiếp vải ra lề (USER 21/10 chọn cách
+    này); GHÉP LẠI mảnh gốc (đã qua QA) vào giữa, mép ghép mờ dần. Codex lỗi/chặn -> lề kéo dài mép."""
+    im = np.array(Image.open(src).convert("RGB")); h, w = im.shape[:2]; p = int(WIDEN_PAD * max(h, w))
+    H, W = h + 2 * p, w + 2 * p
+    canvas = np.full((H, W, 3), 255, np.uint8); canvas[p:p + h, p:p + w] = im
+    cv_in = Path(work) / f"widen_in_{Path(src).stem}.jpg"; Image.fromarray(canvas).save(cv_in)
+    size = "1024x1536" if H > W * 1.2 else ("1536x1024" if W > H * 1.2 else "1024x1024")
+    raw, big, how = Path(work) / f"widen_out_{Path(src).stem}.png", None, ""
+    for name, fn in (("codex", lambda: _with_accounts(lambda home: _chatgpt_gen(WIDEN, [cv_in], raw, size=size))),
+                     # codex chặn (IP) -> Ideogram vẽ lề (khổ "auto" theo ảnh ref) trước khi phải kéo mép
+                     ("openart", lambda: _openart_gen(WIDEN, [cv_in], raw))):
+        try:
+            raw.unlink(missing_ok=True); fn()
+            big, how = np.array(Image.open(raw).convert("RGB").resize((W, H), Image.LANCZOS)), name
+            break
+        except Exception as e:
+            log("gen", f"  widen {Path(src).name}: {name} lỗi ({str(e)[-120:]})")
+    if big is None:
+        log("gen", f"  widen {Path(src).name}: -> lề kéo dài mép")
+        return _save(_edge_extend(im, p), dst, "kéo mép")
+    # model hay vẽ lại cả tấm, lệch vị trí/tỉ lệ chút -> đè mảnh gốc lên thì lộ khung chữ nhật, nhân đôi chi tiết
+    # (test 21/10 tay/quần Deadpool). Chỉ ghép mảnh gốc khi phần giữa bản mới KHỚP mảnh gốc; lệch -> dùng nguyên
+    # bản model vẽ (USER 21/10 duyệt cách 2 = bản Codex nguyên tấm)
+    sm = lambda a: cv2.resize(a, (48, 96 if h > w else 48), interpolation=cv2.INTER_AREA).astype(np.int16)
+    diff = float(np.abs(sm(big[p:p + h, p:p + w]) - sm(im)).mean())
+    if diff > WIDEN_MATCH:
+        return _save(big, dst, f"{how} nguyên tấm (lệch {diff:.0f})")
+    how = f"{how} + ghép gốc (lệch {diff:.0f})"
+    # ghép mảnh gốc: giữ NGUYÊN 100% trong mảnh (bản đã qua QA), chỉ mờ dần RA NGOÀI mép `feather` px — trộn mép
+    # kéo dài của mảnh gốc với phần Codex vẽ (codex review 21/10: mờ vào trong làm Codex đè lên mép mảnh)
+    feather = max(2, p // 6)
+    inner = np.zeros((H, W), np.uint8); inner[p:p + h, p:p + w] = 1
+    a = np.clip(1 - cv2.distanceTransform(1 - inner, cv2.DIST_L2, 5) / feather, 0, 1)[..., None]
+    orig = cv2.copyMakeBorder(im, p, p, p, p, cv2.BORDER_REPLICATE)
+    return _save((orig * a + big * (1 - a)).astype(np.uint8), dst, how)
+
+def _save(arr, dst, how):
+    Image.fromarray(arr).save(dst)
+    return how
+
+def export_piece(slug, src, dst, work):
+    """Mảnh đã chốt (bản 3D hoặc _phang) -> FILE XUẤT khung lớn phủ kín (USER 21/10):
+    ta_* -> uốn theo khuôn tà ra SKIRT_SIZE; than_* -> BODICE_SIZE; art -> giữ nguyên; còn lại (ao/quan/tay)
+    -> widen() rồi cạnh dài PIECE_LONG."""
+    base = slug[:-len("_phang")] if slug.endswith("_phang") else slug
+    Image.MAX_IMAGE_PIXELS = None
+    if base.startswith("ta_"):
+        with _WARP_LOCK:
+            mask = _skirt_mask()
+            rect = np.array(Image.open(src).convert("RGB"))
+            Image.fromarray(warp_skirt(rect, mask)).resize(SKIRT_SIZE, Image.LANCZOS).save(dst)
+        return "uốn khuôn tà"
+    if base.startswith("than_"):
+        Image.open(src).convert("RGB").resize(BODICE_SIZE, Image.LANCZOS).save(dst)
+        return "khuôn thân"
+    if base == "art":
+        shutil.copyfile(src, dst); return "giữ nguyên"
+    tmp = Path(work) / f"wide_{Path(dst).name}"
+    how = widen(src, tmp, work)
+    im = Image.open(tmp); k = PIECE_LONG / max(im.size)
+    im.resize((round(im.width * k), round(im.height * k)), Image.LANCZOS).save(dst)
+    return how
 
 # ---------- 3. cutout theo ngưỡng nền (cho mảnh váy: cắt cong, nền trong suốt) ----------
 def cutout(path, T=12):
@@ -1137,7 +1307,7 @@ def _selfcheck():
         os.environ["LARK_WEBHOOK"] = old_hook
     # gen_panel: codex + OpenArt cùng lỗi -> exception mang cả lỗi codex (để phân loại quota/auth)
     orig_cg, orig_oa = globals()["_chatgpt_gen"], globals()["_openart_gen"]
-    globals()["_chatgpt_gen"] = lambda *a: (_ for _ in ()).throw(RuntimeError("HTTP 429 usage_limit_reached"))
+    globals()["_chatgpt_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 429 usage_limit_reached"))
     globals()["_openart_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("openart không tạo file"))
     try:
         globals()["gen_panel"]("p", [], Path(tempfile.mkdtemp()) / "x.png")
@@ -1248,6 +1418,44 @@ def _selfcheck():
         gen_panel = orig_gen
     assert _strip_ties("base purple; torn openings, lower left; dark green tied sash motif, right hip") \
         == "base purple; torn openings, lower left"
+    # XUẤT FILE (USER 21/10): khuôn quạt nhỏ dựng tay -> uốn: trong khuôn hàng trên (eo) lấy từ đỉnh rect,
+    # gần gấu lấy từ đáy rect; ngoài khuôn vẫn có màu (phủ kín)
+    H_, W_ = 300, 600; yy, xx = np.mgrid[0:H_, 0:W_]; cx_, cy_ = 300, -150
+    rr_, tt_ = np.hypot(xx - cx_, yy - cy_), np.degrees(np.arctan2(yy - cy_, xx - cx_))
+    fan_m = (rr_ > 220) & (rr_ < 430) & (tt_ > 45) & (tt_ < 135)
+    rect_ = np.zeros((100, 300, 3), np.uint8); rect_[:50] = (255, 0, 0); rect_[50:] = (0, 0, 255)
+    wp = warp_skirt(rect_, fan_m, nb=256)
+    assert wp.shape == (H_, W_, 3)
+    assert wp[int(cy_ + 240), 300, 0] > 200 and wp[int(cy_ + 410), 300, 2] > 200      # eo đỏ, gấu xanh
+    assert wp[5, 5].sum() > 0                                                          # góc ngoài khuôn có màu
+    # widen: codex lỗi -> lề kéo mép; mảnh gốc giữ NGUYÊN ở giữa, khung rộng ra 2*30%
+    td2 = Path(tempfile.mkdtemp()); pc = td2 / "p.png"
+    pim = np.zeros((200, 100, 3), np.uint8); pim[:, :, 1] = 200; pim[90:110, 40:60] = (255, 255, 0)
+    Image.fromarray(pim).save(pc)
+    orig_cg2 = globals()["_chatgpt_gen"]
+    orig_oa2 = globals()["_openart_gen"]
+    globals()["_chatgpt_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked"))
+    globals()["_openart_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked"))
+    try:
+        assert widen(pc, td2 / "w.png", td2) == "kéo mép"
+        # model vẽ lề khớp phần giữa -> ghép gốc; vẽ lệch hẳn -> giữ nguyên tấm model
+        def fake_ok(prompt, refs, out, **k):
+            Image.open(refs[0]).save(out)                               # trả y canvas (giữa khớp)
+        globals()["_chatgpt_gen"] = fake_ok
+        assert "ghép gốc" in widen(pc, td2 / "w2.png", td2)
+        def fake_off(prompt, refs, out, **k):
+            Image.new("RGB", (64, 96), (0, 0, 255)).save(out)           # vẽ khác hẳn
+        globals()["_chatgpt_gen"] = fake_off
+        assert "nguyên tấm" in widen(pc, td2 / "w3.png", td2)
+    finally:
+        globals()["_chatgpt_gen"], globals()["_openart_gen"] = orig_cg2, orig_oa2
+    wim = np.array(Image.open(td2 / "w.png")); pp = int(WIDEN_PAD * 200)
+    assert wim.shape[:2] == (200 + 2 * pp, 100 + 2 * pp)
+    assert (wim[pp + 90:pp + 110, pp + 40:pp + 60] == (255, 255, 0)).all()             # chi tiết giữa còn nguyên
+    # export_piece: than -> BODICE_SIZE; art -> giữ nguyên; ta (uốn) dùng khuôn
+    assert export_piece("than_truoc", pc, td2 / "t.png", td2) == "khuôn thân"
+    assert Image.open(td2 / "t.png").size == BODICE_SIZE
+    assert export_piece("art_phang", pc, td2 / "a.png", td2) == "giữ nguyên" and Image.open(td2 / "a.png").size == (100, 200)
     print("selfcheck OK")
 
 

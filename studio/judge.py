@@ -429,11 +429,14 @@ def qa(sheet, names, colour, n_refs, flat=False, extra="", asker=None):
 
 # tiêu chí RIÊNG từng loại mảnh (QA chấm 1 mảnh/lần, ảnh lớn) — tiền tố tên mảnh -> yêu cầu
 PIECE_RULES = [
-    ("ta_", "Dress SKIRT panel: a SYMMETRIC fan (circle-skirt) shape — both straight side edges at the SAME "
-            "angle, a smooth curved waist edge and a smooth curved hem, nothing cut off diagonally; only the "
-            "skirt's print; no tie/sash/bow; no bodice."),
-    ("than_", "Dress BODICE panel: a symmetric sleeveless tank shape from neckline/straps down to the waist "
-              "seam only; only the bodice's print; no skirt fabric below the waist (a thin trim strip is fine)."),
+    # đầm kiểu mới (USER 21/10): tà = chữ nhật trải thẳng, thân = khung vuông phủ kín (uốn/khớp khuôn ở bước xuất)
+    ("ta_", "Dress SKIRT print UNROLLED into a full-bleed RECTANGLE: top edge = waist, bottom edge = hem; the "
+            "skirt's bands/motifs in the same order from waist to hem as the reference, bands straight and "
+            "horizontal, motifs upright; fills the frame edge to edge (no fan/garment outline needed); only the "
+            "skirt's print; no tie/sash/bow; no bodice or waistband."),
+    ("than_", "Dress BODICE print filling the WHOLE square frame edge to edge: the bodice's artwork placed like on "
+              "the real bodice (neckline details at top centre, chest motifs on the chest, waist details at the "
+              "bottom) with the base fabric continuing to every edge; no outline, text, person or skirt print."),
     ("ao_", "TORSO panel of the top: only the torso print (no sleeves, hood or cuffs), flat, filling the frame."),
     ("quan_", "PANTS panel: only the pants print, flat, filling the frame — not a 3D pair of pants."),
     ("tay", "SLEEVE panel: its print must match ONLY the sleeve in the reference (compare with the sleeve "
@@ -673,7 +676,7 @@ def _selfcheck():
         assert find_legend(td / "s.jpg", 11) == 8
     finally:
         globals()["ask"] = orig_ask
-    assert "SYMMETRIC fan" in piece_rule("ta_truoc") and "BACK piece" in piece_rule("ta_sau")
+    assert "UNROLLED" in piece_rule("ta_truoc") and "BACK piece" in piece_rule("ta_sau")
     assert "SLEEVE" in piece_rule("tay_trai_sau_phang") and piece_rule("xyz") == ""
     print("judge selfcheck OK")
 

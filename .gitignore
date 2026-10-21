@@ -1,3 +1,5 @@
 flat_studio_data/
 .claude/
 .codegraph/
+studio/assets/tpl_skirt_mask.npy
+studio/assets/tpl_bodice_1024.png
