@@ -3,3 +3,4 @@ flat_studio_data/
 .codegraph/
 studio/assets/tpl_skirt_mask.npy
 studio/assets/tpl_bodice_1024.png
+studio/assets/tpl_clothing/small/

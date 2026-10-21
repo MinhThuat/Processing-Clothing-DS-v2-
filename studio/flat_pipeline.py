@@ -45,6 +45,7 @@ def log(stage, msg=""):
 EMIT = None   # nếu set: crop/panel ghi thẳng vào thư mục này (cho UI web poll)
 COLOR = None  # --color: ép màu nền vải (batch: nhóm con màu khác ảnh gốc)
 HINT = None   # --hint: ghi chú sửa lỗi QA ghép cuối prompt (batch: gen lại lần 3-4)
+KIND = None     # --kind hoodie|sweater|jogger|jumpsuit (batch suy từ SKU, kind_of): loại có khuôn mảnh thật
 GARMENT = None  # --garment top|bottom|top_bottom|dress: ép loại SP thật (batch, từ judge.pick); None = để vision tự quyết
 
 def _prompt_extra():
@@ -157,6 +158,80 @@ BODICE_TPL = (
     "at the bottom), and continue the base fabric and its pattern beyond the outline out to all four edges. Do "
     "NOT draw the outline, the word FRONT, the mauve background, a person, folds, shadows or perspective — only "
     "the flat print.")
+# ÁO/QUẦN/TAY/MŨ THEO KHUÔN THẬT (USER 21/10, khuôn xưởng ở assets/tpl_clothing): mảnh có khuôn gen như thân đầm
+# (ảnh cắt + khuôn) và xuất ĐÚNG cỡ khuôn; loại/mảnh không có khuôn -> gen bình thường. Jogger = bộ hoodie + quần
+# jogger. Jumpsuit: thân+quần chung 1 khuôn dài -> gộp ao_*+quan_* thành 1 mảnh bo_truoc/bo_sau (_merge_jumpsuit).
+TPL_DIR = ASSETS / "tpl_clothing"
+_HOODIE = {"ao_truoc": "hoodie_front.jpg", "ao_sau": "hoodie_back.jpg", "tay": "hoodie_sleeve.jpg", "mu": "hoodie_hood.jpg"}
+CLOTH_TPL = {
+    "hoodie": _HOODIE,
+    "jogger": {**_HOODIE, "quan": "jogger.jpg"},
+    "sweater": {"ao_truoc": "sweater_front.jpg", "ao_sau": "sweater_back.jpg", "tay": "sweater_sleeve.jpg"},
+    "jumpsuit": {"bo_truoc": "jumpsuit_body.jpg", "bo_sau": "jumpsuit_body.jpg", "tay": "jumpsuit_sleeve.jpg",
+                 "mu": "jumpsuit_hood.jpg"},
+}
+CLOTH_PROMPT = (
+    "Flat textile PRINT for the {label}, filling the ENTIRE frame edge to edge. The SECOND reference is the sewing "
+    "pattern: the light shape shows where this panel will be cut. Place the panel's printed artwork from the FIRST "
+    "reference (a crop of the real garment) so it sits INSIDE that shape at the same positions as on the real "
+    "garment, and continue the base fabric ({base}) and its pattern beyond the shape out to all four edges. Do NOT "
+    "draw the shape outline, the blue/grid background, any text, a person, the garment as an object, folds, "
+    "shadows or perspective — only the flat print. The print of this panel: {desc}")
+CLOTH_FLAT = (" Style: 2D FLAT VECTOR — solid flat colour fills, crisp clean edges, NO 3D, NO shading, NO gradient, "
+              "NO fabric texture.")
+HOOD_NOTE = (' The top has a HOOD: ALSO add "hood": "<print spec of the hood\'s outer side panel>" and its box '
+             'under boxes.hood (from the back view if there is one).')
+
+def _merge_jumpsuit(plan):
+    """Jumpsuit (khuôn thân+quần 1 tấm): ao_X + quan_X -> bo_X (mô tả nối, box gộp từ thân xuống ống)."""
+    by = {p["slug"]: p for p in plan}
+    out = [p for p in plan if not p["slug"].startswith(("ao_", "quan_"))]
+    for side in ("truoc", "sau"):
+        a, q = by.get(f"ao_{side}"), by.get(f"quan_{side}")
+        if not (a and q):
+            out += [x for x in (a, q) if x]; continue
+        box = ([min(a["box"][0], q["box"][0]), min(a["box"][1], q["box"][1]),
+                max(a["box"][2], q["box"][2]), max(a["box"][3], q["box"][3])] if a["box"] and q["box"] else None)
+        out.append(dict(a, slug=f"bo_{side}", label=_BLEED_LABEL[f"bo_{side}"], box=box,
+                        desc=f"TORSO: {a['desc']} | LEGS: {q['desc']}"))
+    return out
+
+def kind_of(sku):
+    """Tên SKU -> loại có khuôn (None = gen bình thường). Jumpsuit trước hoodie (SKU jumpsuit có thể ghi hoodie)."""
+    s = (sku or "").lower()
+    for k, words in (("jumpsuit", ("jumpsuit",)), ("jogger", ("jogger",)), ("sweater", ("ugly sweater",)),
+                     ("hoodie", ("3d hoodie",))):
+        if any(w in s for w in words):
+            return k
+    return None
+
+def cloth_tpl(slug, kind=None):
+    """Khuôn thật của mảnh (bỏ _phang; tay_* chung 'tay', quan_* chung 'quan') hoặc None."""
+    base = slug[:-len("_phang")] if slug.endswith("_phang") else slug
+    key = "tay" if base.startswith("tay") else "quan" if base.startswith("quan_") else base
+    f = CLOTH_TPL.get(kind or KIND, {}).get(key)
+    return TPL_DIR / f if f else None
+
+CLOTH_GEN = (1024, 1536)   # khổ codex gen mảnh có khuôn (khuôn đều dọc)
+
+def _tpl_box(path):
+    """Khuôn (W,H) đặt giữa khổ CLOTH_GEN -> hộp (x0,y0,x1,y1) của khuôn trong khung CLOTH_GEN."""
+    W, H = Image.open(path).size; gw, gh = CLOTH_GEN
+    k = min(gw / W, gh / H); w, h = round(W * k), round(H * k)
+    return (gw - w) // 2, (gh - h) // 2, (gw - w) // 2 + w, (gh - h) // 2 + h
+
+def _tpl_ref(path):
+    """Khuôn thu nhỏ, CHÈN nền cho đủ khổ CLOTH_GEN (codex chỉ gen 1024x1536) -> ảnh gen cắt lại đúng hộp khuôn
+    (_tpl_box), không kéo méo (lỗi 21/10: codex 'auto' trả ngang 1448x1086 rồi kéo sang khuôn dọc 4500x5450)."""
+    out = TPL_DIR / "small" / path.name
+    with _TPL_LOCK:
+        if not out.exists():
+            out.parent.mkdir(exist_ok=True)
+            im = Image.open(path).convert("RGB"); x0, y0, x1, y1 = _tpl_box(path)
+            canvas = Image.new("RGB", CLOTH_GEN, im.getpixel((5, 5)))
+            canvas.paste(im.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0)); canvas.save(out)
+    return out
+
 _DRESS_LABEL = {"ta_truoc": "FRONT skirt panel", "ta_sau": "BACK skirt panel",
                 "than_truoc": "FRONT bodice panel of a dress", "than_sau": "BACK bodice panel of a dress"}
 SKIRT_SIZE, BODICE_SIZE = (9000, 4700), (3500, 3500)   # cỡ file xuất (USER 21/10)
@@ -405,6 +480,8 @@ def _pieces_prompt(source):
     p = _PIECES_INTRO[source]
     if GARMENT:
         p += f" The product is known to be: {GARMENT} — use exactly that type."
+    if "mu" in CLOTH_TPL.get(KIND, {}):
+        p += HOOD_NOTE
     return p
 
 def seed_pieces(client, imgs, source):
@@ -422,6 +499,9 @@ _BLEED_LABEL = {
     "ao_sau":   "back torso/body panel of the top (no sleeves, no hood)",
     "quan_truoc": "front of the pants", "quan_sau": "back of the pants",
     "tay_truoc": "front-facing panel of the sleeve", "tay_sau": "back-facing panel of the sleeve",
+    "mu": "outer side panel of the hood",
+    "bo_truoc": "FRONT body panel of the jumpsuit (torso and legs as ONE tall panel, no sleeves, no hood)",
+    "bo_sau": "BACK body panel of the jumpsuit (torso and legs as ONE tall panel, no sleeves, no hood)",
     "tay_trai_truoc": "front-facing panel of the LEFT sleeve", "tay_trai_sau": "back-facing panel of the LEFT sleeve",
     "tay_phai_truoc": "front-facing panel of the RIGHT sleeve", "tay_phai_sau": "back-facing panel of the RIGHT sleeve",
 }
@@ -437,6 +517,7 @@ PIECE_BOX = {
     "than_sau": ("bodice_back", "the BACK bodice of the dress (neckline down to the waist seam only)"),
     "ta_truoc": ("skirt_front", "the FRONT skirt of the dress (waist seam down to the hem only)"),
     "ta_sau": ("skirt_back", "the BACK skirt of the dress (waist seam down to the hem only)"),
+    "mu": ("hood", "the HOOD of the top (only the hood, not the torso)"),
 }
 
 def _filter_by_garment(items, garment):
@@ -448,7 +529,7 @@ def _filter_by_garment(items, garment):
     if garment == "top":
         keep = lambda x: not slug(x).startswith(("quan_", "ta_"))
     elif garment == "bottom":
-        keep = lambda x: not (slug(x).startswith("ao_") or slug(x).startswith("tay"))
+        keep = lambda x: not (slug(x).startswith(("ao_", "tay", "mu", "bo_")))
     else:
         return items
     return type(items)(x for x in items if keep(x))
@@ -488,7 +569,7 @@ def _box(js, key):
     ok = (w >= 40 and h >= 150 and h >= 1.5 * w) if sleeve else (w >= 150 and h >= 150)
     return [int(x0), int(y0), int(x1), int(y1)] if ok else None
 
-def _pieces_plan(js):
+def _pieces_plan(js, kind=None, garment=None):
     """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
     kind='dress' (cắt cong) | 'bleed' (full-bleed). side='front'/'back' -> chọn ảnh ref.
     type 'top'/'bottom' -> chỉ mảnh áo/tay hoặc chỉ mảnh quần (SP chỉ có 1 phần). GARMENT (--garment,
@@ -539,8 +620,14 @@ def _pieces_plan(js):
             if desc and not _NO_SLEEVE.search(desc):
                 plan.append(dict(slug=slug, kind="bleed", desc=desc, side=side, label=_BLEED_LABEL[slug],
                                  box=_box(js, key)))
-    if GARMENT and GARMENT != typ:
-        plan = _filter_by_garment(plan, GARMENT)
+    if typ != "bottom" and js.get("hood") and not _NO_SLEEVE.search(js["hood"]):   # mũ (chỉ khi vision được hỏi)
+        plan.append(dict(slug="mu", kind="bleed", desc=js["hood"], side="back", label=_BLEED_LABEL["mu"],
+                         box=_box(js, "hood")))
+    garment = garment or GARMENT                 # lọc TRƯỚC khi gộp jumpsuit (batch gọi y hệt -> cùng tên mảnh)
+    if garment and garment != typ:
+        plan = _filter_by_garment(plan, garment)
+    if (kind or KIND) == "jumpsuit":
+        plan = _merge_jumpsuit(plan)
     return plan
 
 def _flatten_white(path):
@@ -621,6 +708,13 @@ def _make_piece(spec, refs, work, out, flat=False):
             gen_panel(head + note + tail, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note + tail, [crop or ref, tpl]),
                       size="2048x2048")
         _flatten_white(dst)
+    elif cloth_tpl(spec["slug"]):                # mảnh có khuôn thật: gen như thân đầm
+        tpl = _tpl_ref(cloth_tpl(spec["slug"]))
+        head = CLOTH_PROMPT.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]),
+                                   desc=spec["desc"]) + (CLOTH_FLAT if flat else "")
+        gen_panel(head + note, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note, [crop or ref, tpl]),
+                  size="x".join(map(str, CLOTH_GEN)))
+        Image.open(dst).convert("RGB").resize(CLOTH_GEN, Image.LANCZOS).crop(_tpl_box(cloth_tpl(spec["slug"]))).save(dst)
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
         raw = work / f"raw_{spec['slug']}.png"            # giữ bản gốc model trả (soi lỗi vùng trong suốt)
@@ -872,7 +966,7 @@ def warp_skirt(rect, mask, nb=1024):
         my[y0:y0 + 512] = (rh - 1) - np.abs(np.mod(v, 2 * (rh - 1)) - (rh - 1))
     return cv2.remap(rect, mx, my, cv2.INTER_LANCZOS4)
 
-def export_piece(slug, src, dst, work):
+def export_piece(slug, src, dst, work, kind=None):
     """Mảnh đã chốt (bản 3D hoặc _phang) -> FILE XUẤT khung lớn phủ kín (USER 21/10):
     ta_* -> uốn theo khuôn tà ra SKIRT_SIZE; than_* -> BODICE_SIZE; còn lại (áo/quần/tay/art) giữ nguyên bản gen
     (USER 21/10: bỏ bước vẽ lề — Codex vẽ lại cả tấm, tay sọc lơ lửng, quần hoa dày lên)."""
@@ -887,6 +981,10 @@ def export_piece(slug, src, dst, work):
     if base.startswith("than_"):
         Image.open(src).convert("RGB").resize(BODICE_SIZE, Image.LANCZOS).save(dst)
         return "khuôn thân"
+    tpl = cloth_tpl(base, kind)
+    if tpl:                                      # mảnh có khuôn thật -> đúng cỡ khuôn
+        Image.open(src).convert("RGB").resize(Image.open(tpl).size, Image.LANCZOS).save(dst)
+        return "khuôn " + tpl.stem
     shutil.copyfile(src, dst)
     return "giữ nguyên"
 
@@ -1325,6 +1423,30 @@ def _selfcheck():
     assert Image.open(td2 / "t.png").size == BODICE_SIZE
     assert export_piece("art_phang", pc, td2 / "a.png", td2) == "giữ nguyên" and Image.open(td2 / "a.png").size == (100, 200)
     assert export_piece("tay_truoc", pc, td2 / "y.png", td2) == "giữ nguyên" and Image.open(td2 / "y.png").size == (100, 200)
+    # khuôn mảnh thật (USER 21/10): loại từ SKU; mảnh có khuôn xuất đúng cỡ khuôn, không khuôn giữ nguyên
+    assert kind_of("THT282609A28-Design 1-3D Hoodie-M") == "hoodie" and kind_of("X-Jumpsuit Adult-L") == "jumpsuit"
+    assert kind_of("BQT081026A06-Ugly Sweater-2XL") == "sweater" and kind_of("NTN012610A09-Jogger-S") == "jogger"
+    assert kind_of("BQT250926A04-Skater Dress") is None and kind_of("") is None
+    assert cloth_tpl("tay_trai_sau_phang", "hoodie").name == "hoodie_sleeve.jpg"
+    assert cloth_tpl("quan_truoc", "jogger").name == "jogger.jpg" and cloth_tpl("quan_truoc", "hoodie") is None
+    assert cloth_tpl("ao_truoc", None) is None and all((TPL_DIR / f).exists() for m in CLOTH_TPL.values() for f in m.values())
+    for m in CLOTH_TPL.values():                 # gen 1024x1536 cắt lại đúng tỉ lệ khuôn (không méo)
+        for f in m.values():
+            (W, H), (x0, y0, x1, y1) = Image.open(TPL_DIR / f).size, _tpl_box(TPL_DIR / f)
+            assert abs((x1 - x0) / (y1 - y0) - W / H) < .01 and (x0 == 0 or y0 == 0), f
+    assert export_piece("ao_sau_phang", pc, td2 / "h.png", td2, "hoodie") == "khuôn hoodie_back"
+    assert Image.open(td2 / "h.png").size == Image.open(TPL_DIR / "hoodie_back.jpg").size
+    # jumpsuit: ao+quan -> 1 mảnh bo_* (box gộp); mũ chỉ khi vision trả "hood"
+    tbh = {"type": "top_bottom", "top_front": "base red; a", "top_back": "base red", "pants_front": "base red; b",
+           "pants_back": "base red", "sleeves_same": True, "sl_front": "base red", "sl_back": "base red",
+           "hood": "base red; ears", "boxes": {"top_front": [100, 100, 500, 400], "pants_front": [120, 400, 480, 900]}}
+    js_plan = {p["slug"]: p for p in _pieces_plan(tbh, "jumpsuit")}
+    assert set(js_plan) == {"bo_truoc", "bo_sau", "tay_truoc", "tay_sau", "mu"}
+    assert js_plan["bo_truoc"]["box"] == [100, 100, 500, 900] and "LEGS: base red; b" in js_plan["bo_truoc"]["desc"]
+    assert {p["slug"] for p in _pieces_plan({k: v for k, v in tbh.items() if k != "hood"})} == \
+        {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau", "tay_truoc", "tay_sau"}
+    assert _filter_by_garment({"bo_truoc", "mu", "quan_sau"}, "bottom") == {"quan_sau"}
+    assert {p["slug"] for p in _pieces_plan(tbh, "jumpsuit", "top")} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau", "mu"}
     print("selfcheck OK")
 
 
@@ -1351,6 +1473,7 @@ if __name__ == "__main__":
     ap.add_argument("--hint", help="ghi chú sửa lỗi ghép cuối mọi prompt gen")
     ap.add_argument("--garment", choices=["top", "bottom", "top_bottom", "dress"],
                     help="ép loại SP thật (biết trước từ SKU, vd 3D Tshirt -> top); mặc định để vision tự quyết")
+    ap.add_argument("--kind", choices=sorted(CLOTH_TPL), help="loại có khuôn mảnh thật (batch suy từ SKU)")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
@@ -1359,6 +1482,7 @@ if __name__ == "__main__":
         if a.emit:
             globals()["EMIT"] = a.emit
         globals()["COLOR"], globals()["HINT"], globals()["GARMENT"] = a.color, a.hint, a.garment
+        globals()["KIND"] = a.kind
         out = Path(a.out)
         logpath = _open_log(a.log or out.with_suffix(".log"))
         log("start", f"log -> {logpath}")

@@ -441,6 +441,9 @@ PIECE_RULES = [
     ("quan_", "PANTS panel: only the pants print, flat, filling the frame — not a 3D pair of pants."),
     ("tay", "SLEEVE panel: its print must match ONLY the sleeve in the reference (compare with the sleeve "
             "itself); flat, filling the frame."),
+    ("bo_", "JUMPSUIT body panel: torso print on top and the legs' print below as ONE tall flat panel (no sleeves, "
+            "no hood), filling the frame."),
+    ("mu", "HOOD panel: only the hood's outer print, flat, filling the frame — not a 3D hood or a whole top."),
     ("art", "ART: one flat technical drawing of the whole product front with every front detail."),
 ]
 

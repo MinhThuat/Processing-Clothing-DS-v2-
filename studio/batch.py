@@ -23,7 +23,7 @@ import lark_base as lb
 import nonclothing
 from batch_errors import AUTH_HARD_RE, AUTH_RE, QUOTA_RE, AuthError, QuotaError, StepError, raise_for
 import flat_pipeline as fp
-from flat_pipeline import _pieces_plan, _filter_by_garment, PIECE_BOX, CODEX_WORKERS
+from flat_pipeline import _pieces_plan, PIECE_BOX, CODEX_WORKERS
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv("STUDIO_DATA", ROOT.parent / "flat_studio_data")).expanduser()
@@ -466,17 +466,16 @@ def _run_both(fns):
         raise auth or quota or errs[0]
 
 
-def _pieces_json_slugs(path, garment=None):
+def _pieces_json_slugs(path, garment=None, kind=None):
     """pieces.json -> tập slug mảnh (không gồm 'art') theo plan hiện tại (flat_pipeline._pieces_plan),
     lọc theo `garment` (SP chỉ có áo/quần, từ judge.pick) nếu truyền — phòng vision vẫn trả thừa phần."""
-    slugs = {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")))}
-    return _filter_by_garment(slugs, garment) if garment else slugs
+    return {p["slug"] for p in _pieces_plan(json.loads(Path(path).read_text(encoding="utf-8")), kind, garment)}
 
 
-def _slugs_match(pieces_json_path, names, garment=None):
+def _slugs_match(pieces_json_path, names, garment=None, kind=None):
     """True nếu bộ mảnh trong pieces.json (bỏ 'art', lọc theo garment) khớp đúng tập `names` (cũng bỏ
     'art'). Dùng ở lần gen lại 3: vision lại có thể đổi loại đồ/tay giống-khác -> đổi tên mảnh."""
-    return _pieces_json_slugs(pieces_json_path, garment) == set(names)
+    return _pieces_json_slugs(pieces_json_path, garment, kind) == set(names)
 
 
 def _rehint_target(group, r):
@@ -534,6 +533,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     if group["mode"] == "two" else None),
            "back_cropped": group["mode"] == "two" and back_crop is not None,
            "hint": old_hint}
+    kind = fp.kind_of(rows[0]["sku"])   # loại có khuôn mảnh thật (hoodie/sweater/jogger/jumpsuit) hoặc None
     qa_no = count(1)     # QA 3D + chuỗi phẳng chạy SONG SONG -> đánh số thread-safe
     pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
 
@@ -542,7 +542,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         if left <= 0:
             raise StepError("quá thời gian", "nhóm > 45 phút")
         extra = ((["--color", color] if color else []) + (["--hint", ctx["hint"]] if ctx["hint"] else [])
-                 + ["--garment", group["garment"]])
+                 + ["--garment", group["garment"]] + (["--kind", kind] if kind else []))
         return run_pipe(args + extra, sdir / f"pipe_{next(pipe_no):02d}.log", left)
 
     def mode_args():
@@ -577,7 +577,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         _run_both([gen_pieces, gen_art])
         if not pj.exists():
             raise StepError("gen", "vision không ra pieces.json")
-        want = _pieces_json_slugs(pj, group["garment"])
+        want = _pieces_json_slugs(pj, group["garment"], kind)
         have = {p.stem[len("final_"):] for p in sdir.glob("final_*.png")}
         names = sorted(want | have)          # mảnh lỗi lần 0 (thiếu file) vẫn vào danh sách -> QA chấm 0 -> gen lại
         if not names:
@@ -650,8 +650,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                 shutil.copyfile(pj, v0)
                 gen_pieces(only=slugs, cache=False)
                 old = {n for n in names if n != "art"}
-                if pj.exists() and not _slugs_match(pj, old, group["garment"]):
-                    new = _pieces_json_slugs(pj, group["garment"])
+                if pj.exists() and not _slugs_match(pj, old, group["garment"], kind):
+                    new = _pieces_json_slugs(pj, group["garment"], kind)
                     log("regen", f"lần {attempt} vision ra mảnh khác ({sorted(new)} != {sorted(old)})"
                                  " -> quay lại mô tả cũ, giữ crop+hint mới")
                     for p in sdir.glob("final_*.png"):
@@ -792,7 +792,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
             return None
         fname = piece_filename(rows[0]["sku"], name, failed=name in fails)
         shutil.copyfile(src, raw / fname)
-        how = fp.export_piece(name, src, out / fname, sdir)
+        how = fp.export_piece(name, src, out / fname, sdir, kind)
         log("xuất", f"{name}: {how} {Image.open(out / fname).size}")
         return out / fname
 
