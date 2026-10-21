@@ -515,7 +515,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     3D cũ trong prev/out; up xong chỉ thay đúng các file đó trên Base (mảnh đã đạt giữ nguyên)."""
     shutil.rmtree(sdir, ignore_errors=True)    # thử lại cùng ngày: bỏ log/mảnh/pieces.json của lần trước
     sdir.mkdir(parents=True)
-    old_hint = None
+    old_hint = FORCE_HINT                    # --regen --hint: ghi chú sửa lỗi ghép vào mọi prompt gen
     if prev:
         shutil.copyfile(prev / "pieces.json", sdir / "pieces.json")
         if (prev / "rehint.json").exists():   # lần trước đã đổi ảnh/crop + hint -> dùng lại đúng bối cảnh đó
@@ -957,6 +957,9 @@ def fix_fails(keys, day, dry, max_score=None):
             cleanup(gdir)
 
 
+FORCE_HINT = None   # --hint (đi kèm --regen): vd vision bỏ sót vùng da in trên áo (Rhonda Romero4 21/10)
+
+
 def regen(keys, day, dry, stats):
     """--regen: gen lại TOÀN BỘ các Order ID / record_id chỉ định (kể cả dòng đã có file / không tag GEN) qua
     đúng luồng batch; up xong mới thay toàn bộ file cũ."""
@@ -1235,6 +1238,7 @@ def _parse_args(argv=None):
                     help="chỉ gen lại các mảnh _QAFAIL của các Order ID / record_id này (mảnh đạt giữ nguyên)")
     ap.add_argument("--regen", nargs="+", metavar="ID",
                     help="gen lại TOÀN BỘ các Order ID / record_id này rồi thay hết file cũ (up trước, gỡ sau)")
+    ap.add_argument("--hint", help="--regen: ghi chú sửa lỗi ghép vào mọi prompt gen (vd chi tiết vision bỏ sót)")
     ap.add_argument("--fix-bad", action="store_true",
                     help=f"gen lại các mảnh _QAFAIL quá tệ (điểm QA <= {BAD_SCORE}) của mẫu ngày --date (cron tối)")
     ap.add_argument("--selfcheck", action="store_true")
@@ -1283,6 +1287,7 @@ def main():
             if a.fix_bad:
                 fix_bad(only_day, day, a.dry_run)
             if a.regen:
+                globals()["FORCE_HINT"] = a.hint
                 regen(a.regen, day, a.dry_run, stats)
             if a.fix_fails:
                 fix_fails(a.fix_fails, day, a.dry_run)
