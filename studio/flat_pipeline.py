@@ -177,6 +177,10 @@ CLOTH_PROMPT = (
     "garment, and continue the base fabric ({base}) and its pattern beyond the shape out to all four edges. Do NOT "
     "draw the shape outline, the blue/grid background, any text, a person, the garment as an object, folds, "
     "shadows or perspective — only the flat print. The print of this panel: {desc}")
+# thân jumpsuit (khuôn 1 tấm): codex hay tách 2 ống + đáy quần + dải trắng gấu (Rhonda Romero 21/10)
+BODY_NOTE = (" This is ONE continuous tall panel from neckline to ankle: do NOT split it into two legs — no crotch, "
+             "no inseam, no gap between the legs; the legs' prints sit side by side on one continuous fabric. No "
+             "white or blank band along any edge.")
 CLOTH_FLAT = (" Style: 2D FLAT VECTOR — solid flat colour fills, crisp clean edges, NO 3D, NO shading, NO gradient, "
               "NO fabric texture.")
 HOOD_NOTE = (' The top has a HOOD: ALSO add "hood": "<print spec of the hood\'s outer side panel>" and its box '
@@ -455,7 +459,9 @@ _PIECES_SCHEMA = (
     "Printed underwear/legs/body on the LOWER part of a top are PART OF THE TOP's print, not a separate "
     "bottom garment. "
     "Realistic body parts printed ON the garment (muscles, abs, chest, skin, tattoos) are part of the "
-    "PRINT: describe them as artwork on the panel, never as bare skin or an opening. "
+    "PRINT: describe them as artwork on the panel, never as bare skin or an opening. Any skin-coloured area in "
+    "the print (bare chest, cleavage, abs, belly showing through an opening) MUST be named in that panel's desc "
+    "with its skin colour and position — never omit it (missed on a women's snowman onesie 21/10). "
     "For skirt_* do NOT describe loose ties/sashes/knots/strings hanging off the skirt (they are left out). "
     'ALSO add "boxes": {"<panel key>": [x0,y0,x1,y1], ...} with one TIGHT bounding box per panel key '
     "above, integers normalized 0-1000 (x from left, y from top) on the image where that panel is seen "
@@ -711,7 +717,8 @@ def _make_piece(spec, refs, work, out, flat=False):
     elif cloth_tpl(spec["slug"]):                # mảnh có khuôn thật: gen như thân đầm
         tpl = _tpl_ref(cloth_tpl(spec["slug"]))
         head = CLOTH_PROMPT.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]),
-                                   desc=spec["desc"]) + (CLOTH_FLAT if flat else "")
+                                   desc=spec["desc"]) + (BODY_NOTE if spec["slug"].startswith("bo_") else "") \
+            + (CLOTH_FLAT if flat else "")
         gen_panel(head + note, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note, [crop or ref, tpl]),
                   size="x".join(map(str, CLOTH_GEN)))
         Image.open(dst).convert("RGB").resize(CLOTH_GEN, Image.LANCZOS).crop(_tpl_box(cloth_tpl(spec["slug"]))).save(dst)
