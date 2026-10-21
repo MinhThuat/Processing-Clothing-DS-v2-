@@ -23,7 +23,7 @@ RUNS.mkdir(parents=True, exist_ok=True); UPLOADS.mkdir(parents=True, exist_ok=Tr
 PIPELINE = ROOT / "flat_pipeline.py"
 # = flat_pipeline.CODEX_HOMES (các tài khoản codex của project)
 CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
+               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
 
 
 def _codex_missing():

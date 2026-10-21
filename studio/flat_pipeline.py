@@ -668,12 +668,12 @@ def _bin(name):
             return str(b)
     return name
 CHATGPT_BIN = _bin("chatgpt-imagegen")
-# tài khoản codex của project (USER 21/10: cả 2 tài khoản, tk 1 đứng đầu, 4 luồng/tk = 8 luồng; chỉ tk 1:
-# FLAT_CODEX_HOMES="~"):
+# tài khoản codex của project (USER 21/10: quay lại chỉ tk 1 ~, 4 luồng; dùng thêm tk 2 (8 luồng):
+# FLAT_CODEX_HOMES="~:~/codex_acc2"):
 # mỗi cái là 1 thư mục HOME chứa .codex/auth.json
 # (chatgpt-imagegen đọc auth theo $HOME). Đổi bằng env FLAT_CODEX_HOMES (các đường dẫn nối bằng os.pathsep).
 CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", os.pathsep.join(["~", "~/codex_acc2"])).split(os.pathsep) if p]
+               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
 _ACC_NEXT = itertools.count(os.getpid())   # xoay vòng; lệch theo pid -> các tiến trình con không cùng dồn 1 tài khoản
 # lỗi do TÀI KHOẢN (quá tải / hạn mức / đăng nhập / treo) -> thử tài khoản kia. Lỗi do NỘI DUNG (ảnh bị chặn:
 # "no image returned") -> không đổi: tài khoản nào cũng chặn, chỉ mất thêm ~1 phút.
