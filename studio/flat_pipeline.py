@@ -157,6 +157,47 @@ BODICE_TPL = (
     "at the bottom), and continue the base fabric and its pattern beyond the outline out to all four edges. Do "
     "NOT draw the outline, the word FRONT, the mauve background, a person, folds, shadows or perspective — only "
     "the flat print.")
+# ÁO/QUẦN (USER 21/10): gen thẳng mảnh THÀNH PHẨM như thân đầm — ảnh cắt + khuôn (viền trắng giữa khung, vẽ bằng
+# code, _PIECE_SHAPE): hoạ tiết nằm trong viền, vải nền trải ra hết khung; xuất chỉ phóng cạnh dài PIECE_LONG
+PIECE_TPL = (
+    "A printable FABRIC SHEET (not a garment) for the {label}, filling the ENTIRE frame edge to edge. The SECOND "
+    "reference is the sewing pattern: the white outline is where this panel will be cut, and it covers only the "
+    "CENTRE of the frame. Redraw the panel's printed artwork from the FIRST reference (a photo crop of the real "
+    "garment) flat, and fit it INSIDE that outline at the same positions and scale as on the real garment "
+    "({where}). Every graphic, stripe, pocket print and trim band stays INSIDE the outline. OUTSIDE the outline the "
+    "SAME base fabric ({base}) and its background texture/pattern simply continue to every edge — no white or "
+    "blank area, no logos, no extra motifs, no second copy of the panel. Do NOT draw the garment as an object: no "
+    "garment silhouette, shoulders, armholes, hood, sleeves, drawstrings, cut-out shape or shadow — and do NOT draw "
+    "the outline, the mauve background, a person, folds or perspective. The print of this panel: {desc}")
+PIECE_TPL_FLAT = (" Style: 2D FLAT VECTOR — solid flat colour fills, crisp clean edges, NO 3D, NO shading, NO "
+                  "gradient, NO fabric texture.")
+_PIECE_WHERE = {"ao": "neckline at the top centre notch, chest graphics on the chest, hem band along the bottom "
+                      "edge of the outline",
+                "quan": "waistband along the top edge of the outline, each leg's print inside its leg, cuffs at "
+                        "the bottom of each leg"}
+# viền: toạ độ 0-1 trong hộp mảnh, rộng/cao, khung codex
+_AO = [(.32, .02), (.38, .10), (.50, .14), (.62, .10), (.68, .02), (.92, .08), (.88, .18), (.86, .30), (.90, .36),
+       (.97, .37), (.97, .99), (.03, .99), (.03, .37), (.10, .36), (.14, .30), (.12, .18), (.08, .08)]
+_PIECE_SHAPE = {
+    "ao_truoc": (_AO, .82, (1024, 1024)),
+    "ao_sau": ([(x, .05 if (x, y) == (.50, .14) else .04 if y == .10 else y) for x, y in _AO], .82, (1024, 1024)),
+    "quan": ([(.04, 0), (.96, 0), (.99, .30), (.92, .99), (.56, .99), (.53, .36), (.50, .30), (.47, .36),
+              (.44, .99), (.08, .99), (.01, .30)], .62, (1024, 1536)),
+}
+
+def _piece_shape(slug):
+    return _PIECE_SHAPE.get(slug) or (_PIECE_SHAPE["quan"] if slug.startswith("quan_") else None)
+
+def _piece_tpl(slug, out, fill=.82):
+    """Khuôn mảnh áo/quần: viền trắng trên nền mauve (như tpl_bodice), mảnh chiếm `fill` khung."""
+    pts, ar, (W, H) = _piece_shape(slug)
+    oh = min(fill * H, fill * W / ar); ow = oh * ar; x0, y0 = (W - ow) / 2, (H - oh) / 2
+    im = Image.new("RGB", (W, H), (166, 106, 106))
+    xy = [(x0 + x * ow, y0 + y * oh) for x, y in pts]
+    ImageDraw.Draw(im).line(xy + xy[:1], fill="white", width=8, joint="curve")
+    im.save(out)
+    return out
+
 _DRESS_LABEL = {"ta_truoc": "FRONT skirt panel", "ta_sau": "BACK skirt panel",
                 "than_truoc": "FRONT bodice panel of a dress", "than_sau": "BACK bodice panel of a dress"}
 SKIRT_SIZE, BODICE_SIZE, PIECE_LONG = (9000, 4700), (3500, 3500), 3500   # cỡ file xuất (USER 21/10)
@@ -621,6 +662,13 @@ def _make_piece(spec, refs, work, out, flat=False):
             gen_panel(head + note + tail, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note + tail, [crop or ref, tpl]),
                       size="2048x2048")
         _flatten_white(dst)
+    elif _piece_shape(spec["slug"]):             # áo/quần: gen thẳng mảnh thành phẩm theo khuôn
+        tpl = _piece_tpl(spec["slug"], work / f"tpl_{spec['slug']}.png")
+        W, H = _piece_shape(spec["slug"])[2]
+        head = PIECE_TPL.format(label=spec["label"], where=_PIECE_WHERE[spec["slug"].split("_")[0]],
+                                base=COLOR or _base_colour(spec["desc"]), desc=spec["desc"]) + (PIECE_TPL_FLAT if flat else "")
+        gen_panel(head + note, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note, [crop or ref, tpl]), size=f"{W}x{H}")
+        _flatten_white(dst)
     else:
         tpl = PANEL_BLEED_FLAT if flat else PANEL_BLEED
         raw = work / f"raw_{spec['slug']}.png"            # giữ bản gốc model trả (soi lỗi vùng trong suốt)
@@ -933,7 +981,7 @@ def _save(arr, dst, how):
 def export_piece(slug, src, dst, work):
     """Mảnh đã chốt (bản 3D hoặc _phang) -> FILE XUẤT khung lớn phủ kín (USER 21/10):
     ta_* -> uốn theo khuôn tà ra SKIRT_SIZE; than_* -> BODICE_SIZE; art -> giữ nguyên; còn lại (ao/quan/tay)
-    -> widen() rồi cạnh dài PIECE_LONG."""
+    -> áo/quần (đã gen theo khuôn) phóng cạnh dài PIECE_LONG; tay -> widen() rồi cạnh dài PIECE_LONG."""
     base = slug[:-len("_phang")] if slug.endswith("_phang") else slug
     Image.MAX_IMAGE_PIXELS = None
     if base.startswith("ta_"):
@@ -947,6 +995,10 @@ def export_piece(slug, src, dst, work):
         return "khuôn thân"
     if base == "art":
         shutil.copyfile(src, dst); return "giữ nguyên"
+    if _piece_shape(base):                       # áo/quần đã gen theo khuôn -> chỉ phóng cỡ
+        im = Image.open(src).convert("RGB"); k = PIECE_LONG / max(im.size)
+        im.resize((round(im.width * k), round(im.height * k)), Image.LANCZOS).save(dst)
+        return "khuôn " + base.split("_")[0]
     tmp = Path(work) / f"wide_{Path(dst).name}"
     how = widen(src, tmp, work)
     im = Image.open(tmp); k = PIECE_LONG / max(im.size)
@@ -1339,19 +1391,21 @@ def _selfcheck():
     # _make_piece có box -> ref 1 = crop đúng vùng, ảnh nguyên ở CUỐI + CROP_NOTE; không box -> như cũ
     global gen_panel
     orig_gen, seen = gen_panel, []
-    def fake_gen(prompt, refs, out_, oa=None):
-        seen.append((prompt, list(refs), oa)); Image.new("RGB", (64, 64), "grey").save(out_)
+    def fake_gen(prompt, refs, out_, oa=None, size="auto"):
+        seen.append((prompt, list(refs), oa, size)); Image.new("RGB", (64, 64), "grey").save(out_)
     gen_panel = fake_gen
     try:
         td = Path(tempfile.mkdtemp()); src = td / "full.png"; Image.new("RGB", (1000, 800), "white").save(src)
         spec = dict(slug="ao_sau", kind="bleed", desc="base green", side="back",
                     label="x", box=[100, 100, 600, 500])
         _make_piece(spec, {"front": src, "back": src}, td, td / "o.png")
-        pr, rf, oa = seen[-1]
+        pr, rf, oa, sz = seen[-1]
         assert Image.open(rf[0]).size == (500, 320) and rf[-1] == src and CROP_NOTE in pr
-        assert oa[1] == [rf[0]] and OA_CROP_NOTE in oa[0] and CROP_NOTE not in oa[0]   # OpenArt: chỉ ảnh cắt
+        # áo: ảnh cắt + khuôn (khung vuông); OpenArt chỉ ảnh cắt + khuôn, bỏ ảnh nguyên
+        assert rf[1].name == "tpl_ao_sau.png" and sz == "1024x1024" and "FABRIC SHEET" in pr
+        assert oa[1] == rf[:2] and OA_CROP_NOTE in oa[0] and CROP_NOTE not in oa[0]
         _make_piece({**spec, "box": None}, {"front": src, "back": src}, td, td / "o.png")
-        assert seen[-1][1] == [src] and CROP_NOTE not in seen[-1][0] and INFER_NOTE not in seen[-1][0]
+        assert seen[-1][1] == [src, td / "tpl_ao_sau.png"] and CROP_NOTE not in seen[-1][0] and INFER_NOTE not in seen[-1][0]
         _make_piece({**spec, "box": None, "inferred": True}, {"front": src, "back": src}, td, td / "o.png")
         assert INFER_NOTE in seen[-1][0]
         # tay áo không box -> Claude khoanh (_sleeve_box) rồi cắt; tay tự suy (inferred) -> không khoanh
@@ -1409,6 +1463,14 @@ def _selfcheck():
     assert export_piece("than_truoc", pc, td2 / "t.png", td2) == "khuôn thân"
     assert Image.open(td2 / "t.png").size == BODICE_SIZE
     assert export_piece("art_phang", pc, td2 / "a.png", td2) == "giữ nguyên" and Image.open(td2 / "a.png").size == (100, 200)
+    # áo/quần: khuôn đúng khung + viền nằm giữa; xuất chỉ phóng cỡ (không widen)
+    assert export_piece("quan_sau_phang", pc, td2 / "q.png", td2) == "khuôn quan" and Image.open(td2 / "q.png").size == (1750, 3500)
+    assert _piece_shape("ao_truoc") and _piece_shape("quan_truoc") and not _piece_shape("tay_truoc")
+    for sl in ("ao_truoc", "ao_sau", "quan_truoc"):
+        t = np.array(_piece_tpl(sl, td2 / f"tpl_{sl}.png") and Image.open(td2 / f"tpl_{sl}.png"))
+        ys, xs = np.nonzero(t.min(axis=2) > 200)
+        H, W = t.shape[:2]
+        assert ys.min() > .05 * H and ys.max() < .95 * H and xs.min() > .05 * W and xs.max() < .95 * W, sl
     print("selfcheck OK")
 
 
