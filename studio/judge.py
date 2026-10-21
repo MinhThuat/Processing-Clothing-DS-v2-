@@ -323,11 +323,9 @@ score 1-10, errors = codes from:
  shorts with separate legs, or with a loose tie/sash/bow/knot hanging off it; a SLEEVE (tay) piece whose
  print differs from the sleeve in the reference — e.g. pants stripes/chevrons or torso graphics on a plain
  sleeve: compare each tay piece ONLY with the reference's sleeve), khong_tran (torso/pants/sleeve piece not full-bleed:
- margins, border or garment outline visible; the piece is drawn as a 3D garment OBJECT with shadow — a
- 3D-looking pair of pants, a hoodie silhouette — or a black/white/grey background around it, instead of a
- flat print sheet whose fabric fills the whole frame. NOT khong_tran: a torso (ao) / pants (quan) print
- sheet whose artwork sits in the CENTRE with the same base fabric continuing to every edge — that is the
- required layout), vung_den (plain areas filled black/void/glow; a glow,
+ margins, border or garment outline visible; the piece shows the garment's SHAPE — a 3D-looking pair of
+ pants with legs/crotch/cuffs, a hoodie silhouette — or a black/white/grey background around it,
+ instead of the flat print filling the whole frame), vung_den (plain areas filled black/void/glow; a glow,
  halo, dark fringe or shadow around a cut-out dress piece),
  cat_loi (dress cut-out broken / missing corners), art_thieu (art misses front details or wrong
  top/bottom layout).
@@ -439,16 +437,8 @@ PIECE_RULES = [
     ("than_", "Dress BODICE print filling the WHOLE square frame edge to edge: the bodice's artwork placed like on "
               "the real bodice (neckline details at top centre, chest motifs on the chest, waist details at the "
               "bottom) with the base fabric continuing to every edge; no outline, text, person or skirt print."),
-    # áo/quần kiểu mới (USER 21/10): gen theo khuôn như thân đầm — hoạ tiết ở giữa khung, vải nền trải ra hết khung
-    ("ao_", "TORSO print SHEET: the top's torso artwork (no sleeves or hood print) laid flat in the CENTRE of the "
-            "frame at its real positions (neckline at top centre, chest graphics on the chest, hem band at the "
-            "bottom), with the SAME base fabric continuing out to every edge. FAIL if the area around it is white/"
-            "blank or a different colour, or if it is drawn as a garment object (silhouette, shoulders, armholes, "
-            "hood, sleeves, shadow) instead of a flat fabric sheet."),
-    ("quan_", "PANTS print SHEET: the pants artwork laid flat in the CENTRE of the frame (waistband print at the "
-              "top, each leg's print in its leg, cuff bands at the bottom), with the SAME base fabric continuing out "
-              "to every edge. FAIL if the area around it is white/blank or a different colour, or if it is a 3D pair "
-              "of pants / garment object with shadow."),
+    ("ao_", "TORSO panel of the top: only the torso print (no sleeves, hood or cuffs), flat, filling the frame."),
+    ("quan_", "PANTS panel: only the pants print, flat, filling the frame — not a 3D pair of pants."),
     ("tay", "SLEEVE panel: its print must match ONLY the sleeve in the reference (compare with the sleeve "
             "itself); flat, filling the frame."),
     ("art", "ART: one flat technical drawing of the whole product front with every front detail."),
