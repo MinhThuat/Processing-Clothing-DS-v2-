@@ -21,14 +21,11 @@ RUNS = DATA / "runs"
 UPLOADS = DATA / "uploads"
 RUNS.mkdir(parents=True, exist_ok=True); UPLOADS.mkdir(parents=True, exist_ok=True)
 PIPELINE = ROOT / "flat_pipeline.py"
-# = flat_pipeline.CODEX_HOMES (các tài khoản codex của project)
-CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
 
 
 def _codex_missing():
-    """Tài khoản codex chưa đăng nhập (chưa có auth.json)."""
-    return [h for h in CODEX_HOMES if not (h / ".codex" / "auth.json").is_file()]
+    """Codex chưa đăng nhập (chưa có ~/.codex/auth.json)."""
+    return not (Path.home() / ".codex" / "auth.json").is_file()
 CODEX_LOGIN_LOG = DATA / "codex_login.log"
 SRC = [ROOT / "server.py", ROOT / "index.html", PIPELINE]
 
@@ -246,7 +243,7 @@ async def state(request):
 
 async def codex_status(request):
     miss = _codex_missing()
-    return web.json_response({"ok": not miss, "reason": "chưa đăng nhập codex: " + ", ".join(map(str, miss)) if miss else "",
+    return web.json_response({"ok": not miss, "reason": "chưa đăng nhập codex" if miss else "",
                              "src_changed": _src_mtime() > request.app["boot_mtime"]})
 
 
@@ -255,8 +252,7 @@ async def codex_login(request):
     CODEX_LOGIN_LOG.write_text("Đang khởi động codex login...\n", encoding="utf-8")
     with open(CODEX_LOGIN_LOG, "a", encoding="utf-8") as lf:
         try:
-            subprocess.Popen(["codex", "login"], stdout=lf, stderr=lf, cwd=str(ROOT),
-                             env={**os.environ, "HOME": str((_codex_missing() or CODEX_HOMES)[0])}, shell=(sys.platform == "win32"))
+            subprocess.Popen(["codex", "login"], stdout=lf, stderr=lf, cwd=str(ROOT), shell=(sys.platform == "win32"))
         except Exception as e:
             lf.write(f"Lỗi chạy codex login: {e}\n")
     return web.json_response({"ok": True})

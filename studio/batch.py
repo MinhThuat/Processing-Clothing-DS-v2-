@@ -433,9 +433,6 @@ def _log_auth_error(logtxt, stderr=""):
     """Toàn log chỉ dừng trên câu CHẮC CHẮN hết đăng nhập (AUTH_HARD_RE) — codex vision log
     'HTTP 401' thoáng qua rồi tự refresh token không được tính; nhưng nếu chính dòng '✗ mảnh ...'
     (mảnh thật sự lỗi) khớp AUTH_RE đầy đủ thì vẫn coi là hết đăng nhập."""
-    # 1 tài khoản hết đăng nhập nhưng đã chuyển sang tài khoản kia gen được (dòng '-> thử tài khoản khác') -> không
-    # tính (20/10: tk 2 token refresh 401, batch dừng 'hết đăng nhập' dù tk 1 vẫn gen bình thường)
-    logtxt = "\n".join(l for l in logtxt.splitlines() if "thử tài khoản khác" not in l)
     return bool(AUTH_HARD_RE.search(logtxt + (stderr or ""))) or _piece_auth(logtxt)
 
 
@@ -1508,9 +1505,6 @@ def _selfcheck():
     assert _log_auth_error("[vision   ] lỗi codex: HTTP 401 Unauthorized") is False
     assert _log_auth_error("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
     assert _log_auth_error("bình thường", stderr="codex chưa đăng nhập") is True   # AUTH_HARD_RE toàn log
-    # tk 2 hết đăng nhập nhưng đã chuyển tk 1 -> không dừng batch
-    assert _log_auth_error("  codex /home/u/codex_acc2 lỗi tài khoản (token refresh failed: HTTP 401) -> thử tài "
-                           "khoản khác\n  ✓ xong bằng chatgpt-imagegen") is False
     assert _piece_auth("[gen] ✗ mảnh ao_sau lỗi: token refresh failed") is True
     assert _piece_auth("[vision] lỗi codex: HTTP 401") is False       # không phải dòng "✗ mảnh"
     # #2 _slugs_match: lần 3 vision lại đổi tay giống<->khác -> tên mảnh lệch

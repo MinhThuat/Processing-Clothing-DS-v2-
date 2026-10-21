@@ -20,7 +20,7 @@ Chạy:
 
 Yêu cầu: codex đã đăng nhập + `openart login`; ARK_API_KEY (env hoặc .env cạnh script).
 """
-import argparse, base64, io, itertools, json, os, random, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
+import argparse, base64, io, json, os, random, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -289,9 +289,9 @@ def _codex_vision(content, timeout=240):
             "input": [{"type": "message", "role": "user", "content": parts}],
             "store": False, "reasoning": {"effort": "low"}, "text": {"verbosity": "low"}}
 
-    def one(home):                          # đọc auth.json của TỪNG tài khoản (không đụng AUTH_PATH chung của module)
+    def one():
         try:
-            auth = json.loads((home / ".codex" / "auth.json").read_text(encoding="utf-8"))
+            auth = json.loads((Path.home() / ".codex" / "auth.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             raise RuntimeError(f"codex chưa đăng nhập: {e}")
         access, account, _ = _CIG._extract_access_token(auth)
@@ -305,7 +305,7 @@ def _codex_vision(content, timeout=240):
             if ev.get("type") in ("response.failed", "response.incomplete", "error"):
                 raise RuntimeError(f"codex: {str(ev)[:300]}")
         return ""
-    return _with_accounts(one)
+    return _with_codex(one)
 
 def _vision(client, img, prompt, need=()):
     """Gọi vision với fallback qua VMODELS, log từng lần thử. `need` = key bắt buộc trong JSON.
@@ -668,33 +668,8 @@ def _bin(name):
             return str(b)
     return name
 CHATGPT_BIN = _bin("chatgpt-imagegen")
-# tài khoản codex của project (USER 21/10: quay lại chỉ tk 1 ~, 4 luồng; dùng thêm tk 2 (8 luồng):
-# FLAT_CODEX_HOMES="~:~/codex_acc2"):
-# mỗi cái là 1 thư mục HOME chứa .codex/auth.json
-# (chatgpt-imagegen đọc auth theo $HOME). Đổi bằng env FLAT_CODEX_HOMES (các đường dẫn nối bằng os.pathsep).
-CODEX_HOMES = [Path(p).expanduser() for p in
-               os.getenv("FLAT_CODEX_HOMES", "~").split(os.pathsep) if p]
-_ACC_NEXT = itertools.count(os.getpid())   # xoay vòng; lệch theo pid -> các tiến trình con không cùng dồn 1 tài khoản
-# lỗi do TÀI KHOẢN (quá tải / hạn mức / đăng nhập / treo) -> thử tài khoản kia. Lỗi do NỘI DUNG (ảnh bị chặn:
-# "no image returned") -> không đổi: tài khoản nào cũng chặn, chỉ mất thêm ~1 phút.
-ACC_RETRY_RE = re.compile(r"overloaded|HTTP 429|usage[_ ]limit|rate[_ ]limit|quota|HTTP 401|unauthori"
-                          r"|token refresh failed|not found|no such file|chưa đăng nhập|timed out|stalled", re.I)
-
-def _accounts():
-    """Thứ tự tài khoản cho 1 lần gọi (xoay vòng)."""
-    k = next(_ACC_NEXT) % len(CODEX_HOMES)
-    return CODEX_HOMES[k:] + CODEX_HOMES[:k]
-
-def _acc_env(home):
-    """Env cho chatgpt-imagegen: HOME của tài khoản. Tài khoản phụ có TMPDIR riêng -> hàng đợi 4 luồng codex riêng
-    (khoá flock của chatgpt-imagegen nằm trong TMPDIR); tài khoản chính giữ /tmp chung với tool khác cùng tài khoản."""
-    env = {"HOME": str(home)}
-    if home != Path.home():
-        (home / ".cig_tmp").mkdir(parents=True, exist_ok=True)
-        env["TMPDIR"] = str(home / ".cig_tmp")
-    return env
-
-# mọi tài khoản đều "overloaded" -> chờ 30-60s (ngẫu nhiên: 8 luồng không cùng dội lại 1 lúc), báo Lark, gen
+# codex chỉ dùng tài khoản `codex login` mặc định (USER 21/10: bỏ hẳn tài khoản 2).
+# codex "overloaded" -> chờ 30-60s (ngẫu nhiên: các luồng không cùng dội lại 1 lúc), báo Lark, gen
 # tiếp bằng codex; tối đa OVERLOAD_ROUNDS vòng rồi mới xuống OpenArt (USER 19/10; quá tải chỉ thoáng qua:
 # 4202338676 13:05-13:26 rơi xuống Seedream 12/13 mảnh vì không chờ)
 OVERLOAD_WAIT, OVERLOAD_ROUNDS = (30, 60), 3
@@ -721,29 +696,21 @@ def _notify_overload(text):
     except Exception as e:
         log("notify", f"gửi Lark lỗi: {e}")
 
-def _with_accounts(fn, wait=OVERLOAD_WAIT, sleep=time.sleep, notify=None):
-    """fn(home) lần lượt qua các tài khoản: lỗi tài khoản -> thử cái sau; lỗi khác ném ngay. Mọi tài khoản đều
-    quá tải -> báo Lark, chờ ngẫu nhiên `wait` giây rồi thử lại cả vòng (tối đa OVERLOAD_ROUNDS). Hết -> ném lỗi
-    gộp (giữ đủ text để raise_for nhận ra quota/hết đăng nhập)."""
+def _with_codex(fn, wait=OVERLOAD_WAIT, sleep=time.sleep, notify=None):
+    """fn() — codex quá tải -> báo Lark, chờ ngẫu nhiên `wait` giây rồi thử lại (tối đa OVERLOAD_ROUNDS); lỗi khác
+    ném ngay (giữ nguyên text để raise_for nhận ra quota/hết đăng nhập)."""
     notify = notify or _notify_overload
     for rnd in range(OVERLOAD_ROUNDS + 1):
-        errs = []
-        for home in _accounts():
-            try:
-                return fn(home)
-            except Exception as e:
-                errs.append(f"[{home}] {e}")
-                if not ACC_RETRY_RE.search(str(e)):
-                    raise RuntimeError("\n".join(errs))
-                log("gen", f"  codex {home} lỗi tài khoản ({str(e).splitlines()[-1][:80]}) -> thử tài khoản khác")
-        if rnd == OVERLOAD_ROUNDS or not all("overloaded" in x for x in errs):
-            break
+        try:
+            return fn()
+        except Exception as e:
+            if rnd == OVERLOAD_ROUNDS or "overloaded" not in str(e):
+                raise
         sec = round(random.uniform(*wait))
-        log("gen", f"  mọi tài khoản codex quá tải -> chờ {sec}s thử lại (vòng {rnd + 1}/{OVERLOAD_ROUNDS})")
-        notify(f"⏸ Codex quá tải ({len(errs)} tài khoản) — chờ {sec}s rồi gen tiếp bằng codex "
+        log("gen", f"  codex quá tải -> chờ {sec}s thử lại (vòng {rnd + 1}/{OVERLOAD_ROUNDS})")
+        notify(f"⏸ Codex quá tải — chờ {sec}s rồi gen tiếp bằng codex "
                f"(vòng {rnd + 1}/{OVERLOAD_ROUNDS}, hết vòng mới chuyển OpenArt)")
         sleep(sec)
-    raise RuntimeError("\n".join(errs))
 OPENART_BIN = _bin("openart")
 
 def _launcher(path):
@@ -786,7 +753,7 @@ def _chatgpt_gen(prompt, refs, out, timeout=420, size="auto"):
            "--backend", "codex", "--quiet", "--format", "jpeg"]
     for r in refs:
         cmd += ["-i", str(r)]
-    _with_accounts(lambda home: _run(cmd, timeout, **_acc_env(home)))
+    _with_codex(lambda: _run(cmd, timeout))
     if not tmp.exists():
         raise RuntimeError("chatgpt-imagegen không tạo file")
     Image.open(tmp).convert("RGB").save(out)
@@ -838,7 +805,7 @@ def gen_panel(prompt, refs, out, oa=None, size="auto"):
         r = _openart_gen(oa_prompt, oa_refs, out, model=model)
     except Exception as e:
         # giữ cả lỗi codex: raise_for cần thấy 429/hết đăng nhập codex, không chỉ "openart không tạo file"
-        raise RuntimeError(f"codex: {err}\nopenart: {e}") from e   # đủ lỗi mọi tài khoản: 429/401 không bị cắt
+        raise RuntimeError(f"codex: {err}\nopenart: {e}") from e   # đủ lỗi: 429/401 không bị cắt
     log("gen", f"  ✓ xong bằng OpenArt {model}")
     return r
 
@@ -931,7 +898,7 @@ def widen(src, dst, work):
     cv_in = Path(work) / f"widen_in_{Path(src).stem}.jpg"; Image.fromarray(canvas).save(cv_in)
     size = "1024x1536" if H > W * 1.2 else ("1536x1024" if W > H * 1.2 else "1024x1024")
     raw, big, how = Path(work) / f"widen_out_{Path(src).stem}.png", None, ""
-    for name, fn in (("codex", lambda: _with_accounts(lambda home: _chatgpt_gen(WIDEN, [cv_in], raw, size=size))),
+    for name, fn in (("codex", lambda: _chatgpt_gen(WIDEN, [cv_in], raw, size=size)),
                      # codex chặn (IP) -> Ideogram vẽ lề (khổ "auto" theo ảnh ref) trước khi phải kéo mép
                      ("openart", lambda: _openart_gen(WIDEN, [cv_in], raw))):
         try:
@@ -1006,8 +973,8 @@ def cutout(path, T=12):
 
 
 # ---------- 4. workers từng người ----------
-# tổng lệnh codex chạy cùng lúc của project (USER 19/10: 8): mỗi tài khoản tối đa 4 (chatgpt-imagegen tự xếp hàng)
-CODEX_WORKERS = int(os.getenv("FLAT_CODEX_WORKERS") or 4 * len(CODEX_HOMES))
+# tổng lệnh codex chạy cùng lúc của project: 1 tài khoản tối đa 4 (chatgpt-imagegen tự xếp hàng)
+CODEX_WORKERS = int(os.getenv("FLAT_CODEX_WORKERS") or 4)
 # gen song song mấy mảnh cùng lúc: chừa 1 luồng cho art (batch chạy pieces + art song song)
 GEN_WORKERS = int(os.getenv("FLAT_GEN_WORKERS") or max(1, CODEX_WORKERS - 1))
 
@@ -1257,43 +1224,29 @@ def _selfcheck():
     ex = _prompt_extra()
     assert "heliconia pink" in ex and "FIX: NO chest graphic on back" in ex
     globals()["COLOR"], globals()["HINT"] = None, None
-    # 2 tài khoản codex: xoay vòng; lỗi tài khoản -> thử cái kia; ảnh bị chặn -> không thử lại
-    orig_homes = globals()["CODEX_HOMES"]
-    globals()["CODEX_HOMES"] = [Path("/a"), Path("/b")]
-    assert {_accounts()[0] for _ in range(4)} == {Path("/a"), Path("/b")}
-    tried = []
-    def busy_then_ok(home):
-        tried.append(home)
-        if len(tried) == 1:
-            raise RuntimeError("backend failed mid-generation: Our servers are currently overloaded.")
-        return home
-    assert _with_accounts(busy_then_ok) == tried[1] != tried[0]
-    tried.clear()
-    def blocked(home):
-        tried.append(home); raise RuntimeError("no image returned (image_status=failed; model_text='')")
+    # codex quá tải -> chờ rồi thử lại; ảnh bị chặn -> ném ngay; quá tải mãi sau OVERLOAD_ROUNDS -> ném
+    tried, slept, sent = [], [], []
+    def blocked():
+        tried.append(1); raise RuntimeError("no image returned (image_status=failed; model_text='')")
     try:
-        _with_accounts(blocked); raise AssertionError("phải raise")
+        _with_codex(blocked); raise AssertionError("phải raise")
     except RuntimeError as e:
         assert len(tried) == 1 and "no image returned" in str(e)
-    # mọi tài khoản quá tải -> chờ rồi thử lại cả vòng; vẫn quá tải sau OVERLOAD_ROUNDS -> ném
-    tried.clear(); slept = []
-    def busy_round1(home):
-        tried.append(home)
-        if len(tried) <= 2:
+    tried.clear()
+    def busy_once():
+        tried.append(1)
+        if len(tried) == 1:
             raise RuntimeError("Our servers are currently overloaded.")
         return "ok"
-    sent = []
-    assert _with_accounts(busy_round1, sleep=slept.append, notify=sent.append) == "ok" and len(tried) == 3
+    assert _with_codex(busy_once, sleep=slept.append, notify=sent.append) == "ok" and len(tried) == 2
     assert len(slept) == 1 and OVERLOAD_WAIT[0] <= slept[0] <= OVERLOAD_WAIT[1] and len(sent) == 1 and "quá tải" in sent[0]
     tried.clear(); slept.clear()
-    def always_busy(home):
-        tried.append(home); raise RuntimeError("overloaded")
+    def always_busy():
+        tried.append(1); raise RuntimeError("overloaded")
     try:
-        _with_accounts(always_busy, sleep=slept.append, notify=sent.append); raise AssertionError("phải raise")
+        _with_codex(always_busy, sleep=slept.append, notify=sent.append); raise AssertionError("phải raise")
     except RuntimeError:
-        assert len(tried) == 2 * (OVERLOAD_ROUNDS + 1) and len(slept) == OVERLOAD_ROUNDS
-    globals()["CODEX_HOMES"] = orig_homes
-    assert "TMPDIR" not in _acc_env(Path.home())
+        assert len(tried) == OVERLOAD_ROUNDS + 1 and len(slept) == OVERLOAD_ROUNDS
     # Lark quá tải: nhiều luồng cùng gọi trong 1 khung 10 phút -> chỉ 1 tin
     orig_dir, logged = globals()["_NOTIFY_DIR"], []
     globals()["_NOTIFY_DIR"] = Path(tempfile.mkdtemp()) / "mark"
@@ -1322,7 +1275,7 @@ def _selfcheck():
         globals()["gen_panel"]("p", ["ref.png"], Path(tempfile.mkdtemp()) / "x.png")
     assert used == [OA_MODEL_ADULT, OA_MODEL]
     globals()["_chatgpt_gen"], globals()["_openart_gen"], globals()["_is_adult"] = orig_cg, orig_oa, orig_ad
-    # GEN_WORKERS: FLAT_GEN_WORKERS, mặc định CODEX_WORKERS - 1 (= 7 với 2 tài khoản)
+    # GEN_WORKERS: FLAT_GEN_WORKERS, mặc định CODEX_WORKERS - 1 (= 3)
     assert GEN_WORKERS == int(os.getenv("FLAT_GEN_WORKERS") or max(1, CODEX_WORKERS - 1))
     # run_pieces_one chạy song song (ThreadPoolExecutor): giữ thứ tự theo plan, 1 mảnh lỗi
     # không chặn mảnh khác, tất cả lỗi -> raise lỗi cuối cùng (theo thứ tự plan)
