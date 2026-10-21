@@ -1288,7 +1288,10 @@ def main():
                 fix_bad(only_day, day, a.dry_run)
             if a.regen:
                 globals()["FORCE_HINT"] = a.hint
-                regen(a.regen, day, a.dry_run, stats)
+                try:
+                    regen(a.regen, day, a.dry_run, stats)
+                finally:
+                    globals()["FORCE_HINT"] = None   # hint chỉ cho --regen, không lan sang --fix-fails cùng lệnh
             if a.fix_fails:
                 fix_fails(a.fix_fails, day, a.dry_run)
         except (AuthError, QuotaError, KeyboardInterrupt) as e:
