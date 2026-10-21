@@ -159,7 +159,7 @@ BODICE_TPL = (
     "the flat print.")
 _DRESS_LABEL = {"ta_truoc": "FRONT skirt panel", "ta_sau": "BACK skirt panel",
                 "than_truoc": "FRONT bodice panel of a dress", "than_sau": "BACK bodice panel of a dress"}
-SKIRT_SIZE, BODICE_SIZE, PIECE_LONG = (9000, 4700), (3500, 3500), 3500   # cỡ file xuất (USER 21/10)
+SKIRT_SIZE, BODICE_SIZE = (9000, 4700), (3500, 3500)   # cỡ file xuất (USER 21/10)
 
 # tà váy: bỏ dây/nơ/sash thắt lủng lẳng (USER: mảnh tà không có dây thừa) — xoá khỏi desc + nhắc CUỐI prompt
 NO_TIES = (" IMPORTANT: draw ONLY the flat skirt fabric panel. NO tie, sash, knot, bow, ribbon, string, "
@@ -872,68 +872,10 @@ def warp_skirt(rect, mask, nb=1024):
         my[y0:y0 + 512] = (rh - 1) - np.abs(np.mod(v, 2 * (rh - 1)) - (rh - 1))
     return cv2.remap(rect, mx, my, cv2.INTER_LANCZOS4)
 
-WIDEN = ("The reference shows a garment print PANEL placed in the CENTRE of a larger white canvas. EXTEND the print "
-         "outward to fill ALL the white area: continue the base fabric colour and the surrounding pattern naturally "
-         "past every edge of the panel out to the canvas borders. Keep the central panel EXACTLY as it is (same "
-         "position, size and details); do NOT add new logos, text, sleeves, collars or big motifs in the extension "
-         "— just more of the same fabric/background pattern. No white left, no borders, no outlines, no person.")
-WIDEN_PAD = 0.3   # lề mỗi bên = 30% cạnh dài của mảnh
-WIDEN_MATCH = 18  # sai khác TB (0-255, ảnh thu 48px) giữa phần giữa bản vẽ lề và mảnh gốc: <= mới ghép gốc
-
-def _edge_extend(im, p):
-    """Lề dự phòng: kéo dài mép vải rồi mờ dần ra ngoài (sọc/dải đi tiếp, không lặp logo)."""
-    h, w = im.shape[:2]
-    ext = cv2.copyMakeBorder(im, p, p, p, p, cv2.BORDER_REPLICATE)
-    blur = cv2.GaussianBlur(ext, (0, 0), max(1, p / 6))
-    inner = np.zeros(ext.shape[:2], np.uint8); inner[p:p + h, p:p + w] = 1
-    a = np.clip(cv2.distanceTransform(1 - inner, cv2.DIST_L2, 5) / max(1, p * 0.6), 0, 1)[..., None]
-    return (ext * (1 - a) + blur * a).astype(np.uint8)
-
-def widen(src, dst, work):
-    """Mảnh full-bleed -> khung rộng hơn (lề WIDEN_PAD mỗi bên): Codex vẽ tiếp vải ra lề (USER 21/10 chọn cách
-    này); GHÉP LẠI mảnh gốc (đã qua QA) vào giữa, mép ghép mờ dần. Codex lỗi/chặn -> lề kéo dài mép."""
-    im = np.array(Image.open(src).convert("RGB")); h, w = im.shape[:2]; p = int(WIDEN_PAD * max(h, w))
-    H, W = h + 2 * p, w + 2 * p
-    canvas = np.full((H, W, 3), 255, np.uint8); canvas[p:p + h, p:p + w] = im
-    cv_in = Path(work) / f"widen_in_{Path(src).stem}.jpg"; Image.fromarray(canvas).save(cv_in)
-    size = "1024x1536" if H > W * 1.2 else ("1536x1024" if W > H * 1.2 else "1024x1024")
-    raw, big, how = Path(work) / f"widen_out_{Path(src).stem}.png", None, ""
-    for name, fn in (("codex", lambda: _chatgpt_gen(WIDEN, [cv_in], raw, size=size)),
-                     # codex chặn (IP) -> Ideogram vẽ lề (khổ "auto" theo ảnh ref) trước khi phải kéo mép
-                     ("openart", lambda: _openart_gen(WIDEN, [cv_in], raw))):
-        try:
-            raw.unlink(missing_ok=True); fn()
-            big, how = np.array(Image.open(raw).convert("RGB").resize((W, H), Image.LANCZOS)), name
-            break
-        except Exception as e:
-            log("gen", f"  widen {Path(src).name}: {name} lỗi ({str(e)[-120:]})")
-    if big is None:
-        log("gen", f"  widen {Path(src).name}: -> lề kéo dài mép")
-        return _save(_edge_extend(im, p), dst, "kéo mép")
-    # model hay vẽ lại cả tấm, lệch vị trí/tỉ lệ chút -> đè mảnh gốc lên thì lộ khung chữ nhật, nhân đôi chi tiết
-    # (test 21/10 tay/quần Deadpool). Chỉ ghép mảnh gốc khi phần giữa bản mới KHỚP mảnh gốc; lệch -> dùng nguyên
-    # bản model vẽ (USER 21/10 duyệt cách 2 = bản Codex nguyên tấm)
-    sm = lambda a: cv2.resize(a, (48, 96 if h > w else 48), interpolation=cv2.INTER_AREA).astype(np.int16)
-    diff = float(np.abs(sm(big[p:p + h, p:p + w]) - sm(im)).mean())
-    if diff > WIDEN_MATCH:
-        return _save(big, dst, f"{how} nguyên tấm (lệch {diff:.0f})")
-    how = f"{how} + ghép gốc (lệch {diff:.0f})"
-    # ghép mảnh gốc: giữ NGUYÊN 100% trong mảnh (bản đã qua QA), chỉ mờ dần RA NGOÀI mép `feather` px — trộn mép
-    # kéo dài của mảnh gốc với phần Codex vẽ (codex review 21/10: mờ vào trong làm Codex đè lên mép mảnh)
-    feather = max(2, p // 6)
-    inner = np.zeros((H, W), np.uint8); inner[p:p + h, p:p + w] = 1
-    a = np.clip(1 - cv2.distanceTransform(1 - inner, cv2.DIST_L2, 5) / feather, 0, 1)[..., None]
-    orig = cv2.copyMakeBorder(im, p, p, p, p, cv2.BORDER_REPLICATE)
-    return _save((orig * a + big * (1 - a)).astype(np.uint8), dst, how)
-
-def _save(arr, dst, how):
-    Image.fromarray(arr).save(dst)
-    return how
-
 def export_piece(slug, src, dst, work):
     """Mảnh đã chốt (bản 3D hoặc _phang) -> FILE XUẤT khung lớn phủ kín (USER 21/10):
-    ta_* -> uốn theo khuôn tà ra SKIRT_SIZE; than_* -> BODICE_SIZE; art -> giữ nguyên; còn lại (ao/quan/tay)
-    -> widen() rồi cạnh dài PIECE_LONG."""
+    ta_* -> uốn theo khuôn tà ra SKIRT_SIZE; than_* -> BODICE_SIZE; còn lại (áo/quần/tay/art) giữ nguyên bản gen
+    (USER 21/10: bỏ bước vẽ lề — Codex vẽ lại cả tấm, tay sọc lơ lửng, quần hoa dày lên)."""
     base = slug[:-len("_phang")] if slug.endswith("_phang") else slug
     Image.MAX_IMAGE_PIXELS = None
     if base.startswith("ta_"):
@@ -945,13 +887,8 @@ def export_piece(slug, src, dst, work):
     if base.startswith("than_"):
         Image.open(src).convert("RGB").resize(BODICE_SIZE, Image.LANCZOS).save(dst)
         return "khuôn thân"
-    if base == "art":
-        shutil.copyfile(src, dst); return "giữ nguyên"
-    tmp = Path(work) / f"wide_{Path(dst).name}"
-    how = widen(src, tmp, work)
-    im = Image.open(tmp); k = PIECE_LONG / max(im.size)
-    im.resize((round(im.width * k), round(im.height * k)), Image.LANCZOS).save(dst)
-    return how
+    shutil.copyfile(src, dst)
+    return "giữ nguyên"
 
 # ---------- 3. cutout theo ngưỡng nền (cho mảnh váy: cắt cong, nền trong suốt) ----------
 def cutout(path, T=12):
@@ -1381,34 +1318,13 @@ def _selfcheck():
     assert wp.shape == (H_, W_, 3)
     assert wp[int(cy_ + 240), 300, 0] > 200 and wp[int(cy_ + 410), 300, 2] > 200      # eo đỏ, gấu xanh
     assert wp[5, 5].sum() > 0                                                          # góc ngoài khuôn có màu
-    # widen: codex lỗi -> lề kéo mép; mảnh gốc giữ NGUYÊN ở giữa, khung rộng ra 2*30%
     td2 = Path(tempfile.mkdtemp()); pc = td2 / "p.png"
-    pim = np.zeros((200, 100, 3), np.uint8); pim[:, :, 1] = 200; pim[90:110, 40:60] = (255, 255, 0)
-    Image.fromarray(pim).save(pc)
-    orig_cg2 = globals()["_chatgpt_gen"]
-    orig_oa2 = globals()["_openart_gen"]
-    globals()["_chatgpt_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked"))
-    globals()["_openart_gen"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked"))
-    try:
-        assert widen(pc, td2 / "w.png", td2) == "kéo mép"
-        # model vẽ lề khớp phần giữa -> ghép gốc; vẽ lệch hẳn -> giữ nguyên tấm model
-        def fake_ok(prompt, refs, out, **k):
-            Image.open(refs[0]).save(out)                               # trả y canvas (giữa khớp)
-        globals()["_chatgpt_gen"] = fake_ok
-        assert "ghép gốc" in widen(pc, td2 / "w2.png", td2)
-        def fake_off(prompt, refs, out, **k):
-            Image.new("RGB", (64, 96), (0, 0, 255)).save(out)           # vẽ khác hẳn
-        globals()["_chatgpt_gen"] = fake_off
-        assert "nguyên tấm" in widen(pc, td2 / "w3.png", td2)
-    finally:
-        globals()["_chatgpt_gen"], globals()["_openart_gen"] = orig_cg2, orig_oa2
-    wim = np.array(Image.open(td2 / "w.png")); pp = int(WIDEN_PAD * 200)
-    assert wim.shape[:2] == (200 + 2 * pp, 100 + 2 * pp)
-    assert (wim[pp + 90:pp + 110, pp + 40:pp + 60] == (255, 255, 0)).all()             # chi tiết giữa còn nguyên
+    Image.new("RGB", (100, 200), (0, 200, 0)).save(pc)
     # export_piece: than -> BODICE_SIZE; art -> giữ nguyên; ta (uốn) dùng khuôn
     assert export_piece("than_truoc", pc, td2 / "t.png", td2) == "khuôn thân"
     assert Image.open(td2 / "t.png").size == BODICE_SIZE
     assert export_piece("art_phang", pc, td2 / "a.png", td2) == "giữ nguyên" and Image.open(td2 / "a.png").size == (100, 200)
+    assert export_piece("tay_truoc", pc, td2 / "y.png", td2) == "giữ nguyên" and Image.open(td2 / "y.png").size == (100, 200)
     print("selfcheck OK")
 
 
