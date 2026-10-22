@@ -576,7 +576,7 @@ def _box(js, key):
     return [int(x0), int(y0), int(x1), int(y1)] if ok else None
 
 def _pieces_plan(js, kind=None, garment=None):
-    """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, guide, label]).
+    """JSON vision -> danh sách mảnh cần gen: mỗi mảnh dict(slug, kind, desc, side[, shape, label]).
     kind='dress' (cắt cong) | 'bleed' (full-bleed). side='front'/'back' -> chọn ảnh ref.
     type 'top'/'bottom' -> chỉ mảnh áo/tay hoặc chỉ mảnh quần (SP chỉ có 1 phần). GARMENT (--garment,
     biết trước loại SP thật từ SKU) lọc lại plan nếu vision vẫn trả loại khác (vd top_bottom thừa quần)."""
@@ -585,15 +585,15 @@ def _pieces_plan(js, kind=None, garment=None):
         typ = "top_bottom"
     plan = []
     if typ == "dress":
-        for slug, shape, guide, key, side in [
-            ("than_truoc", SHAPE_BODICE, "shape_bodice.png", "bodice_front", "front"),
-            ("than_sau",   SHAPE_BODICE, "shape_bodice.png", "bodice_back",  "back"),
-            ("ta_truoc",   SHAPE_FAN,    "shape_fan.png",    "skirt_front",  "front"),
-            ("ta_sau",     SHAPE_FAN,    "shape_fan.png",    "skirt_back",   "back"),
+        for slug, shape, key, side in [
+            ("than_truoc", SHAPE_BODICE, "bodice_front", "front"),
+            ("than_sau",   SHAPE_BODICE, "bodice_back",  "back"),
+            ("ta_truoc",   SHAPE_FAN,    "skirt_front",  "front"),
+            ("ta_sau",     SHAPE_FAN,    "skirt_back",   "back"),
         ]:
             desc = _desc(js, key)
             if desc:
-                plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=shape, guide=guide,
+                plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=shape,
                                  box=_box(js, key)))
         return plan
     if typ != "bottom":   # top / top_bottom: thân áo
@@ -607,7 +607,6 @@ def _pieces_plan(js, kind=None, garment=None):
             desc = _desc(js, key)
             if desc:   # box: Claude khoanh lại (lần 3) ghi vào skirt_*, vision ban đầu ghi pants_*
                 plan.append(dict(slug=slug, kind="dress", desc=desc, side=side, shape=SHAPE_FAN,
-                                 guide="shape_fan.png",
                                  box=_box(js, key.replace("pants_", "skirt_")) or _box(js, key)))
     elif typ != "top":    # bottom / top_bottom: quần
         for slug, key, side in [("quan_truoc", "pants_front", "front"), ("quan_sau", "pants_back", "back")]:
