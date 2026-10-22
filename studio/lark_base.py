@@ -17,7 +17,7 @@ VIEW_NOFILE = "vewkIOvHVD"      # GEN (team tạo 16/10, thay view No File vewRd
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
 F_NOTE = "fldGVXw4ph"           # Flat Note (text)
 N_LINKS = 20
-FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note", "Name Custom", "Gen"]
+FIELDS = (["SKU Design", "Color", "Create Date", "Check File", "Flat Pieces", "Flat Note", "Name Custom", "Gen", "Flat Temp"]
           + [f"Link {i}" for i in range(1, N_LINKS + 1)])
 _MD = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)")
 _URL = re.compile(r"https?://[^\s)\]]+")
@@ -51,6 +51,7 @@ def parse_row(raw):
         "note": (raw.get("Flat Note") or "").strip(),
         "custom": (raw.get("Name Custom") or "").strip(),
         "gen": "GEN" in (raw.get("Gen") or []),      # tag GEN -> làm trước
+        "temps": raw.get("Flat Temp") or [],          # khuôn USER up (attachment) cho loại chưa có khuôn
     }
 
 
@@ -154,6 +155,16 @@ def _upload_args(rid, files):
     return args, cwd
 
 
+def download_files(rid, files, dst):
+    """Tải attachment (dict file_token/name, vd cột Flat Temp) của dòng `rid` vào thư mục `dst` (lark-cli chỉ ghi
+    được trong thư mục đang chạy -> chạy TẠI dst, tên file ngắn)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        _cli(["base", "+record-download-attachment", "--base-token", BASE, "--table-id", TABLE, "--record-id", rid,
+              "--file-token", f["file_token"], "--output", Path(f["name"]).name, "--overwrite"], cwd=dst)
+    return dst
+
+
 def upload_files(rid, files):
     """Up nhiều file vào Flat Pieces của 1 dòng trong 1 lệnh (lark-cli nối thêm, không thay)."""
     args, cwd = _upload_args(rid, files)
@@ -195,7 +206,8 @@ def _selfcheck():
                     "Name Custom": "  • Choose design: Men\n• Choose skin tone: S3  "})
     assert r2["has_pieces"] and r2["pieces"][0]["file_token"] == "t1" and r2["note"] == "SKIP: x"
     assert r2["custom"] == "• Choose design: Men\n• Choose skin tone: S3"
-    assert len(FIELDS) == 8 + N_LINKS
+    assert len(FIELDS) == 9 + N_LINKS and r["temps"] == []
+    assert parse_row({**raw, "Flat Temp": [{"file_token": "k", "name": "X_Front.jpg"}]})["temps"][0]["name"] == "X_Front.jpg"
     # _AUTH: chỉ bắt 'expired' đi kèm 'token' (tránh bắt nhầm link ảnh/khuyến mãi hết hạn)
     assert _AUTH.search("refresh token expired")
     assert _AUTH.search("token abc123 expired")

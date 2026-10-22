@@ -533,7 +533,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
                     if group["mode"] == "two" else None),
            "back_cropped": group["mode"] == "two" and back_crop is not None,
            "hint": old_hint}
-    kind = fp.kind_of(rows[0]["sku"])   # loại có khuôn mảnh thật (hoodie/sweater/jogger/jumpsuit) hoặc None
+    kind = tpl_kind(rows)   # loại có khuôn: hoodie/sweater/jogger/jumpsuit / thư mục assets (Flat Temp) / None
     qa_no = count(1)     # QA 3D + chuỗi phẳng chạy SONG SONG -> đánh số thread-safe
     pipe_no = count(1)   # pieces + art gen SONG SONG -> itertools.count thread-safe, không trùng tên log
 
@@ -955,6 +955,33 @@ def fix_fails(keys, day, dry, max_score=None):
                     shutil.copyfile(psdir / name, sdir / name)
             (gdir / "pick.json").write_text(json.dumps(pick, ensure_ascii=False, indent=1), encoding="utf-8")
             cleanup(gdir)
+
+
+def tpl_kind(rows):
+    """Loại khuôn cho nhóm: 4 loại cố định (fp.kind_of) -> thư mục assets/<tên> có tên nằm trong SKU (đã có khuôn,
+    không tải lại) -> chưa có: tải khuôn cột Flat Temp (USER up) về assets/<tiền tố tên file trước '_'> -> None
+    (gen bình thường). USER 22/10: 'có temp rồi thì thôi, chưa có thì lấy temp trong cột đó'."""
+    sku = rows[0]["sku"]
+    k = fp.kind_of(sku)
+    if k:
+        return k
+    s = sku.lower()
+    for d in sorted(fp.ASSETS.iterdir(), key=lambda d: -len(d.name)):   # tên dài khớp trước
+        if d.is_dir() and d.name.lower() in s and fp.dyn_tpl(d.name):
+            return d.name
+    r = next((r for r in rows if r.get("temps")), None)
+    if not r:
+        return None
+    # tên thư mục từ tên file USER up -> làm sạch (chặn '..', '/', ký tự lạ ghi ra ngoài assets)
+    name = safe_name(Path(r["temps"][0]["name"]).stem.split("_")[0]).strip(" .") or safe_name(sku_stem(sku))
+    if not name or name.startswith("."):
+        return None
+    try:
+        lb.download_files(r["record_id"], r["temps"], fp.ASSETS / name)
+    except StepError as e:
+        log("khuôn", f"tải Flat Temp lỗi ({e}) -> gen bình thường"); return None
+    log("khuôn", f"tải {len(r['temps'])} khuôn từ Flat Temp -> assets/{name}: {fp.dyn_tpl(name)}")
+    return name if fp.dyn_tpl(name) else None
 
 
 FORCE_HINT = None   # --hint (đi kèm --regen): vd vision bỏ sót vùng da in trên áo (Rhonda Romero4 21/10)

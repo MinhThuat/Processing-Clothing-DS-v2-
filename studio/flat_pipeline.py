@@ -214,11 +214,37 @@ def kind_of(sku):
             return k
     return None
 
+# KHUÔN ĐỘNG (USER 22/10): loại chưa có trong CLOTH_TPL -> thư mục assets/<tên loại>/ (batch tải từ cột Flat Temp
+# trên Base). Vai trò mảnh theo TÊN FILE: Front/Back/Sleeve/Hood; có thêm Pants/Top thì chỉ rõ phần (vd
+# 'Loose Sweatpants_Front.jpg' -> quan_truoc). Không rõ phần -> Front/Back áp cho mảnh thân trước/sau bất kỳ.
+_ROLE = (("sleeve", "tay"), ("hood", "mu"), ("front", "truoc"), ("back", "sau"))
+
+def dyn_tpl(name):
+    """assets/<name>/ -> {khoá mảnh: 'name/file'} theo tên file; thư mục không có / không file nào khớp -> {}."""
+    d, m = ASSETS / name, {}
+    if not name or name.startswith(".") or not d.is_dir():
+        return m
+    for f in sorted(d.iterdir()):
+        if not f.is_file() or f.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"):
+            continue
+        st = f.stem.lower()
+        role = next((r for w, r in _ROLE if w in st), None)
+        if not role:
+            continue
+        part = ("quan" if re.search(r"pant|jogger|short|legging|quan", st)
+                else "ao" if re.search(r"\btop|shirt|torso|hoodie|sweater", st) else "")
+        m[f"{part}_{role}" if part and role in ("truoc", "sau") else role] = f"{name}/{f.name}"
+    return m
+
+def tpl_map(kind):
+    return (CLOTH_TPL.get(kind) or dyn_tpl(kind)) if kind else {}
+
 def cloth_tpl(slug, kind=None):
-    """Khuôn thật của mảnh (bỏ _phang; tay_* chung 'tay', quan_* chung 'quan') hoặc None."""
+    """Khuôn thật của mảnh (bỏ _phang) hoặc None. Tra: đúng slug -> phần (tay/quan/...) -> mặt (truoc/sau)."""
     base = slug[:-len("_phang")] if slug.endswith("_phang") else slug
-    key = "tay" if base.startswith("tay") else "quan" if base.startswith("quan_") else base
-    f = CLOTH_TPL.get(kind or KIND, {}).get(key)
+    m = tpl_map(kind or KIND)
+    part, side = base.split("_")[0], base.rsplit("_", 1)[-1]
+    f = m.get(base) or m.get(part) or (m.get(side) if side in ("truoc", "sau") and part != "tay" else None)
     return TPL_DIR / f if f else None
 
 CLOTH_GEN = (1024, 1536)   # khổ codex gen mảnh có khuôn (khuôn đều dọc)
@@ -491,7 +517,7 @@ def _pieces_prompt(source):
     p = _PIECES_INTRO[source]
     if GARMENT:
         p += f" The product is known to be: {GARMENT} — use exactly that type."
-    if "mu" in CLOTH_TPL.get(KIND, {}):
+    if "mu" in tpl_map(KIND):
         p += HOOD_NOTE
     return p
 
@@ -636,9 +662,13 @@ def _pieces_plan(js, kind=None, garment=None):
     garment = garment or GARMENT                 # lọc TRƯỚC khi gộp jumpsuit (batch gọi y hệt -> cùng tên mảnh)
     if garment and garment != typ:
         plan = _filter_by_garment(plan, garment)
-    if (kind or KIND) == "jumpsuit":
+    kind = kind or KIND
+    if kind == "jumpsuit":
         plan = _merge_jumpsuit(plan)
-    return plan
+    # USER 22/10: mẫu CÓ khuôn -> chỉ gen các mảnh có trong khuôn (vd hoodie bỏ quần); khuôn không khớp mảnh
+    # nào -> giữ plan (gen mặc định, không ra bộ rỗng)
+    kept = [p for p in plan if cloth_tpl(p["slug"], kind)] if tpl_map(kind) else plan
+    return kept or plan
 
 def _flatten_white(path):
     """Mảnh full-bleed phải ĐỤC -> bỏ hẳn kênh alpha, GIỮ màu RGB. Codex hay trả PNG có alpha SAI: vẫn tô
@@ -1460,7 +1490,25 @@ def _selfcheck():
     assert {p["slug"] for p in _pieces_plan({k: v for k, v in tbh.items() if k != "hood"})} == \
         {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau", "tay_truoc", "tay_sau"}
     assert _filter_by_garment({"bo_truoc", "mu", "quan_sau"}, "bottom") == {"quan_sau"}
-    assert {p["slug"] for p in _pieces_plan(tbh, "jumpsuit", "top")} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau", "mu"}
+    # mẫu có khuôn chỉ gen mảnh có khuôn: hoodie bỏ quần; sweater bỏ quần + mũ; không khuôn -> đủ mảnh
+    assert {p["slug"] for p in _pieces_plan(tbh, "hoodie")} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau", "mu"}
+    assert {p["slug"] for p in _pieces_plan(tbh, "jogger")} == \
+        {"ao_truoc", "ao_sau", "quan_truoc", "quan_sau", "tay_truoc", "tay_sau", "mu"}
+    assert {p["slug"] for p in _pieces_plan(tbh, "sweater")} == {"ao_truoc", "ao_sau", "tay_truoc", "tay_sau"}
+    dyn = Path(tempfile.mkdtemp(dir=ASSETS, prefix="_t_"))
+    try:                                         # khuôn động: vai trò theo tên file
+        for n in ("X Sweatpants_Front.jpg", "X Sweatpants_Back.jpg", "Sleeve.png", "readme.txt", "Hood.txt"):
+            (dyn / n).write_bytes(b"x")
+        (dyn / "Back").mkdir()                   # thư mục / file không phải ảnh không tính là khuôn
+        m = dyn_tpl(dyn.name)
+        assert m == {"quan_truoc": f"{dyn.name}/X Sweatpants_Front.jpg", "quan_sau": f"{dyn.name}/X Sweatpants_Back.jpg",
+                     "tay": f"{dyn.name}/Sleeve.png"}, m
+        assert cloth_tpl("quan_sau_phang", dyn.name).name == "X Sweatpants_Back.jpg"
+        assert cloth_tpl("tay_trai_truoc", dyn.name).name == "Sleeve.png" and cloth_tpl("ao_truoc", dyn.name) is None
+        assert dyn_tpl("khong co") == {} and dyn_tpl(".cache") == {}
+    finally:
+        shutil.rmtree(dyn)
+    assert {p["slug"] for p in _pieces_plan(tbh, "jumpsuit", "top")} == {"tay_truoc", "tay_sau", "mu"}   # áo không khuôn
     print("selfcheck OK")
 
 
@@ -1487,7 +1535,8 @@ if __name__ == "__main__":
     ap.add_argument("--hint", help="ghi chú sửa lỗi ghép cuối mọi prompt gen")
     ap.add_argument("--garment", choices=["top", "bottom", "top_bottom", "dress"],
                     help="ép loại SP thật (biết trước từ SKU, vd 3D Tshirt -> top); mặc định để vision tự quyết")
-    ap.add_argument("--kind", choices=sorted(CLOTH_TPL), help="loại có khuôn mảnh thật (batch suy từ SKU)")
+    ap.add_argument("--kind", help="loại có khuôn mảnh thật: hoodie/sweater/jogger/jumpsuit hoặc tên thư mục "
+                                   "assets/<loại> (khuôn động, batch suy từ SKU / cột Flat Temp)")
     ap.add_argument("--selfcheck", action="store_true")
     a = ap.parse_args()
     if a.selfcheck:
