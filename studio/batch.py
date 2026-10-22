@@ -1142,7 +1142,8 @@ def process_nonclothing(rows, srcs, sheet, gdir, day, dry, stats, done_ids, repl
         any_fail |= bool(fails)
         note = (f"QA FAIL {day} · " + " · ".join(f"{k} ({','.join(e)})" for k, e in fails.items())
                 + f" sau {nonclothing.MAX_ATTEMPTS} lần" if fails
-                else f"OK {day} · art phẳng + giả 3D (không phải quần áo)")
+                else f"OK {day} · " + ("khuôn Ski Mask" if "ski" in arts else "art phẳng + giả 3D")
+                + " (không phải quần áo)")
         if replace:
             replace_rows([r], files, {piece_slug(r["sku"], f.name)[0] for f in files}, {r["record_id"]: note}, dry)
         else:

@@ -174,6 +174,7 @@ CLOTH_TPL = {
                  "tay": "Jumpsuit/Temp-Sleeve.jpg", "mu": "Jumpsuit/Temp-Hood.jpg"},
 }
 SKIRT_TPL, BODICE_TPL_IMG = ASSETS / "Vay Ao" / "Skirt.jpg", ASSETS / "Vay Ao" / "Bodice.jpg"
+SKI_TPL = ASSETS / "Funny Face Ski Mask" / "Front.png"   # tấm in 4380x2892, lỗ mắt = vùng trong suốt
 CLOTH_PROMPT = (
     "Flat textile PRINT for the {label}, filling the ENTIRE frame edge to edge. The SECOND reference is the sewing "
     "pattern: the light shape shows where this panel will be cut. Place the panel's printed artwork from the FIRST "

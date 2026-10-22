@@ -61,6 +61,21 @@ FLAT_FROM_3D = (
     "to edge — as clean 2D FLAT vector art: SOLID FLAT COLOR FILL, crisp clean edges, NO 3D, NO shading, "
     "NO gradient, NO highlights, NO glow, NO texture. Change nothing else.")
 VERSIONS = ["3d", "phang"]      # 3d trước: bản phẳng lấy bản 3D làm ref
+# SKI MASK (USER 22/10): CHỈ xuất 1 bản "ski" = tấm in theo khuôn assets/Funny Face Ski Mask (4380x2892), ảnh
+# liền KHÔNG khoét lỗ mắt (USER: bỏ vệt đen), không gen 2 art cũ. Codex gen khổ SKI_GEN với khuôn (lỗ mắt tô
+# xám) làm ref 2 rồi cắt đúng tỉ lệ khuôn. Hay vẽ lại kính/visor/dải che mắt to hơn lỗ, hoặc cả cái đầu trên
+# nền (test 13 mẫu view 22/10) -> cấm trong prompt.
+SKI = ("Flat textile PRINT for the FRONT of a ski mask (balaclava), filling the ENTIRE frame edge to edge. The SECOND "
+       "reference is the sewing pattern: the white sheet is the printed fabric and the dark rounded slot is the EYE "
+       "OPENING that will be cut out. Redraw the face design from the FIRST reference flat on this sheet: the eyes "
+       "sit IN the slot (leave the slot area plain base colour), eyebrows just above the slot, cheeks and mouth "
+       "below it, centred, at a natural face scale. The base fabric colour fills every edge. Do NOT draw the slot, "
+       "the mask shape, a head, a person, folds, shadows or perspective — only the flat print. If the reference "
+       "shows goggles, a visor, sunglasses or a black/blank band over the eyes, do NOT draw it: no goggles, visor, "
+       "band or blank strip anywhere — continue the face's skin, fur or hair right up to the slot. Do NOT draw the "
+       "head/mask silhouette on a background: the mask's own fabric (fur, hair, skin, pattern) covers the WHOLE "
+       "sheet.")
+SKI_GEN = (1536, 1024)
 
 QA = """Tile 1 = REFERENCE photo of the real product. Tile 2 = generated PRINT FILE ("art"), version: {version}.
 Order: colour {color} | customer options: {opts}.
@@ -81,6 +96,9 @@ Return ONLY {{"score": 9, "errors": []}}"""
 STYLE = {"phang": "must be flat — shading, highlights, glow, bevels or texture that imitate DEPTH/3D on a "
                   "graphic are wrong; colour bands/stripes that are part of the design itself (e.g. a "
                   "rainbow pattern) and tiny eye catch-lights are fine",
+         "ski": "must be a flat print sheet of the mask's FRONT filling the whole frame: the reference face "
+                "centred with its eyes in the middle-upper area, NO goggles/visor/eye band, NO head silhouette on a "
+                "background, NO mask shape in perspective",
          "3d": "must reproduce the printed graphics faithfully with their raised faux-3D look, shading and "
                "texture as in the reference — a flat cartoon look is wrong when the reference print has "
                "3D/raised effects; if the reference print itself is flat, a faithful copy is correct"}
@@ -114,10 +132,10 @@ def norm_qa(js):
     return {"ok": not errs and score >= QA_MIN, "score": float(score), "errors": errs}
 
 
-def _gen(prompt, ref, out):
+def _gen(prompt, ref, out, extra=(), size="auto"):
     """gen_panel trong tiến trình; lỗi -> AuthError/QuotaError/StepError('gen') như luồng clothing."""
     try:
-        fp.gen_panel(prompt, [ref], out)
+        fp.gen_panel(prompt, [ref, *extra], out, size=size)
     except Exception as e:
         raise_for(str(e), "gen")
     fp._flatten_white(out)      # codex đôi khi trả PNG nền trong suốt -> nền trắng đục (như mảnh clothing)
@@ -141,14 +159,16 @@ def _input(r, srcs, sheet, d, log):
     pixel) 1 SP -> ảnh đầu vào đã phóng. Theo từng dòng vì 1 nhóm (chung bộ link) có thể gồm nhiều
     biến thể/màu (vd giỏ Green + Purple) — dùng chung 1 ảnh thì dòng kia gen/QA theo sai mẫu."""
     rows = [r]
-    num = judge.design_num(r.get("custom") or "", r["sku"])
+    num = judge.design_label(r.get("custom") or "", r["sku"])    # '4' / 'F3' / 'A5'
     legend = num and _legend(str(sheet), len(srcs), log)
     if legend:      # dòng chọn 'D4' / 'Design 4' + có bảng design đánh số -> cắt ĐÚNG ô đó trên bảng (pick
         # tự chọn thì lấy ảnh người đeo bất kỳ -> sai design, mặt nạ Jo chapman 20/10: 4/5 dòng sai)
         src = srcs[legend - 1]
         try:
             box = judge.locate(judge.grid_overlay(src, d / "nc_grid.jpg"),
-                               f"the ONE design labelled D{num} / Design {num} / #{num}", r["sku"], False)
+                               (f"the ONE design labelled D{num} / Design {num} / #{num}" if num.isdigit()
+                                else f'the ONE design labelled "{num}" (the whole item, not the label text)'),
+                               r["sku"], False)
         except StepError as e:
             log("nc", f"D{num}: định vị trên bảng design lỗi {e}"); box = None
         if box:
@@ -174,14 +194,14 @@ def _input(r, srcs, sheet, d, log):
     return fp._upscaled(inp, d / "nc_in_up.png"), pk
 
 
-def _best_art(r, version, prompt, inp, d, log, ref=None):
+def _best_art(r, version, prompt, inp, d, log, ref=None, extra=(), size="auto"):
     """Gen 1 bản (version) cho 1 dòng từ `ref` (mặc định ảnh SP `inp`), QA so với ảnh SP, gen lại tối đa
     MAX_ATTEMPTS -> (path, qa) bản điểm cao nhất."""
     best, fix = None, ""
     for k in range(1, MAX_ATTEMPTS + 1):
         art = d / f"art_{version}_{k}.png"
         try:
-            _gen(prompt + fix, ref or inp, art)
+            _gen(prompt + fix, ref or inp, art, extra, size)
         except StepError as e:
             log("nc", f"{r['record_id']} {version} lần {k}: lỗi gen {e}"); continue
         # ô lớn (QA_TILE) để Claude thấy bóng/gradient nhỏ trên bản phẳng — ô 384px mặc định bỏ sót
@@ -202,6 +222,25 @@ def _best_art(r, version, prompt, inp, d, log, ref=None):
     return best
 
 
+def _ski_tpl(d):
+    """Khuôn ski mask cho model: tấm trắng, lỗ mắt tô xám, chèn nền đủ SKI_GEN -> (path, hộp khuôn trong SKI_GEN)."""
+    import numpy as np
+    t = Image.open(fp.SKI_TPL); a = np.array(t.convert("RGBA"))[..., 3]
+    gw, gh = SKI_GEN; h = round(t.height * gw / t.width); y0 = (gh - h) // 2
+    ref = Image.new("RGB", SKI_GEN, (200, 200, 200))
+    ref.paste(Image.fromarray(np.where(a[..., None] < 128, [90, 90, 110], [255, 255, 255]).astype(np.uint8))
+              .resize((gw, h)), (0, y0))
+    ref.save(d / "ski_tpl.png")
+    return d / "ski_tpl.png", (0, y0, gw, y0 + h)
+
+
+def ski_export(art, box, out):
+    """Bản gen SKI_GEN -> cắt hộp khuôn -> đúng cỡ khuôn (ảnh liền, không khoét lỗ mắt)."""
+    Image.open(art).convert("RGB").resize(SKI_GEN).crop(box).resize(Image.open(fp.SKI_TPL).size,
+                                                                     Image.LANCZOS).save(out)
+    return out
+
+
 def run(rows, srcs, sheet, gdir, log):
     """Generator: yield (row, {version: (art_path, qa)}) NGAY khi xong từng dòng -> batch up luôn, dòng
     sau lỗi không làm mất dòng đã xong. Mỗi dòng chọn ảnh + vision riêng (biến thể/màu có thể khác)."""
@@ -210,6 +249,12 @@ def run(rows, srcs, sheet, gdir, log):
         d = gdir / f"nc_{r['record_id']}"
         shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)   # bỏ file lần chạy trước
         inp, pk = _input(r, srcs, sheet, d, log)
+        if "ski mask" in r["sku"].lower():      # Ski Mask: CHỈ tấm in theo khuôn, bỏ vision + 2 art
+            tpl, box = _ski_tpl(d)
+            art, q = _best_art(r, "ski", SKI + custom_rule(r), inp, d, log, extra=(tpl,),
+                               size="x".join(map(str, SKI_GEN)))
+            yield r, {"ski": (ski_export(art, box, d / "art_ski_out.png"), q)}
+            continue
         try:
             spec, m = fp._vision(client, inp, VISION, need=("product", "print"))
         except SystemExit as e:                 # _vision hết model -> sys.exit; hết login/quota -> dừng đợt
@@ -240,7 +285,7 @@ def _selfcheck():
     import tempfile
     g, orig = globals(), (_gen, judge.ask, judge.contact_sheet)
     answers = iter([{"score": 9, "errors": ["sai_chu"]}, {"score": 8, "errors": []}])
-    g["_gen"] = lambda prompt, ref, out: None
+    g["_gen"] = lambda prompt, ref, out, *a: None
     judge.ask, judge.contact_sheet = (lambda *a, **k: next(answers)), (lambda *a, **k: None)
     try:
         d = Path(tempfile.mkdtemp())
@@ -248,6 +293,13 @@ def _selfcheck():
     finally:
         g["_gen"], judge.ask, judge.contact_sheet = orig
     assert art.name == "art_3d_2.png" and q["ok"]
+    # Ski Mask: khuôn cho model đủ khổ SKI_GEN, hộp khuôn đúng tỉ lệ; xuất đúng cỡ khuôn, ảnh liền (RGB)
+    tp, box = _ski_tpl(d)
+    W, H = Image.open(fp.SKI_TPL).size
+    assert Image.open(tp).size == SKI_GEN and abs((box[2] - box[0]) / (box[3] - box[1]) - W / H) < .01
+    Image.new("RGB", SKI_GEN, "yellow").save(d / "g.png")
+    o = Image.open(ski_export(d / "g.png", box, d / "o.png"))
+    assert o.size == (W, H) and o.mode == "RGB"
     print("nonclothing selfcheck OK")
 
 
