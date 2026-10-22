@@ -97,7 +97,8 @@ def _mac_ca_bundle():
         os.environ["SSL_CERT_FILE"] = os.environ["REQUESTS_CA_BUNDLE"] = str(f)
 _mac_ca_bundle()
 
-ASSETS = HERE / "assets"
+ASSETS = HERE / "assets"          # khuôn xưởng (USER 22/10): mỗi loại 1 thư mục, giữ tên file gốc -> thay khuôn = chép đè
+CACHE = ASSETS / ".cache"         # khuôn thu nhỏ / mặt nạ tính sẵn (gitignore, tự sinh lại)
 VSC = Path(os.getenv("VSC_ROOT", "/mnt/6C96C1A096C16AE2/vsc"))
 # ưu tiên .env cạnh script (self-contained), không có thì dùng .env gốc của chatgpt-api
 _DEF_ENV = (HERE / ".env") if (HERE / ".env").exists() else (VSC / "chatgpt-api" / ".env")
@@ -140,7 +141,7 @@ SHAPE_BODICE = (" Shape: a sleeveless bodice tank panel like the second referenc
 SHAPE_FAN = (" Shape: a wide quarter-circle CIRCLE-SKIRT fan panel spread flat like the second "
              "reference (shape guide). Every band follows the curved arc, parallel to the curved hem.")
 # ĐẦM KIỂU MỚI (USER 21/10): tà = tấm hoạ tiết CHỮ NHẬT "trải thẳng" (trên = eo, dưới = gấu) — export_piece uốn
-# theo khuôn tpl_skirt ra NGUYÊN khung 9000x4700; thân = khung vuông phủ kín, đặt hoạ tiết khớp khuôn tpl_bodice.
+# theo khuôn assets/Vay Ao/Skirt.jpg ra NGUYÊN khung 9000x4700; thân = khung vuông phủ kín, khớp khuôn Vay Ao/Bodice.jpg.
 SKIRT_RECT = (
     "Flat textile PRINT of the {label} as one wide RECTANGLE for printing: the TOP edge is the waistline, the "
     "BOTTOM edge is the hem. Reproduce the skirt's printed artwork EXACTLY as in the reference crop (colours, "
@@ -158,18 +159,21 @@ BODICE_TPL = (
     "at the bottom), and continue the base fabric and its pattern beyond the outline out to all four edges. Do "
     "NOT draw the outline, the word FRONT, the mauve background, a person, folds, shadows or perspective — only "
     "the flat print.")
-# ÁO/QUẦN/TAY/MŨ THEO KHUÔN THẬT (USER 21/10, khuôn xưởng ở assets/tpl_clothing): mảnh có khuôn gen như thân đầm
+# ÁO/QUẦN/TAY/MŨ THEO KHUÔN THẬT (USER 21/10, khuôn xưởng ở assets/<loại>/): mảnh có khuôn gen như thân đầm
 # (ảnh cắt + khuôn) và xuất ĐÚNG cỡ khuôn; loại/mảnh không có khuôn -> gen bình thường. Jogger = bộ hoodie + quần
 # jogger. Jumpsuit: thân+quần chung 1 khuôn dài -> gộp ao_*+quan_* thành 1 mảnh bo_truoc/bo_sau (_merge_jumpsuit).
-TPL_DIR = ASSETS / "tpl_clothing"
-_HOODIE = {"ao_truoc": "hoodie_front.jpg", "ao_sau": "hoodie_back.jpg", "tay": "hoodie_sleeve.jpg", "mu": "hoodie_hood.jpg"}
+TPL_DIR = ASSETS
+_HOODIE = {"ao_truoc": "3D Hoodie/Front.jpg", "ao_sau": "3D Hoodie/Back.jpg", "tay": "3D Hoodie/Sleeve.jpg",
+           "mu": "3D Hoodie/Hood.jpg"}
 CLOTH_TPL = {
     "hoodie": _HOODIE,
-    "jogger": {**_HOODIE, "quan": "jogger.jpg"},
-    "sweater": {"ao_truoc": "sweater_front.jpg", "ao_sau": "sweater_back.jpg", "tay": "sweater_sleeve.jpg"},
-    "jumpsuit": {"bo_truoc": "jumpsuit_body.jpg", "bo_sau": "jumpsuit_body.jpg", "tay": "jumpsuit_sleeve.jpg",
-                 "mu": "jumpsuit_hood.jpg"},
+    "jogger": {**_HOODIE, "quan": "3D Jogger/3D Jogger.jpg"},
+    "sweater": {"ao_truoc": "Ugly Sweater_JO/Front.jpg", "ao_sau": "Ugly Sweater_JO/Back.jpg",
+                "tay": "Ugly Sweater_JO/Sleeve.jpg"},
+    "jumpsuit": {"bo_truoc": "Jumpsuit/Temp-Jumpsuit.jpg", "bo_sau": "Jumpsuit/Temp-Jumpsuit.jpg",
+                 "tay": "Jumpsuit/Temp-Sleeve.jpg", "mu": "Jumpsuit/Temp-Hood.jpg"},
 }
+SKIRT_TPL, BODICE_TPL_IMG = ASSETS / "Vay Ao" / "Skirt.jpg", ASSETS / "Vay Ao" / "Bodice.jpg"
 CLOTH_PROMPT = (
     "Flat textile PRINT for the {label}, filling the ENTIRE frame edge to edge. The SECOND reference is the sewing "
     "pattern: the light shape shows where this panel will be cut. Place the panel's printed artwork from the FIRST "
@@ -227,10 +231,10 @@ def _tpl_box(path):
 def _tpl_ref(path):
     """Khuôn thu nhỏ, CHÈN nền cho đủ khổ CLOTH_GEN (codex chỉ gen 1024x1536) -> ảnh gen cắt lại đúng hộp khuôn
     (_tpl_box), không kéo méo (lỗi 21/10: codex 'auto' trả ngang 1448x1086 rồi kéo sang khuôn dọc 4500x5450)."""
-    out = TPL_DIR / "small" / path.name
+    out = CACHE / "small" / f"{path.parent.name}_{path.name}"
     with _TPL_LOCK:
         if not out.exists():
-            out.parent.mkdir(exist_ok=True)
+            out.parent.mkdir(parents=True, exist_ok=True)
             im = Image.open(path).convert("RGB"); x0, y0, x1, y1 = _tpl_box(path)
             canvas = Image.new("RGB", CLOTH_GEN, im.getpixel((5, 5)))
             canvas.paste(im.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0)); canvas.save(out)
@@ -916,23 +920,25 @@ _WARP_LOCK = threading.Lock()   # ponytail: 1 lần uốn 9000x4700 ~3GB RAM -> 
 
 def _tpl_small():
     """Khuôn thân đầm thu nhỏ 1024 làm ref cho model (file gốc 3500px quá nặng để gửi)."""
-    out = ASSETS / "tpl_bodice_1024.png"
+    out = CACHE / "bodice_1024.png"
     with _TPL_LOCK:
         if not out.exists():
-            Image.open(ASSETS / "tpl_bodice.jpg").convert("RGB").resize((1024, 1024)).save(out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            Image.open(BODICE_TPL_IMG).convert("RGB").resize((1024, 1024)).save(out)
     return out
 
 def _skirt_mask():
-    """Mặt nạ trong khuôn tà (tpl_skirt.jpg, viền trắng trên nền đều màu) -> bool HxW, cache .npy."""
-    cache = ASSETS / "tpl_skirt_mask.npy"
+    """Mặt nạ trong khuôn tà (Vay Ao/Skirt.jpg, viền trắng trên nền đều màu) -> bool HxW, cache .npy."""
+    cache = CACHE / "skirt_mask.npy"
     with _TPL_LOCK:
         if cache.exists():
             return np.load(cache)
         Image.MAX_IMAGE_PIXELS = None
-        im = np.array(Image.open(ASSETS / "tpl_skirt.jpg").convert("RGB")).astype(np.int16)
+        im = np.array(Image.open(SKIRT_TPL).convert("RGB")).astype(np.int16)
         line = (np.abs(im - im[5, 5]).max(2) > 60).astype(np.uint8)        # viền + chữ của khuôn
         _, lab = cv2.connectedComponents(1 - line, connectivity=4)
         inside = cv2.morphologyEx((lab != lab[0, 0]).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+        cache.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache, inside.astype(bool))
         return inside.astype(bool)
 
@@ -990,7 +996,7 @@ def export_piece(slug, src, dst, work, kind=None):
     tpl = cloth_tpl(base, kind)
     if tpl:                                      # mảnh có khuôn thật -> đúng cỡ khuôn
         Image.open(src).convert("RGB").resize(Image.open(tpl).size, Image.LANCZOS).save(dst)
-        return "khuôn " + tpl.stem
+        return f"khuôn {tpl.parent.name}/{tpl.stem}"
     shutil.copyfile(src, dst)
     return "giữ nguyên"
 
@@ -1433,15 +1439,16 @@ def _selfcheck():
     assert kind_of("THT282609A28-Design 1-3D Hoodie-M") == "hoodie" and kind_of("X-Jumpsuit Adult-L") == "jumpsuit"
     assert kind_of("BQT081026A06-Ugly Sweater-2XL") == "sweater" and kind_of("NTN012610A09-Jogger-S") == "jogger"
     assert kind_of("BQT250926A04-Skater Dress") is None and kind_of("") is None
-    assert cloth_tpl("tay_trai_sau_phang", "hoodie").name == "hoodie_sleeve.jpg"
-    assert cloth_tpl("quan_truoc", "jogger").name == "jogger.jpg" and cloth_tpl("quan_truoc", "hoodie") is None
+    assert cloth_tpl("tay_trai_sau_phang", "hoodie") == ASSETS / "3D Hoodie" / "Sleeve.jpg"
+    assert cloth_tpl("quan_truoc", "jogger").name == "3D Jogger.jpg" and cloth_tpl("quan_truoc", "hoodie") is None
+    assert SKIRT_TPL.exists() and BODICE_TPL_IMG.exists()
     assert cloth_tpl("ao_truoc", None) is None and all((TPL_DIR / f).exists() for m in CLOTH_TPL.values() for f in m.values())
     for m in CLOTH_TPL.values():                 # gen 1024x1536 cắt lại đúng tỉ lệ khuôn (không méo)
         for f in m.values():
             (W, H), (x0, y0, x1, y1) = Image.open(TPL_DIR / f).size, _tpl_box(TPL_DIR / f)
             assert abs((x1 - x0) / (y1 - y0) - W / H) < .01 and (x0 == 0 or y0 == 0), f
-    assert export_piece("ao_sau_phang", pc, td2 / "h.png", td2, "hoodie") == "khuôn hoodie_back"
-    assert Image.open(td2 / "h.png").size == Image.open(TPL_DIR / "hoodie_back.jpg").size
+    assert export_piece("ao_sau_phang", pc, td2 / "h.png", td2, "hoodie") == "khuôn 3D Hoodie/Back"
+    assert Image.open(td2 / "h.png").size == Image.open(ASSETS / "3D Hoodie" / "Back.jpg").size
     # jumpsuit: ao+quan -> 1 mảnh bo_* (box gộp); mũ chỉ khi vision trả "hood"
     tbh = {"type": "top_bottom", "top_front": "base red; a", "top_back": "base red", "pants_front": "base red; b",
            "pants_back": "base red", "sleeves_same": True, "sl_front": "base red", "sl_back": "base red",
