@@ -972,8 +972,11 @@ def tpl_kind(rows):
     r = next((r for r in rows if r.get("temps")), None)
     if not r:
         return None
-    # tên thư mục từ tên file USER up -> làm sạch (chặn '..', '/', ký tự lạ ghi ra ngoài assets)
-    name = safe_name(Path(r["temps"][0]["name"]).stem.split("_")[0]).strip(" .") or safe_name(sku_stem(sku))
+    # tên thư mục từ tên file USER up -> làm sạch (chặn '..', '/', ký tự lạ ghi ra ngoài assets). File không tiền tố
+    # ('front.jpg' -> assets/front, Adult Jersey 22/10: loại khác up front.jpg là đè nhau) -> tên loại cuối SKU
+    name = safe_name(Path(r["temps"][0]["name"]).stem.split("_")[0]).strip(" .")
+    if not name or name.lower() in {w for w, _ in fp._ROLE}:   # nguyên từ: 'Hoodie_Front' vẫn giữ tiền tố
+        name = safe_name(sku_stem(sku).split("-")[-1]).strip(" .")
     if not name or name.startswith("."):
         return None
     try:
@@ -1089,6 +1092,11 @@ def _check_design_photos(groups, rows, srcs, sheet, log_=None):
             log("design", f"Design {num}: đọc legend lỗi, giữ front={g['front']}: {e}"); continue
         photos = [p for p in m["photos"] if p != legend]
         log("design", f"Design {num} = {m['desc']} -> ảnh {photos} (legend {legend}, pick front={g['front']})")
+        try:   # ảnh đầu (sẽ dùng gen) phải qua xác minh so ảnh gốc với legend; trượt hết -> dùng ảnh legend
+            while photos and not judge.same_design(srcs[legend - 1], srcs[photos[0] - 1], num, m["desc"]):
+                log("design", f"Design {num}: ảnh {photos[0]} không phải design này -> bỏ"); photos.pop(0)
+        except StepError as e:   # ảnh chưa xác minh có thể là bộ khác cùng màu -> an toàn hơn: ảnh legend
+            log("design", f"Design {num}: xác minh ảnh lỗi -> dùng ảnh legend: {e}"); photos = []
         # không ảnh riêng nào khớp -> dùng chính ảnh legend (có đủ các design, locate cắt đúng Design N); giữ
         # front của pick thì locate tìm 'Design N' trên ảnh 1 design khác -> không thấy (Athletic Set D1 19/10)
         new = photos[0] if photos else legend
@@ -1927,6 +1935,7 @@ def _selfcheck():
         judge.grid_overlay, judge.locate = orig_go, orig_loc
     # Design N: pick chọn nhầm ảnh -> đổi sang ảnh legend nói đúng; đúng sẵn -> giữ; không legend -> giữ
     judge.find_legend = lambda sheet, n: 8
+    judge.same_design = lambda leg, ph, num, desc: True
     judge.match_design = lambda sheet, leg, num, n, garment="outfit": {"desc": "Olaf", "photos": [2, 8]}
     gD = {"front": 4, "crop": [1, 1, 500, 500], "back": None, "back_crop": None, "mode": "combined",
           "variant": "Design 1", "garment": "top_bottom", "record_ids": ["d"]}
@@ -1942,6 +1951,12 @@ def _selfcheck():
     gL = {**gD, "front": 3, "mode": "two"}
     _check_design_photos([gL], rD[:1], [Path(f"{i}.jpg") for i in range(1, 12)], Path("s.jpg"))
     assert gL["front"] == 8 and gL["crop"] is None and gL["mode"] == "combined" and not gL["design_photo"]
+    # ảnh ứng viên trượt xác minh (khác design, cùng màu) -> bỏ, trượt hết -> ảnh legend
+    judge.match_design = lambda sheet, leg, num, n, garment="outfit": {"desc": "abs", "photos": [3]}
+    judge.same_design = lambda leg, ph, num, desc: False
+    gV = {**gD, "front": 3}
+    _check_design_photos([gV], rD[:1], [Path(f"{i}.jpg") for i in range(1, 12)], Path("s.jpg"))
+    assert gV["front"] == 8 and not gV["design_photo"]
     judge.find_legend = lambda sheet, n: None
     gN = {**gD, "front": 4}
     _check_design_photos([gN], rD[:1], [Path("1.jpg")] * 11, Path("s.jpg"))
@@ -1971,6 +1986,16 @@ def _selfcheck():
     assert _og_image(b"<html>no image</html>", "https://h.io") is None
     assert _og_image(b"<meta content='//c.io/x.png' property='og:image'>", "https://h.io") == "https://c.io/x.png"
     assert _og_image(b'<link href="/y.jpg" rel="image_src">', "https://h.io/a") == "https://h.io/y.jpg"
+    # khuôn Flat Temp: file có tiền tố -> thư mục theo tiền tố; 'front.jpg' trơn -> tên loại cuối SKU
+    dl, o_dl, o_as = [], lb.download_files, fp.ASSETS
+    lb.download_files, fp.ASSETS = (lambda rid, t, dst: dl.append(dst.name)), Path(tempfile.mkdtemp())
+    try:
+        for s_, f_ in [("A-1-Adult Jersey-M-JO1", "front.jpg"), ("B-Loose Sweatpants-L-JO1", "Loose Sweatpants_Back.jpg"),
+                       ("C-Zip Hoodie-L-JO1", "Zip Hoodie_Front.jpg"), ("D-Pajama Set-L-JO1", "Back_Temp.jpg")]:
+            tpl_kind([{"sku": s_, "record_id": "r", "temps": [{"name": f_}]}])
+        assert dl == ["Adult Jersey", "Loose Sweatpants", "Zip Hoodie", "Pajama Set"], dl
+    finally:
+        lb.download_files, fp.ASSETS = o_dl, o_as
     print("batch selfcheck OK")
 
 

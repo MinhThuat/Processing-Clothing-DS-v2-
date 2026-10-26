@@ -363,18 +363,40 @@ Return ONLY {{"legend": <label of that photo, or null>}}"""
 MATCH_DESIGN = """Image 1 is the numbered legend photo: each outfit is marked with a number badge or a label like
 "Design 1". Image 2 is a
 contact sheet of all product photos labelled 1..{n}.
-Find the outfit marked with number {num} in image 1 and describe it in a few words (colours, character).
-Then list the contact-sheet labels whose photo shows THAT SAME outfit ({garment}), best FRONT view
-first (photos showing ONLY that outfit, front+back, are best; group/legend photos last). The SAME print
-design in another size or body (a flat-lay, a KID version, a different model or pose) IS the same outfit.
-Return ONLY {{"desc": "...", "photos": [labels]}} — "photos": [] if none shows it."""
+List EVERY numbered outfit in image 1, left to right: each badge belongs to the person DIRECTLY BELOW it
+(the head right under the badge), not the person beside it; badges often float above heads at different
+heights, so check each one by its horizontal position. For each outfit give a few words (colours, character)
+and the contact-sheet labels whose photo shows THAT SAME outfit ({garment}), best FRONT view first (photos
+showing ONLY that outfit, front+back, are best; group/legend photos last). A single-outfit photo belongs to
+exactly ONE outfit — compare its colours with each description before assigning it. The SAME print design in
+another size or body (a flat-lay, a KID version, a different model or pose) IS the same outfit. Similar colours
+are NOT enough: the photo must show the SAME print and the outfit's distinctive feature (e.g. a printed bare
+chest / faux muscles, a character face, a specific motif); a different print in the same colours is another
+product -> leave it out. When unsure, leave it out (the legend photo itself is used then).
+Return ONLY {{"outfits": [{{"num": 1, "desc": "...", "photos": [labels]}}, ...]}} — "photos": [] if none shows it.
+The customer wants outfit {num}."""
 
 
 def match_design(sheet, legend_src, num, n, garment="outfit"):
     """'Design N' -> {"desc", "photos": [label...]} theo ảnh legend có số (đọc số thật, không đoán)."""
+    # bắt liệt kê CẢ legend trước rồi mới chọn số N: hỏi thẳng 'bộ số N' thì Claude gắn badge cho người bên cạnh
+    # (Jumpsuit Design 5 23/10: badge 5 = bộ đen-tím, lần nào cũng trả bộ đỏ tia sét của badge 4)
     js = ask(MATCH_DESIGN.format(num=num, n=n, garment=garment), [legend_src, sheet])
-    photos = [p for p in map(lambda x: _label(x, n), js.get("photos") or []) if p]
-    return {"desc": str(js.get("desc") or "")[:200], "photos": photos}
+    o = next((o for o in js.get("outfits") or [] if isinstance(o, dict) and str(o.get("num")) == str(num)), js)
+    photos = [p for p in map(lambda x: _label(x, n), o.get("photos") or []) if p]
+    return {"desc": str(o.get("desc") or "")[:200], "photos": photos}
+
+
+SAME_DESIGN = """Image 1 is the numbered legend photo; the customer wants outfit {num} ({desc}). Image 2 is one product
+photo. Does image 2 show THAT SAME outfit — the same print design and its distinctive features (not just similar
+colours or the same garment type)? A different size, body, model, pose or flat-lay of the same print counts as the same.
+Return ONLY {{"same": true|false, "why": "..."}}"""
+
+
+def same_design(legend_src, photo_src, num, desc):
+    """Xác minh 1 ảnh ứng viên đúng là design N (so ẢNH GỐC với legend, không qua contact sheet): match_design hay
+    gán ảnh khác cùng màu (Ugly Sweater Design 3 23/10: lấy áo đỏ tuần lộc thay áo cơ bụng giả)."""
+    return ask(SAME_DESIGN.format(num=num, desc=desc), [legend_src, photo_src]).get("same") is True
 
 
 # 'Design 4' / 'Design #4' / 'Choose design: D4' (bảng DESIGN OPTIONS D1..D10, mặt nạ Jo chapman 20/10)
@@ -443,12 +465,12 @@ def qa(sheet, names, colour, n_refs, flat=False, extra="", asker=None):
 
 # tiêu chí RIÊNG từng loại mảnh (QA chấm 1 mảnh/lần, ảnh lớn) — tiền tố tên mảnh -> yêu cầu
 PIECE_RULES = [
-    # đầm kiểu mới (USER 21/10): tà = chữ nhật trải thẳng, thân = khung vuông phủ kín (uốn/khớp khuôn ở bước xuất)
+    # đầm kiểu mới (USER 21/10): tà = chữ nhật trải thẳng, thân = khung ngang phủ kín (uốn/khớp khuôn ở bước xuất)
     ("ta_", "Dress SKIRT print UNROLLED into a full-bleed RECTANGLE: top edge = waist, bottom edge = hem; the "
             "skirt's bands/motifs in the same order from waist to hem as the reference, bands straight and "
             "horizontal, motifs upright; fills the frame edge to edge (no fan/garment outline needed); only the "
             "skirt's print; no tie/sash/bow; no bodice or waistband."),
-    ("than_", "Dress BODICE print filling the WHOLE square frame edge to edge: the bodice's artwork placed like on "
+    ("than_", "Dress BODICE print filling the WHOLE frame edge to edge: the bodice's artwork placed like on "
               "the real bodice (neckline details at top centre, chest motifs on the chest, waist details at the "
               "bottom) with the base fabric continuing to every edge; no outline, text, person or skirt print."),
     ("ao_", "TORSO panel of the top: only the torso print (no sleeves, hood or cuffs), flat, filling the frame."),
@@ -690,6 +712,9 @@ def _selfcheck():
     globals()["ask"] = lambda prompt, images, timeout=300: {"desc": "Olaf", "photos": [2, "x", 99, 8]}
     try:
         assert match_design(td / "s.jpg", td / "l.jpg", 1, 11) == {"desc": "Olaf", "photos": [2, 8]}
+        globals()["ask"] = lambda prompt, images, timeout=300: {"outfits": [
+            {"num": 4, "desc": "red", "photos": [5]}, {"num": "5", "desc": "lavender", "photos": [4, 1]}]}
+        assert match_design(td / "s.jpg", td / "l.jpg", 5, 11) == {"desc": "lavender", "photos": [4, 1]}   # lấy đúng bộ N
         globals()["ask"] = lambda prompt, images, timeout=300: {"legend": 15}
         assert find_legend(td / "s.jpg", 11) is None
         globals()["ask"] = lambda prompt, images, timeout=300: {"legend": 8}

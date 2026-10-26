@@ -141,7 +141,8 @@ SHAPE_BODICE = (" Shape: a sleeveless bodice tank panel like the second referenc
 SHAPE_FAN = (" Shape: a wide quarter-circle CIRCLE-SKIRT fan panel spread flat like the second "
              "reference (shape guide). Every band follows the curved arc, parallel to the curved hem.")
 # ĐẦM KIỂU MỚI (USER 21/10): tà = tấm hoạ tiết CHỮ NHẬT "trải thẳng" (trên = eo, dưới = gấu) — export_piece uốn
-# theo khuôn assets/Vay Ao/Skirt.jpg ra NGUYÊN khung 9000x4700; thân = khung vuông phủ kín, khớp khuôn Vay Ao/Bodice.jpg.
+# theo khuôn tà assets/Skater Dress ra NGUYÊN khung 9000x4700; thân = khung ngang phủ kín, khớp khuôn thân trước/sau assets/Skater Dress
+# (USER 22/10: khuôn Skater Dress_CC — thân trước/sau tách riêng 4800x3500).
 SKIRT_RECT = (
     "Flat textile PRINT of the {label} as one wide RECTANGLE for printing: the TOP edge is the waistline, the "
     "BOTTOM edge is the hem. Reproduce the skirt's printed artwork EXACTLY as in the reference crop (colours, "
@@ -151,7 +152,7 @@ SKIRT_RECT = (
     "folds, shadows or perspective; NO garment outline, NO bodice or waistband, NO person, NO background. Fill "
     "the whole frame edge to edge.")
 BODICE_TPL = (
-    "Flat textile PRINT for the {label}, filling the ENTIRE square frame edge to edge. The SECOND reference is "
+    "Flat textile PRINT for the {label}, filling the ENTIRE frame edge to edge. The SECOND reference is "
     "the sewing pattern: the white outline shows where this panel will be cut (neckline scoop at top centre, "
     "straps at the top corners, armholes at the sides, waist seam along the bottom). Place the bodice's printed "
     "artwork from the FIRST reference (a crop of the real bodice) so it sits INSIDE that outline at the same "
@@ -173,7 +174,10 @@ CLOTH_TPL = {
     "jumpsuit": {"bo_truoc": "Jumpsuit/Temp-Jumpsuit.jpg", "bo_sau": "Jumpsuit/Temp-Jumpsuit.jpg",
                  "tay": "Jumpsuit/Temp-Sleeve.jpg", "mu": "Jumpsuit/Temp-Hood.jpg"},
 }
-SKIRT_TPL, BODICE_TPL_IMG = ASSETS / "Vay Ao" / "Skirt.jpg", ASSETS / "Vay Ao" / "Bodice.jpg"
+SKIRT_TPL = ASSETS / "Skater Dress" / "Skater Dress_CC_Skirt.jpg"
+BODICE_TPL_IMG = {"truoc": ASSETS / "Skater Dress" / "Skater Dress_CC_Shirt_Front.jpg",
+                  "sau": ASSETS / "Skater Dress" / "Skater Dress_CC_Shirt_Back.jpg"}
+BODICE_GEN = (1536, 1024)   # khổ codex gen thân đầm (khuôn thân ngang)
 SKI_TPL = ASSETS / "Funny Face Ski Mask" / "Front.png"   # tấm in 4380x2892, lỗ mắt = vùng trong suốt
 CLOTH_PROMPT = (
     "Flat textile PRINT for the {label}, filling the ENTIRE frame edge to edge. The SECOND reference is the sewing "
@@ -249,27 +253,27 @@ def cloth_tpl(slug, kind=None):
 
 CLOTH_GEN = (1024, 1536)   # khổ codex gen mảnh có khuôn (khuôn đều dọc)
 
-def _tpl_box(path):
-    """Khuôn (W,H) đặt giữa khổ CLOTH_GEN -> hộp (x0,y0,x1,y1) của khuôn trong khung CLOTH_GEN."""
-    W, H = Image.open(path).size; gw, gh = CLOTH_GEN
+def _tpl_box(path, gen=CLOTH_GEN):
+    """Khuôn (W,H) đặt giữa khổ gen -> hộp (x0,y0,x1,y1) của khuôn trong khung gen."""
+    W, H = Image.open(path).size; gw, gh = gen
     k = min(gw / W, gh / H); w, h = round(W * k), round(H * k)
     return (gw - w) // 2, (gh - h) // 2, (gw - w) // 2 + w, (gh - h) // 2 + h
 
-def _tpl_ref(path):
+def _tpl_ref(path, gen=CLOTH_GEN):
     """Khuôn thu nhỏ, CHÈN nền cho đủ khổ CLOTH_GEN (codex chỉ gen 1024x1536) -> ảnh gen cắt lại đúng hộp khuôn
     (_tpl_box), không kéo méo (lỗi 21/10: codex 'auto' trả ngang 1448x1086 rồi kéo sang khuôn dọc 4500x5450)."""
-    out = CACHE / "small" / f"{path.parent.name}_{path.name}"
+    out = CACHE / "small" / f"{path.parent.name}_{gen[0]}x{gen[1]}_{path.name}"   # 1 khuôn có thể dùng cả khổ dọc lẫn ngang
     with _TPL_LOCK:
         if not out.exists():
             out.parent.mkdir(parents=True, exist_ok=True)
-            im = Image.open(path).convert("RGB"); x0, y0, x1, y1 = _tpl_box(path)
-            canvas = Image.new("RGB", CLOTH_GEN, im.getpixel((5, 5)))
+            im = Image.open(path).convert("RGB"); x0, y0, x1, y1 = _tpl_box(path, gen)
+            canvas = Image.new("RGB", gen, im.getpixel((5, 5)))
             canvas.paste(im.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0)); canvas.save(out)
     return out
 
 _DRESS_LABEL = {"ta_truoc": "FRONT skirt panel", "ta_sau": "BACK skirt panel",
                 "than_truoc": "FRONT bodice panel of a dress", "than_sau": "BACK bodice panel of a dress"}
-SKIRT_SIZE, BODICE_SIZE = (9000, 4700), (3500, 3500)   # cỡ file xuất (USER 21/10)
+SKIRT_SIZE, BODICE_SIZE = (9000, 4700), (4800, 3500)   # cỡ file xuất = cỡ khuôn (USER 22/10)
 
 # tà váy: bỏ dây/nơ/sash thắt lủng lẳng (USER: mảnh tà không có dây thừa) — xoá khỏi desc + nhắc CUỐI prompt
 NO_TIES = (" IMPORTANT: draw ONLY the flat skirt fabric panel. NO tie, sash, knot, bow, ribbon, string, "
@@ -742,11 +746,12 @@ def _make_piece(spec, refs, work, out, flat=False):
             head, tail = SKIRT_RECT.format(label=label), " Print: " + _strip_ties(spec["desc"]) + NO_TIES
             gen_panel(head + note + tail, [crop or ref, *ctx], dst, oa=(head + oa_note + tail, [crop or ref]),
                       size="1536x1024")
-        else:                                    # thân: khung vuông phủ kín, hoạ tiết đặt theo khuôn thân
-            tpl = _tpl_small()
+        else:                                    # thân: khung ngang phủ kín, hoạ tiết đặt theo khuôn thân trước/sau
+            path = BODICE_TPL_IMG[spec["slug"].rsplit("_", 1)[-1]]; tpl = _tpl_ref(path, BODICE_GEN)
             head, tail = BODICE_TPL.format(label=label), " Print: " + spec["desc"]
             gen_panel(head + note + tail, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note + tail, [crop or ref, tpl]),
-                      size="2048x2048")
+                      size="x".join(map(str, BODICE_GEN)))
+            Image.open(dst).convert("RGB").resize(BODICE_GEN, Image.LANCZOS).crop(_tpl_box(path, BODICE_GEN)).save(dst)
         _flatten_white(dst)
     elif cloth_tpl(spec["slug"]):                # mảnh có khuôn thật: gen như thân đầm
         tpl = _tpl_ref(cloth_tpl(spec["slug"]))
@@ -949,18 +954,9 @@ def gen_panel(prompt, refs, out, oa=None, size="auto"):
 _TPL_LOCK = threading.Lock()
 _WARP_LOCK = threading.Lock()   # ponytail: 1 lần uốn 9000x4700 ~3GB RAM -> uốn tuần tự; tách theo dải hàng nếu cần song song
 
-def _tpl_small():
-    """Khuôn thân đầm thu nhỏ 1024 làm ref cho model (file gốc 3500px quá nặng để gửi)."""
-    out = CACHE / "bodice_1024.png"
-    with _TPL_LOCK:
-        if not out.exists():
-            out.parent.mkdir(parents=True, exist_ok=True)
-            Image.open(BODICE_TPL_IMG).convert("RGB").resize((1024, 1024)).save(out)
-    return out
-
 def _skirt_mask():
-    """Mặt nạ trong khuôn tà (Vay Ao/Skirt.jpg, viền trắng trên nền đều màu) -> bool HxW, cache .npy."""
-    cache = CACHE / "skirt_mask.npy"
+    """Mặt nạ trong khuôn tà (SKIRT_TPL, viền trắng trên nền đều màu) -> bool HxW, cache .npy theo tên khuôn."""
+    cache = CACHE / f"skirt_mask_{SKIRT_TPL.stem}.npy"
     with _TPL_LOCK:
         if cache.exists():
             return np.load(cache)
@@ -1472,7 +1468,10 @@ def _selfcheck():
     assert kind_of("BQT250926A04-Skater Dress") is None and kind_of("") is None
     assert cloth_tpl("tay_trai_sau_phang", "hoodie") == ASSETS / "3D Hoodie" / "Sleeve.jpg"
     assert cloth_tpl("quan_truoc", "jogger").name == "3D Jogger.jpg" and cloth_tpl("quan_truoc", "hoodie") is None
-    assert SKIRT_TPL.exists() and BODICE_TPL_IMG.exists()
+    assert SKIRT_TPL.exists() and all(f.exists() for f in BODICE_TPL_IMG.values())
+    for f in BODICE_TPL_IMG.values():            # thân đầm gen ngang cắt lại đúng tỉ lệ khuôn, xuất đúng cỡ khuôn
+        (W, H), (x0, y0, x1, y1) = Image.open(f).size, _tpl_box(f, BODICE_GEN)
+        assert abs((x1 - x0) / (y1 - y0) - W / H) < .01 and (W, H) == BODICE_SIZE, f
     assert cloth_tpl("ao_truoc", None) is None and all((TPL_DIR / f).exists() for m in CLOTH_TPL.values() for f in m.values())
     for m in CLOTH_TPL.values():                 # gen 1024x1536 cắt lại đúng tỉ lệ khuôn (không méo)
         for f in m.values():
