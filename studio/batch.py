@@ -1056,11 +1056,35 @@ def _needs_locate(group, front_counts, custom=""):
     return front_counts[group["front"]] > 1 or group["crop"] is not None or bool(custom)
 
 
+# dòng Name Custom chỉ là CÁ NHÂN HOÁ (in tên, tone da, chữ...) -> không chọn biến thể, không tìm được trên ảnh
+# (Ugly Sweater 'Enter Name: Jerry · Skin Tone: Tone 2' 23-25/10: locate tìm 'Jerry' không thấy -> loại 3 đêm liền)
+# CHỈ khoá rõ là cá nhân hoá ('Enter Name', 'Your Text', 'Skin Tone'...); 'Character Name', 'Jersey Number',
+# 'Choose Font' có thể là biến thể -> giữ (codex review 26/10)
+_PERSONAL = re.compile(r"\b(enter|your|add|type|custom|personali[sz]ed?)\b.*\b(names?|text|message|initials?|age|photo)\b"
+                       r"|\bskin\b|\bskin[- ]?tone\b|\bmonogram\b|^\s*(names?|tên|initials?)\s*$", re.I)
+
+
+_ATTR_KEY = re.compile(r"\b(font|colou?r|style|design|size|version|option)\b", re.I)
+
+
+def _is_personal(key):
+    """Khoá trường là nhập nội dung cá nhân hoá? 'Custom Text Color' / 'Your Text Font' = chọn thuộc tính -> không."""
+    return bool(_PERSONAL.search(key)) and not (_ATTR_KEY.search(key) and not re.search(r"skin", key, re.I))
+
+
+def variant_custom(custom):
+    """Name Custom -> chỉ các trường chọn biến thể (bỏ trường cá nhân hoá theo khoá trước ':'). Tách theo dòng,
+    '·', '|', ';' (nhiều trường chung 1 dòng)."""
+    keep = [f.strip(" •-") for f in re.split(r"[\n·|;](?=\s*[•-]?\s*[^:·|;\n]{1,40}:)", custom or "")   # chỉ tách trước 'Khoá:' mới
+            if f.strip(" •-") and _is_personal(f.strip(" •-").split(":", 1)[0]) is False]
+    return "\n".join(keep)
+
+
 def _variant_label(group, sub_rows):
     """Nhãn biến thể đưa cho locate: variant của judge, hoặc Name Custom khi judge để 'default'."""
     if group["variant"] and group["variant"] != "default":
         return group["variant"]
-    return "; ".join(sorted({r["custom"] for r in sub_rows if r.get("custom")})) or group["variant"]
+    return "; ".join(sorted({variant_custom(r.get("custom")) for r in sub_rows} - {""})) or group["variant"]
 
 
 LOCATE_TRIES = 3
@@ -1120,7 +1144,7 @@ def _locate_groups(groups, rows, srcs, gdir):
     grids = {}
     for group in groups:
         sub_rows = [r for r in rows if r["record_id"] in group["record_ids"]]
-        custom = "; ".join(r.get("custom", "") for r in sub_rows if r.get("custom"))
+        custom = "; ".join(c for c in (variant_custom(r.get("custom")) for r in sub_rows) if c)
         if not _needs_locate(group, front_counts, custom):
             continue
         front = group["front"]
@@ -1996,6 +2020,16 @@ def _selfcheck():
         assert dl == ["Adult Jersey", "Loose Sweatpants", "Zip Hoodie", "Pajama Set"], dl
     finally:
         lb.download_files, fp.ASSETS = o_dl, o_as
+    # Name Custom cá nhân hoá (tên, tone da) không phải chọn biến thể; 'Design N' / 'Color' thì giữ
+    assert variant_custom("• Enter Name: Jerry\n• Choose Skin Tone Color: Tone 2") == ""
+    assert variant_custom("• Design: Design 3") == "Design: Design 3"
+    assert variant_custom("• Choose Color: Red\n• Your Text: Hi") == "Choose Color: Red"
+    assert variant_custom("Enter Name: Jerry · Choose Design: Design 3") == "Choose Design: Design 3"
+    assert variant_custom("• Your Text: Happy Birthday\nJerry\n• Choose Color: Red") == "Choose Color: Red"
+    assert variant_custom("• Your Text: Hello; Jerry\n• Custom Text Color: Red\n• Your Text Font: Arial") == \
+        "Custom Text Color: Red\nYour Text Font: Arial"
+    assert variant_custom("• Character Name: Mickey\n• Choose Jersey Number: 10\n• Name: Bo") == \
+        "Character Name: Mickey\nChoose Jersey Number: 10"
     print("batch selfcheck OK")
 
 
