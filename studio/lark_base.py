@@ -166,9 +166,16 @@ def download_files(rid, files, dst):
 
 
 def upload_files(rid, files):
-    """Up nhiều file vào Flat Pieces của 1 dòng trong 1 lệnh (lark-cli nối thêm, không thay)."""
-    args, cwd = _upload_args(rid, files)
-    _cli(args, timeout=900, cwd=str(cwd.resolve()))
+    """Up file vào Flat Pieces của 1 dòng (lark-cli nối thêm, không thay), MỖI FILE 1 LỆNH: bộ Hoodie+Jogger
+    16 file/278MB dồn 1 lệnh vượt 900s (26/10, NTD081026A04 không lên Base). Lỗi giữa chừng -> caller dọn file dở."""
+    for f in files:
+        args, cwd = _upload_args(rid, [f])
+        try:
+            _cli(args, timeout=900, cwd=str(cwd.resolve()))
+        except StepError:       # Lark hay timeout tạm (request_timeout=3000ms, 27/10) -> thử lại 1 lần
+            # timeout có thể xảy ra SAU khi file đã nối vào Base -> đối soát trước, tránh up trùng (codex 29/10)
+            if Path(f).name not in {a.get("name") for a in get_row(rid)["pieces"]}:
+                _cli(args, timeout=900, cwd=str(cwd.resolve()))
 
 
 def remove_files(rid, tokens):

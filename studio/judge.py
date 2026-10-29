@@ -283,6 +283,10 @@ OWN inputs for a flat sewing-pattern generator:
    labelled "Hoodie / Zip Hoodie / Joggers" or "FRONT / BACK" on a pastel background) when any photo shows
    the actual printed design — those only illustrate the cut/style. A clean flat image is preferred ONLY
    if it shows the same artwork as the design photos.
+   Store INFOGRAPHICS (PRODUCT DETAILS / material / FEEDBACK / reviews / size chart / shipping notice) are
+   shared across the shop's listings and often show a DIFFERENT product as a sample: NEVER take the garment
+   in such a graphic as this listing's design unless its artwork matches the listing's main lifestyle /
+   hero photos (the design most other photos show).
  - "back": label of a photo of the real BACK of the SAME variant, or null.
  - "mode": "two" if back is a separate photo; "combined" if the chosen front photo itself shows that
    variant's front and back side by side (then back = null); otherwise "infer".

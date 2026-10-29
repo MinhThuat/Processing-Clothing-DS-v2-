@@ -540,7 +540,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
     def pipe(args):
         left = deadline - time.monotonic()
         if left <= 0:
-            raise StepError("quá thời gian", "nhóm > 45 phút")
+            raise StepError("quá thời gian", f"nhóm > {GROUP_TIMEOUT // 60} phút")
         extra = ((["--color", color] if color else []) + (["--hint", ctx["hint"]] if ctx["hint"] else [])
                  + ["--garment", group["garment"]] + (["--kind", kind] if kind else []))
         return run_pipe(args + extra, sdir / f"pipe_{next(pipe_no):02d}.log", left)
@@ -736,7 +736,7 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
 
     def gen_flat(todo):
         if time.monotonic() > deadline:
-            raise StepError("quá thời gian", "nhóm > 60 phút")
+            raise StepError("quá thời gian", f"nhóm > {GROUP_TIMEOUT // 60} phút")
         for x in todo:
             gen_flat_one(x)
 
