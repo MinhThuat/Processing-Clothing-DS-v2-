@@ -25,6 +25,7 @@ class StepError(RuntimeError):
 QUOTA_RE = re.compile(
     r"HTTP 429|usage[_ ]limit|rate[_ ]limit|too many requests|quota|out of credits"
     r"|insufficient (credits|balance)|credit balance", re.I)
+CODEX_QUOTA_RE = re.compile(r"HTTP 429|usage[_ ]limit|rate[_ ]limit|too many requests", re.I)
 AUTH_RE = re.compile(
     r"token refresh failed|access token expired|refresh token expired|HTTP 401|\bunauthori[sz]ed"
     r"|run `?codex login|codex chưa đăng nhập|need_user_authorization|not logged in"
@@ -41,6 +42,10 @@ def raise_for(text, kind):
     t = (text or "").strip()
     if AUTH_RE.search(t):
         raise AuthError(t[-300:])
+    # codex từ chối riêng ảnh này ("no image returned", vd nhân vật bản quyền) -> lỗi của nhóm, KHÔNG chờ quota
+    # dù OpenArt fallback báo hết credit (chờ 30' không giúp gì; Muppet 2/11). codex 429/usage limit vẫn là quota.
+    if "no image returned" in t and not CODEX_QUOTA_RE.search(t):
+        raise StepError(kind, t[-300:])
     if QUOTA_RE.search(t):
         raise QuotaError(t[-300:])
     raise StepError(kind, t[-300:])
@@ -62,6 +67,9 @@ def _selfcheck():
     assert kind_of("[vision   ] lỗi codex: codex chưa đăng nhập") == "auth"
     assert kind_of("RuntimeError: openart không tạo file") == "gen"
     assert kind_of("") == "gen"
+    assert kind_of("codex: no image returned (image_status=failed; model_text='')\nopenart: Insufficient credit balance") == "gen"
+    assert kind_of("codex: no image returned (image_status=-; model_text='I can't')\nopenart: Insufficient credit balance") == "gen"
+    assert kind_of("codex: HTTP 429 usage_limit_reached no image returned\nopenart: Insufficient credit balance") == "quota"
     e = StepError("tải ảnh", "x")
     assert e.kind == "tải ảnh" and "x" in str(e)
     # AUTH_HARD_RE: muốn lỗi chắc chắn, không HTTP 5xx (tạm thời)

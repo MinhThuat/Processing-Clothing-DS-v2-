@@ -413,16 +413,8 @@ def run_pipe(args, logf, timeout, cmd=None):
     if _piece_quota(logtxt):
         raise QuotaError("hết hạn mức gen giữa chừng — xem " + str(logf))
     if p.returncode != 0:
-        _raise_gen((stderr or "")[-2000:])
+        raise_for((stderr or "")[-2000:], "gen")
     return logtxt
-
-
-def _raise_gen(err):
-    """codex từ chối riêng ảnh này (image_status=failed, vd nhân vật bản quyền) -> lỗi gen của nhóm, sang nhóm
-    sau; KHÔNG coi là hết hạn mức dù OpenArt fallback báo hết credit (chờ 30' không giúp gì; Muppet 2/11)."""
-    if "image_status=failed" in err and not AUTH_RE.search(err) and not re.search(r"HTTP 429|usage[_ ]limit", err):
-        raise StepError("gen", err[-300:])
-    raise_for(err, "gen")
 
 
 def _piece_quota(logtxt):
@@ -1573,13 +1565,6 @@ def _selfcheck():
     finally:
         Path.exists = orig_exists
     lk6.unlink()
-    # _raise_gen: codex từ chối ảnh + OpenArt hết credit -> StepError gen (không chờ quota); codex 429 -> vẫn quota
-    for txt, want in (("no image returned (image_status=failed) ... error: Insufficient credit balance", StepError),
-                      ("HTTP 429 usage_limit_reached ... error: Insufficient credit balance", QuotaError)):
-        try:
-            _raise_gen(txt); raise AssertionError("phải raise")
-        except (StepError, QuotaError) as e:
-            assert type(e) is want, (txt, e)
     # _piece_quota: chỉ tính dòng "✗ mảnh ..." khớp QUOTA_RE
     assert _piece_quota("[gen] ✗ mảnh ao_sau lỗi: HTTP 429 usage_limit") is True
     assert _piece_quota("[vision] lỗi codex: HTTP 429") is False
