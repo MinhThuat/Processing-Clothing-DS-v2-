@@ -40,6 +40,8 @@ _LOGF = None
 MAX_ATTEMPTS = 3         # gen lại: lần 1 y nguyên, lần 2-3 có hint + chọn lại ảnh/crop
 FLAT_MAX_ATTEMPTS = 2    # bản phẳng: lần gen lại thứ 3 chỉ cứu 1/44 mảnh (log 15-20/10) -> bỏ
 BAD_SCORE = 3            # --fix-bad (cron tối, sau batch): mảnh _QAFAIL điểm QA tốt nhất <= mức này -> gen lại
+GEN_FAIL_MAX = 2         # USER 3/11: 1 mảnh gen lỗi (codex từ chối...) 2 lần -> bỏ trống, làm tiếp mảnh khác, ghi note
+GEN_SKIP = "bo_trong"    # mã lỗi của mảnh bị bỏ trống (note_fail ghi riêng "BỎ TRỐNG")
 HINT_FROM = 2            # lần bắt đầu dùng hint (lần y nguyên thứ 2 gần như không cứu được mảnh nào)
 SAME_ERR_STOP = 5        # 5 nhóm liên tiếp lỗi cùng kiểu -> dừng đợt
 _SIZE = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|\d{1,2}XL|\d{1,2}T|\d{1,2}Y|\d{1,2}-\d{1,2}Y?"
@@ -123,8 +125,12 @@ def note_ok(day, n_pieces, regen):
 
 
 def note_fail(day, fails):
-    body = " · ".join(f"{k} ({','.join(v) or '?'})" for k, v in sorted(fails.items()))
-    return f"QA FAIL {day} · {body} sau {MAX_ATTEMPTS} lần"
+    skip = sorted(k for k, v in fails.items() if v == [GEN_SKIP])
+    rest = {k: v for k, v in fails.items() if k not in skip}
+    parts = ([" · ".join(f"{k} ({','.join(v) or '?'})" for k, v in sorted(rest.items()))
+              + f" sau {MAX_ATTEMPTS} lần"] if rest else []) \
+        + ([f"BỎ TRỐNG {', '.join(skip)} (gen lỗi/codex từ chối {GEN_FAIL_MAX} lần)"] if skip else [])
+    return f"QA FAIL {day} · " + " · ".join(parts)
 
 
 # ---------- điều kiện dừng ----------
@@ -185,8 +191,8 @@ def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn, on_final=None, max_attem
       keep_fn(name, attempt)                       lưu bản hiện tại để chọn bản tốt nhất
       on_final(name, attempt)                      (tuỳ chọn) mảnh đã chốt (đạt / hết lượt), attempt = bản được chọn
     -> best {name: (attempt, score)}, fails {name: errors} (vẫn lỗi), regen {name: số lần gen lại}."""
-    best, last, regen = {}, {}, {}
-    todo, hint = list(names), None
+    best, last, regen, gen_err = {}, {}, {}, Counter()
+    todo, hint, skipped = list(names), None, []
     for attempt in range(max_attempts + 1):
         if attempt:
             if attempt == HINT_FROM:
@@ -207,13 +213,22 @@ def improve(names, qa_fn, regen_fn, rehint_fn, keep_fn, on_final=None, max_attem
             else:
                 if n not in best or r["score"] > best[n][1]:
                     best[n] = (attempt, r["score"])
+                gen_err[n] += "gen_loi" in r["errors"]
+                if gen_err[n] >= GEN_FAIL_MAX:          # gen lỗi 2 lần -> bỏ trống, không gen lại nữa
+                    log("regen", f"{n}: gen lỗi {gen_err[n]} lần -> bỏ trống, làm tiếp mảnh khác")
+                    # chưa lần nào ra file -> trống thật; có bản cũ (điểm >= 0) -> giữ bản đó như QA FAIL thường
+                    last[n] = {**r, "errors": [GEN_SKIP] if best[n][1] < 0 else r["errors"]}
+                    skipped.append(n)
+                    if on_final:
+                        on_final(n, best[n][0])
+                    continue
                 nxt.append(n)
         todo = nxt
         if not todo:
             break
     for n in todo if on_final else ():
         on_final(n, best[n][0])
-    return best, {n: last[n]["errors"] for n in todo}, regen
+    return best, {n: last[n]["errors"] for n in todo + skipped}, regen
 
 
 # ---------- log + báo Lark ----------
@@ -747,6 +762,8 @@ def process_subgroup(group, rows, pick, srcs, sdir, day, dry, deadline, done_ids
         gen_flat(todo)
 
     def flat_chain(name):
+        if not refs[name].exists():     # mảnh 3D bỏ trống (gen lỗi) -> bản phẳng cũng trống, không gen
+            return {name: (0, -1.0)}, {name: [GEN_SKIP]}, {}   # best giả: export() thấy không có file -> bỏ qua
         gen_flat([name])
         return improve([name], make_qa(flat_path, flat=True), regen_flat, lambda fails_: None,
                        make_keep(flat_path), max_attempts=FLAT_MAX_ATTEMPTS)
@@ -1519,6 +1536,15 @@ def _selfcheck():
     tries.clear(); calls["regen"].clear()
     _, fails2, regen2 = improve(["C"], qa_fn, regen_fn, lambda f: None, keep_fn, max_attempts=FLAT_MAX_ATTEMPTS)
     assert regen2 == {"C": 2} and len(calls["regen"]) == 2 and fails2 == {"C": ["mo_nhoe"]}
+    # mảnh gen lỗi (-1, gen_loi) 2 lần -> bỏ trống ngay sau lần 1, không gen lại nữa; mảnh khác làm tiếp
+    def qa_dead(todo):
+        return {n: ({"ok": False, "score": -1.0, "errors": ["gen_loi"]} if n == "D"
+                    else {"ok": False, "score": 4, "errors": ["mo_nhoe"]}) for n in todo}
+    calls["regen"].clear(); fin = []
+    _, f3, r3 = improve(["C", "D"], qa_dead, regen_fn, lambda f: None, keep_fn, on_final=lambda n, a: fin.append(n))
+    assert f3 == {"C": ["mo_nhoe"], "D": [GEN_SKIP]} and r3 == {"C": 3, "D": 1}, (f3, r3)
+    assert [t for t, _, _ in calls["regen"]] == [("C", "D"), ("C",), ("C",)] and sorted(fin) == ["C", "D"]
+    assert note_fail("d", f3) == "QA FAIL d · C (mo_nhoe) sau 3 lần · BỎ TRỐNG D (gen lỗi/codex từ chối 2 lần)"
     # crop theo bbox 0-1000; bbox quá nhỏ/None -> giữ nguyên ảnh
     import tempfile
     from PIL import Image as _I
