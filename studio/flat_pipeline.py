@@ -807,7 +807,10 @@ def _bin(name):
         if b.exists():
             return str(b)
     return name
-CHATGPT_BIN = _bin("chatgpt-imagegen")
+CHATGPT_BIN = _bin("chatgpt-imagegen")   # chỉ còn dùng cho _codex_vision (nạp như module)
+# gen = Codex CLI chính thức (`codex exec` + tool vẽ của Codex); bản gọi thẳng endpoint bị backend chặn 5/11
+# ("Complexity 'low' is not supported for this image model")
+CODEX_IMG_BIN = _bin("codex-imagegen")
 # codex chỉ dùng tài khoản `codex login` mặc định (USER 21/10: bỏ hẳn tài khoản 2).
 # codex "overloaded" -> chờ 30-60s (ngẫu nhiên: các luồng không cùng dội lại 1 lúc), báo Lark, gen
 # tiếp bằng codex; tối đa OVERLOAD_ROUNDS vòng rồi mới xuống OpenArt (USER 19/10; quá tải chỉ thoáng qua:
@@ -889,8 +892,9 @@ def _chatgpt_gen(prompt, refs, out, timeout=420, size="auto"):
     # nhầm vùng vải trơn là trong suốt + vẽ viền tối loang (vignette) ở đó (lỗi thật: Jogger tay_truoc 16/10)
     tmp = Path(out).with_name(Path(out).stem + "_gen.jpg")
     tmp.unlink(missing_ok=True)
-    cmd = _launcher(CHATGPT_BIN) + [CHATGPT_BIN, prompt, "-o", str(tmp), "--size", size,
-           "--backend", "codex", "--quiet", "--format", "jpeg"]
+    # --timeout < timeout của _run: wrapper tự dừng `codex exec` con, không để tiến trình mồ côi
+    cmd = _launcher(CODEX_IMG_BIN) + [CODEX_IMG_BIN, prompt, "-o", str(tmp), "--size", size,
+           "--quiet", "--timeout", str(timeout - 20)]
     for r in refs:
         cmd += ["-i", str(r)]
     _with_codex(lambda: _run(cmd, timeout))

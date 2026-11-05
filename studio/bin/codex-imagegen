@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Drop-in thay chatgpt-imagegen: cho Codex CLI chính thức tự gen ảnh (tool image_gen),
+rồi copy ảnh từ ~/.codex/generated_images/<thread_id>/ sang -o, xong thì xoá ảnh gốc + session của thread đó.
+Bật/tắt bằng ./imagegen-switch.sh codex|cli. Dùng model gpt-5.6-sol (reasoning low) như bản cũ, ép Codex đưa prompt nguyên văn cho tool vẽ.
+Các cờ khác của bản cũ (--backend, --format, --no-progress...) được chấp nhận và bỏ qua."""
+import argparse, json, os, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
+
+GEN = Path.home() / ".codex" / "generated_images"
+
+p = argparse.ArgumentParser()
+p.add_argument("prompt")
+p.add_argument("-o", "--out")
+p.add_argument("-i", "--ref", action="append", default=[])
+p.add_argument("--size", default="1024x1024")
+p.add_argument("--timeout", type=int, default=600)
+p.add_argument("--quiet", action="store_true")
+p.add_argument("--model", default=os.environ.get("CHATGPT_IMAGEGEN_MODEL", "gpt-5.6-sol"))  # cùng model bản cũ
+args, _ignored = p.parse_known_args()  # --backend/--model/--format/--no-progress... không dùng
+
+out = Path(args.out or f"assets/generated/codex-{int(time.time())}.png")
+refs = [os.path.abspath(r) for r in args.ref if r]  # absolute vì codex chạy ở cwd khác
+for r in refs:
+    if not Path(r).is_file():
+        sys.exit(f"ref not found: {r}")
+
+# prompt gửi cho tool vẽ = đúng câu bản cũ (_build_user_text) đưa cho model, không để Codex viết lại
+img_prompt = (
+    ("Edit the attached reference image(s). Treat the reference as the canonical subject — reproduce "
+     "its exact pattern, colours, and texture faithfully; do not redesign or stylise the subject itself. "
+     f"Request: {args.prompt}." if refs else f"Request: {args.prompt}.")
+    + (f" Size: {args.size}." if args.size and args.size != "auto" else "")
+)
+instr = (
+    "Call your image generation tool exactly ONCE, then stop. Do not run shell commands, write code or edit files. "
+    + ("Pass the attached image(s) to the tool as the reference(s) to edit. " if refs else "")
+    + "Set the tool's prompt argument to the text between <<<PROMPT and PROMPT>>> copied VERBATIM, "
+    "character for character: do not rephrase, expand, shorten, translate or add any words. "
+    "Generation takes 30-120 s: run the call with yield_time_ms 300000 and WAIT until the image is fully "
+    "generated and saved; if it is still running, keep waiting on it. Never end your turn before the image exists.\n"
+    f"<<<PROMPT\n{img_prompt}\nPROMPT>>>"
+)
+# cwd trung tính: không nạp AGENTS.md của thư mục đang đứng
+cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only", "-C", tempfile.gettempdir(),
+       "-m", args.model, "-c", 'model_reasoning_effort="low"']
+for r in refs:
+    cmd += ["-i", r]
+cmd += ["--", instr]
+
+t0 = time.time()
+try:
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, stdin=subprocess.DEVNULL)
+except subprocess.TimeoutExpired:
+    sys.exit(f"codex exec timeout after {args.timeout}s")
+
+thread = None
+for line in res.stdout.splitlines():
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    thread = thread or ev.get("thread_id") or (ev.get("msg") or {}).get("thread_id")
+
+# ảnh của đúng thread này (an toàn khi chạy song song); không có thread_id thì lấy ảnh mới nhất sau t0
+cands = list((GEN / thread).glob("*")) if thread else [f for f in GEN.glob("*/*") if f.stat().st_mtime >= t0]
+cands = [f for f in cands if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
+if not cands:
+    sys.stderr.write(res.stdout[-2000:] + res.stderr[-2000:])
+    sys.exit("codex did not produce an image")
+src = max(cands, key=lambda f: f.stat().st_mtime)
+
+out.parent.mkdir(parents=True, exist_ok=True)
+if out.suffix.lower() == src.suffix.lower():
+    shutil.copyfile(src, out)
+else:
+    from PIL import Image
+    im = Image.open(src)
+    if out.suffix.lower() in (".jpg", ".jpeg"):
+        im = im.convert("RGB")
+    im.save(out, quality=95)
+
+# copy xong → xoá ảnh gốc + file session của đúng thread này (~11 MB/ảnh). Lỗi thì giữ lại để debug.
+if thread and out.is_file() and out.stat().st_size > 0:
+    shutil.rmtree(GEN / thread, ignore_errors=True)
+    for f in (GEN.parent / "sessions").glob(f"*/*/*/rollout-*-{thread}.jsonl"):
+        f.unlink(missing_ok=True)
+
+print(out if args.quiet else f"saved: {out}  ({out.stat().st_size:,} bytes)  via codex exec, {time.time()-t0:.0f}s")

@@ -562,8 +562,8 @@ def _build_payload(
         "tool_choice": tool_choice,
         "parallel_tool_calls": False,
         "store": False,
-        "reasoning": {"effort": "low", "summary": "auto"},
-        "include": ["reasoning.encrypted_content"],
+        # ponytail: bỏ "reasoning" — từ 5/11 backend báo "Complexity 'low|medium|high' is not supported for
+        # this image model" với mọi effort; không gửi thì gen bình thường
         "text": {"verbosity": "low"},
     }
 
