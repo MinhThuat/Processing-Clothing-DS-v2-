@@ -40,8 +40,19 @@ instr = (
     "generated and saved; if it is still running, keep waiting on it. Never end your turn before the image exists.\n"
     f"<<<PROMPT\n{img_prompt}\nPROMPT>>>"
 )
+def codex_launcher():
+    """Windows: npm cài codex dạng shim codex.cmd — subprocess (shell=False) không tự chạy được, và truyền prompt
+    dài có ngoặc qua .cmd không an toàn -> chạy thẳng `node <npm>/node_modules/@openai/codex/bin/codex.js`."""
+    exe = shutil.which("codex") or "codex"
+    if sys.platform == "win32" and exe.lower().endswith((".cmd", ".bat")):
+        js = Path(exe).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        node = shutil.which("node")
+        if js.is_file() and node:
+            return [node, str(js)]
+    return [exe]
+
 # cwd trung tính: không nạp AGENTS.md của thư mục đang đứng
-cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only", "-C", tempfile.gettempdir(),
+cmd = codex_launcher() + ["exec", "--json", "--skip-git-repo-check", "-s", "read-only", "-C", tempfile.gettempdir(),
        "-m", args.model, "-c", 'model_reasoning_effort="low"']
 for r in refs:
     cmd += ["-i", r]
@@ -61,12 +72,13 @@ for line in res.stdout.splitlines():
         continue
     thread = thread or ev.get("thread_id") or (ev.get("msg") or {}).get("thread_id")
 
-# ảnh của đúng thread này (an toàn khi chạy song song); không có thread_id thì lấy ảnh mới nhất sau t0
-cands = list((GEN / thread).glob("*")) if thread else [f for f in GEN.glob("*/*") if f.stat().st_mtime >= t0]
-cands = [f for f in cands if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
+# chỉ nhận ảnh của ĐÚNG thread này: batch gen song song, không có thread_id thì báo lỗi chứ không đoán theo
+# mtime (dễ lấy nhầm mảnh của luồng khác)
+cands = [f for f in (GEN / thread).glob("*") if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")] \
+    if thread else []
 if not cands:
     sys.stderr.write(res.stdout[-2000:] + res.stderr[-2000:])
-    sys.exit("codex did not produce an image")
+    sys.exit(f"codex did not produce an image (rc={res.returncode}, thread={thread or '-'})")
 src = max(cands, key=lambda f: f.stat().st_mtime)
 
 out.parent.mkdir(parents=True, exist_ok=True)
