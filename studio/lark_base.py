@@ -11,7 +11,7 @@ from batch_errors import AuthError, StepError
 
 PROFILE = "tool_ds"
 BASE = "NQMeb69ZRak4kfs40oQlMfySgXA"
-TABLE = "tblZhM8uIGIzQ4fx"      # ORD_01
+TABLE = "tblG8Xk9KTGe4cYK"      # ORD_02 (thay ORD_01 tblZhM8uIGIzQ4fx từ 05/11; cùng field/view ID)
 VIEW = "vew0cgQ2cZ"             # 1. DS Order
 VIEW_NOFILE = "vewkIOvHVD"      # GEN (team tạo 16/10, thay view No File vewRdGQSXj): dòng cần gen của hôm nay
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
