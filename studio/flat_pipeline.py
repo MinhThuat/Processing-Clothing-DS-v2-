@@ -190,6 +190,12 @@ CLOTH_PROMPT = (
 BODY_NOTE = (" This is ONE continuous tall panel from neckline to ankle: do NOT split it into two legs — no crotch, "
              "no inseam, no gap between the legs; the legs' prints sit side by side on one continuous fabric. No "
              "white or blank band along any edge.")
+# da/cơ thể in trên áo: codex vẽ thành mảng dệt kim màu be phẳng, mất rốn/khe ngực/khối (Ugly Sweater bra
+# VPC072610A08 Female 2/11) -> bản 3D phải giữ da thật như ảnh gốc
+# ponytail: chữ "photorealistic skin/cleavage/navel" làm codex từ chối 4/4 (regen 3/11) -> chỉ tả khối/bóng
+SKIN_NOTE = (" The skin-tone artwork in the centre of the print keeps the same 3D shading, highlights and "
+             "contours as the reference, smooth like a printed photo — NOT knit/fabric texture, NOT a flat fill.")
+_SKIN_RE = re.compile(r"\b(skin|abs|cleavage|chest muscles?|belly|navel|torso artwork)\b", re.I)
 CLOTH_FLAT = (" Style: 2D FLAT VECTOR — solid flat colour fills, crisp clean edges, NO 3D, NO shading, NO gradient, "
               "NO fabric texture.")
 HOOD_NOTE = (' The top has a HOOD: ALSO add "hood": "<print spec of the hood\'s outer side panel>" and its box '
@@ -498,6 +504,7 @@ _PIECES_SCHEMA = (
     "the print (bare chest, cleavage, abs, belly showing through an opening) MUST be named in that panel's desc "
     "with its skin colour and position — never omit it (missed on a women's snowman onesie 21/10). "
     "For skirt_* do NOT describe loose ties/sashes/knots/strings hanging off the skirt (they are left out). "
+    "Never describe a zipper (teeth, tape, pull) — zips are sewn on later, the print runs straight under them. "
     'ALSO add "boxes": {"<panel key>": [x0,y0,x1,y1], ...} with one TIGHT bounding box per panel key '
     "above, integers normalized 0-1000 (x from left, y from top) on the image where that panel is seen "
     "(front panels on the front image/view, back panels on the back image/view). Each box covers ONLY "
@@ -707,6 +714,10 @@ INFER_NOTE = (" This is a BACK panel INFERRED from a front-only photo: the refer
               "only for fabric colour and style; do NOT copy any front graphic (bows, chest prints, logos, "
               "buttons, zips) onto this panel — follow ONLY the given panel description.")
 
+# áo khoác/áo có dây kéo: dây kéo xưởng may sau -> mảnh in KHÔNG vẽ dây kéo, hoạ tiết liền qua chỗ đó (USER 6/11)
+NO_ZIP = (" Do NOT draw any zipper, zip teeth, zip tape or zip pull — continue the print and base fabric "
+          "seamlessly where a zipper would be.")
+
 def _sleeve_box(spec, ref, work):
     """Tay áo: Claude khoanh 1 tay trên lưới pixel (box tay của vision hay lệch sang cổ/người bên cạnh nên
     _box bỏ) -> box 0-1000 hoặc None (gen từ ảnh nguyên như cũ). USER 20/10: mảnh nào cũng cắt riêng rồi mới
@@ -740,6 +751,7 @@ def _make_piece(spec, refs, work, out, flat=False):
         ctx = [ref]
     infer = INFER_NOTE if spec.get("inferred") else ""
     note, oa_note = (CROP_NOTE + infer, OA_CROP_NOTE + infer) if crop else (infer, infer)
+    note, oa_note = note + NO_ZIP, oa_note + NO_ZIP
     if spec["kind"] == "dress":
         label = _DRESS_LABEL.get(spec["slug"], spec["slug"])
         if spec["slug"].startswith("ta_"):       # tà: chữ nhật trải thẳng, export_piece uốn theo khuôn
@@ -757,7 +769,7 @@ def _make_piece(spec, refs, work, out, flat=False):
         tpl = _tpl_ref(cloth_tpl(spec["slug"]))
         head = CLOTH_PROMPT.format(label=spec["label"], base=COLOR or _base_colour(spec["desc"]),
                                    desc=spec["desc"]) + (BODY_NOTE if spec["slug"].startswith("bo_") else "") \
-            + (CLOTH_FLAT if flat else "")
+            + (CLOTH_FLAT if flat else SKIN_NOTE if _SKIN_RE.search(spec["desc"]) else "")
         gen_panel(head + note, [crop or ref, tpl, *ctx], dst, oa=(head + oa_note, [crop or ref, tpl]),
                   size="x".join(map(str, CLOTH_GEN)))
         Image.open(dst).convert("RGB").resize(CLOTH_GEN, Image.LANCZOS).crop(_tpl_box(cloth_tpl(spec["slug"]))).save(dst)
@@ -1207,6 +1219,8 @@ def _selfcheck():
         assert '"type"' in pr and "top_back" in pr and "bodice_back" in pr, src
         assert "never as bare skin or an opening" in pr, src     # hình cơ thể in = họa tiết, không phải da thật
     assert "never as bare skin or an opening" in OUTFIT_PROMPT
+    # da in trên áo -> bản 3D thêm SKIN_NOTE; hoạ tiết thường thì không
+    assert _SKIN_RE.search("warm tan skin-colour chest and abdomen artwork") and not _SKIN_RE.search("cream snowflakes")
     # plan: váy -> 4 mảnh; tay giống -> 6 (tay_truoc/sau); tay khác -> 8 (trái/phải × trước/sau)
     d = _pieces_plan({"type": "dress", "bodice_front": "base a", "bodice_back": "b",
                       "skirt_front": "c", "skirt_back": "d"})

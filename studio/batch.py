@@ -1098,10 +1098,11 @@ def variant_custom(custom):
 
 
 def _variant_label(group, sub_rows):
-    """Nhãn biến thể đưa cho locate: variant của judge, hoặc Name Custom khi judge để 'default'."""
-    if group["variant"] and group["variant"] != "default":
-        return group["variant"]
-    return "; ".join(sorted({variant_custom(r.get("custom")) for r in sub_rows} - {""})) or group["variant"]
+    """Nhãn biến thể đưa cho locate: variant của judge + Name Custom (variant judge tự đặt như 'Classic' không có
+    trên bảng chọn màu, nhãn ô là màu khách chọn 'Color: Red' -> phải kèm Name Custom; Loose Sweatpants 2/11)."""
+    custom = "; ".join(sorted({variant_custom(r.get("custom")) for r in sub_rows} - {""}))
+    v = group["variant"] if group["variant"] and group["variant"] != "default" else ""
+    return " · ".join(x for x in (v, custom) if x) or group["variant"]
 
 
 LOCATE_TRIES = 3
@@ -1435,7 +1436,8 @@ def _selfcheck():
     g1 = {"front": 1, "crop": None, "variant": "default"}
     assert not _needs_locate(g1, Counter([1])) and _needs_locate(g1, Counter([1]), "Design: Design 3")
     assert _variant_label(g1, [{"custom": "Design: Design 3"}]) == "Design: Design 3"
-    assert _variant_label({**g1, "variant": "Women"}, [{"custom": "x"}]) == "Women"
+    assert _variant_label({**g1, "variant": "Women"}, [{"custom": ""}]) == "Women"
+    assert _variant_label({**g1, "variant": "Classic"}, [{"custom": "• Color: Red"}]) == "Classic · Color: Red"
     # _is_kid: size/từ khoá trẻ em trong SKU Design -> True (để judge.locate chọn áo người lớn/trẻ em)
     assert _is_kid("HKH032604A21-Black-Kid Tennis Shirt-M-G130426")
     assert _is_kid("HKH032604A21-Black-2D Hoodie-4T-G130426")
