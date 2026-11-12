@@ -1373,9 +1373,18 @@ def main():
             if a.fix_fails:
                 fix_fails(a.fix_fails, day, a.dry_run)
         except (AuthError, QuotaError, KeyboardInterrupt) as e:
-            _kill_active(); log("done", f"dừng: {e!r}")
+            _kill_active(); log("done", f"dừng: {e!r}"); reason = f"dừng: {str(e)[:200] or type(e).__name__}"
+        except Exception as e:
+            reason = f"lỗi không lường: {str(e)[:200]}"; log("crash", traceback.format_exc())
         finally:
-            release_lock()
+            try:   # chế độ riêng cũng báo bot Lark (trước đây return im lặng)
+                mode = " + ".join(m for m, on in (("fix-bad", a.fix_bad), (f"regen {' '.join(a.regen or [])}", a.regen),
+                                                  (f"fix-fails {' '.join(a.fix_fails or [])}", a.fix_fails)) if on)
+                notify(f"{mode}{' (dry-run)' if a.dry_run else ''}: "
+                       + (f"{stats['ok']} OK · {stats['qafail']} QA FAIL · {stats['loi']} LỖI · " if a.regen else "")
+                       + f"{reason} · log: {rundir / 'batch.log'}")
+            finally:
+                release_lock()
         return
     try:
         queue = build_queue(lb.fetch_rows(only_day, day), only_day)
