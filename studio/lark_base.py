@@ -12,8 +12,10 @@ from batch_errors import AuthError, StepError
 PROFILE = "tool_ds"
 BASE = "NQMeb69ZRak4kfs40oQlMfySgXA"
 TABLE = "tblG8Xk9KTGe4cYK"      # ORD_02 (thay ORD_01 tblZhM8uIGIzQ4fx từ 05/11; cùng field/view ID)
-VIEW = "vew0cgQ2cZ"             # 1. DS Order
 VIEW_NOFILE = "vewkIOvHVD"      # GEN (team tạo 16/10, thay view No File vewRdGQSXj): dòng cần gen của hôm nay
+# Truy vấn kèm --filter-json (theo Order ID / ngày cũ): filter THAY filter của view -> view nào đọc được cũng quét
+# cả bảng. 12/11: view "1. DS Order" vew0cgQ2cZ thành not_support với user tool_ds -> dùng luôn view GEN.
+VIEW = VIEW_NOFILE
 F_PIECES = "fldVzvTA9Q"         # Flat Pieces (attachment)
 F_NOTE = "fldGVXw4ph"           # Flat Note (text)
 N_LINKS = 20
@@ -89,7 +91,7 @@ def _read_ndjson(args):
 def _query(day, today):
     """(view, filter|None) để lấy dòng cần làm của ngày `day`.
     Hôm nay -> view "No File" do team định nghĩa (tự lọc; gửi --filter-json sẽ THAY filter của view).
-    Ngày cũ -> view 1. DS Order + chép lại 5 điều kiện của view "No File", 'Today' -> ngày đó."""
+    Ngày cũ -> VIEW + chép lại 5 điều kiện của view "No File", 'Today' -> ngày đó."""
     if day == today:
         return VIEW_NOFILE, None
     return VIEW, {"logic": "and", "conditions": [
@@ -221,7 +223,7 @@ def _selfcheck():
     assert not _AUTH.search("promotion offer expired at midnight")
     # hôm nay -> đọc view "No File" (view tự lọc, KHÔNG gửi filter vì --filter-json thay filter của view)
     assert _query("2026-10-16", "2026-10-16") == (VIEW_NOFILE, None)
-    # ngày cũ -> view 1. DS Order + áp lại đủ 5 điều kiện của view "No File", đổi Today thành ngày đó
+    # ngày cũ -> VIEW + áp lại đủ 5 điều kiện của view "No File", đổi Today thành ngày đó
     v, f = _query("2026-10-15", "2026-10-16")
     assert v == VIEW and f["logic"] == "and" and len(f["conditions"]) == 5
     assert ["Create Date", "==", "ExactDate(2026-10-15)"] in f["conditions"]
